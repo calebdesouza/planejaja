@@ -1,0 +1,20 @@
+[package]
+name = "nodestor-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+memmap2 = { workspace = true }
+zstd = { workspace = true }
+lz4_flex = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "nodestor-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nodestor"
+path = "src/main.rs"
+
+[dependencies]
+nodestor-core = { path = "../crates/nodestor-core" }
+nodestor-scanner = { path = "../crates/nodestor-scanner" }
+nodestor-formats = { path = "../crates/nodestor-formats" }
+nodestor-transport = { path = "../crates/nodestor-transport" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

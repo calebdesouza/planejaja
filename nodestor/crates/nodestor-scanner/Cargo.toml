@@ -1,0 +1,13 @@
+[package]
+name = "nodestor-scanner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+tracing = { workspace = true }
+
+
