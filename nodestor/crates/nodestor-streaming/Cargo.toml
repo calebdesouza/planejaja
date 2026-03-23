@@ -1,0 +1,16 @@
+[package]
+name = "nodestor-streaming"
+version.workspace = true
+edition.workspace = true
+description = "Tensor Streaming Kernel — Double buffering, Modo Metralhadora, async pipeline"
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+nodestor-transport = { path = "../nodestor-transport" }
+nodestor-vulkan = { path = "../nodestor-vulkan" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

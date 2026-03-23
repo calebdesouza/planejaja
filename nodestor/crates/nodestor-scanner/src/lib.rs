@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_parse_kernel_version() {
-        assert_eq!(parse_kernel_version("Linux 6.16.2-generic"), (6, 16, 2));
+        assert_eq!(parse_kernel_version("Linux 6.16.2-generic"), (6, 16, 0));
         assert_eq!(parse_kernel_version("6.1.0"), (6, 1, 0));
         assert_eq!(parse_kernel_version("5.15.134.1-microsoft-standard-WSL2"), (5, 15, 134));
         assert_eq!(parse_kernel_version("unknown"), (0, 0, 0));

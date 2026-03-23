@@ -1,0 +1,10 @@
+# NodeStor — Cargo workspace configuration
+#
+# Força o uso do MSVC linker no Windows para evitar problemas com
+# o dlltool do MSYS2/mingw que não suporta paths com espaços.
+# O MSVC toolchain (stable-x86_64-pc-windows-msvc) está instalado
+# via rustup e é o linker recomendado para desenvolvimento no Windows.
+
+[build]
+# Usa o target MSVC explicitamente para este workspace
+target = "x86_64-pc-windows-msvc"

@@ -123,31 +123,47 @@ impl std::fmt::Display for OsType {
 }
 
 /// Backend de transporte de dados selecionado pelo scanner.
+///
+/// Hierarquia de prioridades (do mais rápido ao mais compatível):
+/// 1. `NvidiaGds`      — NVIDIA GDS 2.0 (Linux) — ~28 GB/s
+/// 2. `RocmDirectGma`  — AMD ROCm (Linux)        — ~20 GB/s
+/// 3. `DirectStorage`  — Windows DS 1.4           — ~14 GB/s
+/// 4. `IoUringDmabuf`  — Linux kernel 6.16+       — ~20 GB/s
+/// 5. `IoUringStandard`— Linux kernel 5.11+       — ~7 GB/s
+/// 6. `Win32Fallback`  — Windows antigo / sem DS  — ~5 GB/s
+/// 7. `VulkanGeneric`  — Mac/Intel/CPU            — ~3-6 GB/s
+/// 8. `PreadFallback`  — Qualquer máquina (base)  — ~1.5 GB/s
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportBackend {
     /// NVIDIA GPUDirect Storage 2.0 via cuFile (Linux).
     NvidiaGds,
-    /// Microsoft DirectStorage 1.4 (Windows).
+    /// AMD ROCm com DirectGMA (Linux).
+    RocmDirectGma,
+    /// Microsoft DirectStorage 1.4 (Windows, requer DLLs).
     DirectStorage,
     /// Linux io_uring + DMABUF zero-copy (kernel 6.16+).
     IoUringDmabuf,
     /// Linux io_uring padrão (kernel 5.11+).
     IoUringStandard,
-    /// Windows Win32 ReadFile com buffers não-alinhados.
+    /// Windows Win32 Overlapped I/O com alinhamento de setor (sem DirectStorage).
     Win32Fallback,
-    /// Fallback universal com pread64/ReadFile básico.
+    /// Vulkan Compute + mmap: macOS, Intel iGPU, máquinas sem GPU dedicada.
+    VulkanGeneric,
+    /// Fallback universal com pread64/ReadFile — funciona em qualquer hardware.
     PreadFallback,
 }
 
 impl std::fmt::Display for TransportBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportBackend::NvidiaGds => write!(f, "NVIDIA GPUDirect Storage 2.0"),
-            TransportBackend::DirectStorage => write!(f, "DirectStorage 1.4"),
-            TransportBackend::IoUringDmabuf => write!(f, "io_uring + DMABUF (kernel 6.16+)"),
-            TransportBackend::IoUringStandard => write!(f, "io_uring padrão (kernel 5.11+)"),
-            TransportBackend::Win32Fallback => write!(f, "Win32 Overlapped I/O"),
-            TransportBackend::PreadFallback => write!(f, "Fallback Universal (pread)"),
+            TransportBackend::NvidiaGds      => write!(f, "NVIDIA GPUDirect Storage 2.0"),
+            TransportBackend::RocmDirectGma  => write!(f, "AMD ROCm + DirectGMA"),
+            TransportBackend::DirectStorage  => write!(f, "DirectStorage 1.4 (Windows)"),
+            TransportBackend::IoUringDmabuf  => write!(f, "io_uring + DMABUF (kernel 6.16+)"),
+            TransportBackend::IoUringStandard=> write!(f, "io_uring padrão (kernel 5.11+)"),
+            TransportBackend::Win32Fallback  => write!(f, "Win32 Overlapped I/O (sem DirectStorage)"),
+            TransportBackend::VulkanGeneric  => write!(f, "Vulkan Generic (Mac/Intel/Universal)"),
+            TransportBackend::PreadFallback  => write!(f, "Fallback Universal (pread — qualquer máquina)"),
         }
     }
 }
@@ -185,12 +201,14 @@ impl HardwareProfile {
     /// Throughput máximo estimado do transporte selecionado em bytes/s.
     pub fn estimated_transport_throughput(&self) -> u64 {
         match self.recommended_transport {
-            TransportBackend::NvidiaGds => 28_000_000_000,         // 28 GB/s
-            TransportBackend::DirectStorage => 14_000_000_000,      // 14 GB/s
-            TransportBackend::IoUringDmabuf => 20_000_000_000,      // 20 GB/s
-            TransportBackend::IoUringStandard => 7_000_000_000,     //  7 GB/s
-            TransportBackend::Win32Fallback => 3_000_000_000,       //  3 GB/s
-            TransportBackend::PreadFallback => 1_500_000_000,       //  1.5 GB/s
+            TransportBackend::NvidiaGds       => 28_000_000_000, // 28 GB/s
+            TransportBackend::RocmDirectGma   => 20_000_000_000, // 20 GB/s
+            TransportBackend::DirectStorage   => 14_000_000_000, // 14 GB/s
+            TransportBackend::IoUringDmabuf   => 20_000_000_000, // 20 GB/s
+            TransportBackend::IoUringStandard =>  7_000_000_000, //  7 GB/s
+            TransportBackend::Win32Fallback   =>  5_000_000_000, //  5 GB/s
+            TransportBackend::VulkanGeneric   =>  3_500_000_000, //  3.5 GB/s
+            TransportBackend::PreadFallback   =>  1_500_000_000, //  1.5 GB/s
         }
     }
 }

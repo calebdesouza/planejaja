@@ -5,7 +5,12 @@ members = [
     "crates/nodestor-scanner",
     "crates/nodestor-formats",
     "crates/nodestor-transport",
+    "crates/nodestor-vulkan",
+    "crates/nodestor-streaming",
+    "crates/nodestor-metadata",
+    "crates/nodestor-inference",
     "nodestor-cli",
+    "nodestor-server",
 ]
 
 [workspace.package]
@@ -15,21 +20,40 @@ rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+# === Core ===
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# === Vulkan ===
+ash = "0.38"
+gpu-allocator = "0.27"
+
+# === I/O ===
 memmap2 = "0.9"
 zstd = "0.13"
 lz4_flex = "0.11"
-clap = { version = "4", features = ["derive"] }
+
+# === Async ===
 tokio = { version = "1", features = ["full"] }
+
+# === HTTP ===
+axum = "0.8"
+
+# === CLI ===
+clap = { version = "4", features = ["derive"] }
+
+# === Hardware Detection ===
 sysinfo = "0.32"
 byteorder = "1"
+
+# === Utilidades ===
 tempfile = "3"
 criterion = { version = "0.5" }
+dirs = "5"
 
 [profile.release]
 lto = true
@@ -37,3 +61,6 @@ codegen-units = 1
 opt-level = 3
 strip = true
 panic = "abort"
+
+[profile.release.build-override]
+opt-level = 3

@@ -1,20 +1,21 @@
 [package]
-name = "nodestor-cli"
+name = "nodestor-server"
 version.workspace = true
 edition.workspace = true
+description = "NodeStor HTTP REST server — axum-based API for model inference"
 
 [[bin]]
-name = "nodestor"
+name = "nodestor-server"
 path = "src/main.rs"
 
 [dependencies]
 nodestor-core = { path = "../crates/nodestor-core" }
+nodestor-inference = { path = "../crates/nodestor-inference" }
 nodestor-scanner = { path = "../crates/nodestor-scanner" }
-nodestor-formats = { path = "../crates/nodestor-formats" }
-nodestor-transport = { path = "../crates/nodestor-transport" }
-clap = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-dirs = { workspace = true }
+anyhow = { workspace = true }

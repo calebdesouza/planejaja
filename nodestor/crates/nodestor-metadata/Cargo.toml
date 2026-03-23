@@ -1,16 +1,12 @@
 [package]
-name = "nodestor-formats"
+name = "nodestor-metadata"
 version.workspace = true
 edition.workspace = true
+description = "Metadata engine — LanceDB, DiskANN, Binary Quantization"
 
 [dependencies]
 nodestor-core = { path = "../nodestor-core" }
+tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-byteorder = { workspace = true }
-memmap2 = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

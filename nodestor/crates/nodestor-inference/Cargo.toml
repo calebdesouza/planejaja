@@ -1,0 +1,17 @@
+[package]
+name = "nodestor-inference"
+version.workspace = true
+edition.workspace = true
+description = "Inference pipeline — end-to-end token generation orchestration"
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+nodestor-streaming = { path = "../nodestor-streaming" }
+nodestor-metadata = { path = "../nodestor-metadata" }
+nodestor-formats = { path = "../nodestor-formats" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+nodestor-scanner = { path = "../nodestor-scanner" }
+nodestor-transport = { path = "../nodestor-transport" }
+nodestor-vulkan = { path = "../nodestor-vulkan" }

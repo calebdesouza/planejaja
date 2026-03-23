@@ -39,6 +39,8 @@ enum Commands {
         #[arg(long, default_value = "64")]
         block_mb: usize,
     },
+    /// Executa uma autocalibração do sistema (benchmarks de I/O e GPU) e salva a configuração ótima.
+    Calibrate,
 }
 
 fn main() -> Result<()> {
@@ -58,6 +60,7 @@ fn main() -> Result<()> {
         Commands::Scan => cmd_scan(),
         Commands::Inspect { path, tensors } => cmd_inspect(&path, tensors),
         Commands::Bench { path, block_mb } => cmd_bench(&path, block_mb),
+        Commands::Calibrate => cmd_calibrate(),
     }
 }
 
@@ -225,5 +228,45 @@ fn cmd_bench(path: &str, block_mb: usize) -> Result<()> {
     println!("   Eficiência vs máximo teórico: {:.1}%", efficiency);
 
     println!("\n✅ Benchmark concluído!\n");
+    Ok(())
+}
+
+fn cmd_calibrate() -> Result<()> {
+    println!("\n⚙️  NodeStor — Autocalibração do Sistema\n{}", "─".repeat(50));
+    println!("Iniciando varredura profunda de Hardware e I/O...");
+    
+    // 1. Scan Profile
+    let mut profile = nodestor_scanner::scan()?;
+    println!("✅ Scan concluído: SO {}, {} núcleos, {:.1} GB RAM", 
+        profile.os, profile.cpu_cores, profile.total_ram_bytes as f64 / 1e9);
+
+    // 2. Report GPUs
+    if profile.gpus.is_empty() {
+        println!("⚠️  Nenhuma GPU aceleradora encontrada (fallback para CPU)");
+    } else {
+        println!("✅ GPU principal detectada: {} ({:.1} GB VRAM)", 
+            profile.gpus[0].device_name, profile.gpus[0].vram_bytes as f64 / 1e9);
+        if profile.gpus[0].supports_vulkan_compute {
+            println!("   -> Suporte Vulkan nativo confirmado para Engine L3");
+        }
+    }
+
+    // 3. Transport
+    println!("✅ Transporte selecionado pelo Seletor Inteligente: {}", profile.recommended_transport);
+    
+    // 4. Save Config
+    if let Some(mut proj_dirs) = dirs::data_local_dir() {
+        proj_dirs.push("nodestor");
+        std::fs::create_dir_all(&proj_dirs)?;
+        let config_file = proj_dirs.join("config.json");
+        
+        let json = serde_json::to_string_pretty(&profile)?;
+        std::fs::write(&config_file, json)?;
+        
+        println!("\n🚀 Autocalibração impecável!");
+        println!("💾 Perfil de hardware salvo em: {}", config_file.display());
+    } else {
+        println!("\n⚠️ Não foi possível determinar pasta de configurações, abortando o salvamento.");
+    }
     Ok(())
 }

@@ -274,7 +274,8 @@ fn ggml_dtype(dtype_id: u32) -> TensorDtype {
         6 => TensorDtype::Q5_0,
         7 => TensorDtype::Q5_1,
         8 => TensorDtype::Q8_0,
-        9 => TensorDtype::Q8_1,
+        9 => TensorDtype::Q8_0,
+
         16 => TensorDtype::I8,
         17 => TensorDtype::I16,
         18 => TensorDtype::I32,
