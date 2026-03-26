@@ -1,5 +1,5 @@
 use nodestor_core::{NvmeGen, StorageInfo};
-use sysinfo::{Disks, System};
+use sysinfo::Disks;
 
 /// Detecta dispositivos de armazenamento disponíveis.
 pub fn detect_storage() -> Vec<StorageInfo> {

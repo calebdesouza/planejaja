@@ -57,7 +57,7 @@ impl ModelParser for GgufParser {
 
 fn parse_gguf_inner<R: Read + Seek>(
     reader: &mut R,
-    path: &str,
+    _path: &str,
     file_size: u64,
 ) -> Result<ModelMetadata, NodeStorError> {
     // ── Magic ───────────────────────────────────────────

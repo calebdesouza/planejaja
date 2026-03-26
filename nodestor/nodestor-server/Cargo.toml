@@ -12,10 +12,15 @@ path = "src/main.rs"
 nodestor-core = { path = "../crates/nodestor-core" }
 nodestor-inference = { path = "../crates/nodestor-inference" }
 nodestor-scanner = { path = "../crates/nodestor-scanner" }
-axum = { workspace = true }
-tokio = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+uuid = { version = "1.7", features = ["v4", "serde"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+dirs = { workspace = true }

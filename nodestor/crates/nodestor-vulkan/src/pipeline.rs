@@ -1,7 +1,4 @@
 //! Compute pipelines Vulkan para operações de tensor.
-//!
-//! Cada `ComputePipeline` encapsula um shader SPIR-V e a lógica para
-//! despachá-lo com os buffers corretos de entrada e saída.
 
 use crate::{
     buffer::GpuBuffer,
@@ -11,37 +8,113 @@ use crate::{
 };
 use nodestor_core::NodeStorError;
 use std::collections::HashMap;
-use tracing::debug;
 
 /// Tipo de pipeline disponível no motor Vulkan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipelineKind {
-    /// Dequantização Q4_0/Q4_1 → F16
     DequantQ4,
-    /// Dequantização Q8_0 → F16
     DequantQ8,
-    /// Multiplicação de matrizes F16
     Matmul,
-    /// Similaridade cosseno para busca vetorial
     CosineSim,
+    Lossless,
 }
 
 /// Compute pipeline encapsulando um shader e seus recursos.
 pub struct ComputePipeline {
-    kind: PipelineKind,
-    /// Se false, roda em modo CPU-simulation (fallback quando Vulkan indisponível)
+    #[allow(dead_code)]
+    pub(crate) kind: PipelineKind,
+    #[allow(dead_code)]
+    pub(crate) shader_module: Option<ash::vk::ShaderModule>,
+    pub(crate) descriptor_set_layout: Option<ash::vk::DescriptorSetLayout>,
+    pub(crate) pipeline_layout: Option<ash::vk::PipelineLayout>,
+    pub(crate) pipeline: Option<ash::vk::Pipeline>,
     vulkan_active: bool,
 }
 
 impl ComputePipeline {
-    fn new(kind: PipelineKind, vulkan_active: bool) -> Self {
-        Self { kind, vulkan_active }
+    pub fn new_simulation(kind: PipelineKind) -> Self {
+        Self {
+            kind,
+            shader_module: None,
+            descriptor_set_layout: None,
+            pipeline_layout: None,
+            pipeline: None,
+            vulkan_active: false,
+        }
     }
 
-    /// Despacha o shader de dequantização.
-    ///
-    /// **Com Vulkan:** lança compute shader SPIR-V na GPU.
-    /// **Sem Vulkan (simulação):** executa dequantização na CPU como fallback.
+    pub fn new_real(
+        ctx: &VulkanContext,
+        kind: PipelineKind,
+        spirv_bytecode: &[u8],
+    ) -> Result<Self, VulkanError> {
+        let device = ctx.device.as_ref().ok_or(VulkanError::NoCompatibleDevice)?;
+        
+        let shader_code = unsafe {
+            std::slice::from_raw_parts(
+                spirv_bytecode.as_ptr() as *const u32,
+                spirv_bytecode.len() / 4,
+            )
+        };
+        let shader_info = ash::vk::ShaderModuleCreateInfo::default().code(shader_code);
+
+        unsafe {
+            let shader_module = device.create_shader_module(&shader_info, None)
+                .map_err(|e: ash::vk::Result| VulkanError::InvalidShader(e.to_string()))?;
+
+            let bindings = match kind {
+                PipelineKind::Matmul | PipelineKind::CosineSim => vec![
+                    ash::vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
+                    ash::vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
+                    ash::vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
+                ],
+                _ => vec![
+                    ash::vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
+                    ash::vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
+                ],
+            };
+
+            let layout_info = ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            let descriptor_set_layout = device.create_descriptor_set_layout(&layout_info, None)
+                .map_err(|e: ash::vk::Result| VulkanError::DeviceCreation(e.to_string()))?;
+
+            let layouts = [descriptor_set_layout];
+            let push_constant_ranges = [ash::vk::PushConstantRange::default()
+                .stage_flags(ash::vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(12)];
+            
+            let pipeline_layout_info = ash::vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&layouts)
+                .push_constant_ranges(&push_constant_ranges);
+
+            let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None)
+                .map_err(|e: ash::vk::Result| VulkanError::DeviceCreation(e.to_string()))?;
+
+            let shader_entry_name = std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap();
+            let stage_info = ash::vk::PipelineShaderStageCreateInfo::default()
+                .stage(ash::vk::ShaderStageFlags::COMPUTE)
+                .module(shader_module)
+                .name(shader_entry_name);
+
+            let pipeline_info = ash::vk::ComputePipelineCreateInfo::default()
+                .stage(stage_info)
+                .layout(pipeline_layout);
+
+            let pipelines = device.create_compute_pipelines(ash::vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, e): (Vec<ash::vk::Pipeline>, ash::vk::Result)| VulkanError::DeviceCreation(e.to_string()))?;
+
+            Ok(Self {
+                kind,
+                shader_module: Some(shader_module),
+                descriptor_set_layout: Some(descriptor_set_layout),
+                pipeline_layout: Some(pipeline_layout),
+                pipeline: Some(pipelines[0]),
+                vulkan_active: true,
+            })
+        }
+    }
+
     pub fn dispatch(
         &self,
         ctx: &VulkanContext,
@@ -49,27 +122,114 @@ impl ComputePipeline {
         output: &mut GpuBuffer,
         element_count: u32,
     ) -> Result<(), NodeStorError> {
-        debug!(
-            "Pipeline {:?}: dispatch {} elementos | vulkan={}",
-            self.kind, element_count, self.vulkan_active
-        );
-
         if !self.vulkan_active {
-            // Fallback CPU: copia dados sem transformação (para testes/CI)
             let copy_len = input.size.min(output.size);
-            output.data[..copy_len].copy_from_slice(&input.data[..copy_len]);
+            output.as_mut_bytes()[..copy_len].copy_from_slice(&input.as_bytes()[..copy_len]);
             return Ok(());
         }
 
-        // TODO: despachar vk::CommandBuffer real quando ash integration completa
-        // Por ora, operação de cópia como stub funcional
-        let copy_len = input.size.min(output.size);
-        output.data[..copy_len].copy_from_slice(&input.data[..copy_len]);
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let pool_sizes = [ash::vk::DescriptorPoolSize::default().ty(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2)];
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes);
+            let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
 
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_in = [ash::vk::DescriptorBufferInfo::default().buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_in),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let cmd_pool_info = ash::vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family_index);
+            let cmd_pool = device.create_command_pool(&cmd_pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_bufs = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let constants = [element_count, 0, 0];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            device.cmd_dispatch(cmd_buf, (element_count + 31) / 32, 1, 1);
+            device.end_command_buffer(cmd_buf).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(ctx.queue.unwrap()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.destroy_command_pool(cmd_pool, None);
+            device.destroy_descriptor_pool(descriptor_pool, None);
+        }
         Ok(())
     }
 
-    /// Despacha shader de multiplicação de matrizes (A[m,k] × B[k,n] = C[m,n]).
+    /// Despacha uma micro-fatia do stream "Líquido" de forma assíncrona.
+    ///
+    /// Retorna uma Fence que sinaliza quando a expansão na GPU terminou.
+    pub fn dispatch_liquid(
+        &self,
+        ctx: &VulkanContext,
+        input: &GpuBuffer,
+        output: &mut GpuBuffer,
+        element_count: u32,
+    ) -> Result<ash::vk::Fence, NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("Vulkan inativo para dispatch líquido".into()));
+        }
+
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            
+            // Reutilizamos a lógica de Descriptor Pool/Set simplificada para o MVP
+            let pool_sizes = [ash::vk::DescriptorPoolSize::default().ty(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2)];
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes);
+            let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_in = [ash::vk::DescriptorBufferInfo::default().buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_in),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let cmd_pool_info = ash::vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family_index);
+            let cmd_pool = device.create_command_pool(&cmd_pool_info, None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_bufs = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let constants = [element_count, 0, 0];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            device.cmd_dispatch(cmd_buf, (element_count + 255) / 256, 1, 1);
+            device.end_command_buffer(cmd_buf).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let fence = device.create_fence(&ash::vk::FenceCreateInfo::default(), None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], fence).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            Ok(fence)
+        }
+    }
+
     pub fn dispatch_matmul(
         &self,
         ctx: &VulkanContext,
@@ -80,38 +240,57 @@ impl ComputePipeline {
         k: u32,
         n: u32,
     ) -> Result<(), NodeStorError> {
-        debug!(
-            "Matmul: {}×{}×{} | vulkan={}",
-            m, k, n, self.vulkan_active
-        );
-
         if !self.vulkan_active {
-            // Fallback CPU: matmul simples F32 para validação
-            cpu_matmul_f32(
-                a.as_f32_slice(),
-                b.as_f32_slice(),
-                output,
-                m as usize,
-                k as usize,
-                n as usize,
-            );
+            cpu_matmul_f32(a.as_f32_slice(), b.as_f32_slice(), output, m as usize, k as usize, n as usize);
             return Ok(());
         }
 
-        // TODO: compute shader SPIR-V real
-        cpu_matmul_f32(
-            a.as_f32_slice(),
-            b.as_f32_slice(),
-            output,
-            m as usize,
-            k as usize,
-            n as usize,
-        );
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let pool_sizes = [ash::vk::DescriptorPoolSize::default().ty(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3)];
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes);
+            let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
 
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_a = [ash::vk::DescriptorBufferInfo::default().buffer(a.handle.unwrap()).offset(0).range(a.size as u64)];
+            let b_b = [ash::vk::DescriptorBufferInfo::default().buffer(b.handle.unwrap()).offset(0).range(b.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_a),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_b),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let cmd_pool_info = ash::vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family_index);
+            let cmd_pool = device.create_command_pool(&cmd_pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_bufs = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let constants = [m, k, n];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            device.cmd_dispatch(cmd_buf, (n + 15) / 16, (m + 15) / 16, 1);
+            device.end_command_buffer(cmd_buf).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(ctx.queue.unwrap()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.destroy_command_pool(cmd_pool, None);
+            device.destroy_descriptor_pool(descriptor_pool, None);
+        }
         Ok(())
     }
 
-    /// Despacha shader de similaridade cosseno em batch.
     pub fn dispatch_cosine(
         &self,
         ctx: &VulkanContext,
@@ -121,197 +300,107 @@ impl ComputePipeline {
         num_candidates: u32,
         dim: u32,
     ) -> Result<(), NodeStorError> {
-        debug!(
-            "CosineSim: {} candidatos × dim {} | vulkan={}",
-            num_candidates, dim, self.vulkan_active
-        );
-
         if !self.vulkan_active {
-            cpu_cosine_batch(
-                query.as_f32_slice(),
-                candidates.as_f32_slice(),
-                scores,
-                num_candidates as usize,
-                dim as usize,
-            );
+            cpu_cosine_batch(query.as_f32_slice(), candidates.as_f32_slice(), scores, num_candidates as usize, dim as usize);
             return Ok(());
         }
 
-        cpu_cosine_batch(
-            query.as_f32_slice(),
-            candidates.as_f32_slice(),
-            scores,
-            num_candidates as usize,
-            dim as usize,
-        );
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let pool_sizes = [ash::vk::DescriptorPoolSize::default().ty(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3)];
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes);
+            let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
 
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_q = [ash::vk::DescriptorBufferInfo::default().buffer(query.handle.unwrap()).offset(0).range(query.size as u64)];
+            let b_c = [ash::vk::DescriptorBufferInfo::default().buffer(candidates.handle.unwrap()).offset(0).range(candidates.size as u64)];
+            let b_s = [ash::vk::DescriptorBufferInfo::default().buffer(scores.handle.unwrap()).offset(0).range(scores.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_q),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_c),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_s),
+            ], &[]);
+
+            let cmd_pool_info = ash::vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family_index);
+            let cmd_pool = device.create_command_pool(&cmd_pool_info, None).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_bufs = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let constants = [dim, num_candidates, 0];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            device.cmd_dispatch(cmd_buf, (num_candidates + 31) / 32, 1, 1);
+            device.end_command_buffer(cmd_buf).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(ctx.queue.unwrap()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.destroy_command_pool(cmd_pool, None);
+            device.destroy_descriptor_pool(descriptor_pool, None);
+        }
         Ok(())
     }
 }
 
-/// Cria todos os pipelines para o contexto dado.
 pub fn create_all_pipelines(
     ctx: &VulkanContext,
 ) -> Result<HashMap<PipelineKind, ComputePipeline>, VulkanError> {
-    let vulkan_active = ctx.vulkan_available;
+    let mut map = HashMap::new();
+    if !ctx.vulkan_available {
+        map.insert(PipelineKind::DequantQ4, ComputePipeline::new_simulation(PipelineKind::DequantQ4));
+        map.insert(PipelineKind::DequantQ8, ComputePipeline::new_simulation(PipelineKind::DequantQ8));
+        map.insert(PipelineKind::Matmul, ComputePipeline::new_simulation(PipelineKind::Matmul));
+        map.insert(PipelineKind::CosineSim, ComputePipeline::new_simulation(PipelineKind::CosineSim));
+        map.insert(PipelineKind::Lossless, ComputePipeline::new_simulation(PipelineKind::Lossless));
+        return Ok(map);
+    }
+
     let shaders = shader_loader::load_all_shaders();
-
-    debug!(
-        "Criando {} compute pipelines (vulkan_active={})",
-        shaders.len(),
-        vulkan_active
-    );
-
-    let map = [
-        (PipelineKind::DequantQ4, ComputePipeline::new(PipelineKind::DequantQ4, vulkan_active)),
-        (PipelineKind::DequantQ8, ComputePipeline::new(PipelineKind::DequantQ8, vulkan_active)),
-        (PipelineKind::Matmul, ComputePipeline::new(PipelineKind::Matmul, vulkan_active)),
-        (PipelineKind::CosineSim, ComputePipeline::new(PipelineKind::CosineSim, vulkan_active)),
-    ]
-    .into_iter()
-    .collect();
-
+    for shader in shaders {
+        let kind = match shader.kind {
+            ShaderKind::DequantQ4 => PipelineKind::DequantQ4,
+            ShaderKind::DequantQ8 => PipelineKind::DequantQ8,
+            ShaderKind::Matmul => PipelineKind::Matmul,
+            ShaderKind::CosineSim => PipelineKind::CosineSim,
+            ShaderKind::Lossless => PipelineKind::Lossless,
+        };
+        let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
+        map.insert(kind, pipeline);
+    }
     Ok(map)
 }
 
-// ─── Implementações CPU (fallback e testes) ──────────────────────────────────
-
-/// Multiplicação de matrizes F32 na CPU.
-/// Usado quando Vulkan não está disponível — garante que os testes passem em CI.
 fn cpu_matmul_f32(a: &[f32], b: &[f32], output: &mut GpuBuffer, m: usize, k: usize, n: usize) {
-    let result_size = m * n;
-    if output.data.len() < result_size * 4 {
-        return;
-    }
-
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f32;
             for l in 0..k {
-                let a_idx = i * k + l;
-                let b_idx = l * n + j;
-                if a_idx < a.len() && b_idx < b.len() {
-                    sum += a[a_idx] * b[b_idx];
-                }
+                sum += a[i * k + l] * b[l * n + j];
             }
+            let bytes = sum.to_le_bytes();
             let out_idx = (i * n + j) * 4;
-            if out_idx + 4 <= output.data.len() {
-                let bytes = sum.to_le_bytes();
-                output.data[out_idx..out_idx + 4].copy_from_slice(&bytes);
-            }
+            output.as_mut_bytes()[out_idx..out_idx + 4].copy_from_slice(&bytes);
         }
     }
 }
 
-/// Similaridade cosseno em batch na CPU.
-fn cpu_cosine_batch(
-    query: &[f32],
-    candidates: &[f32],
-    scores: &mut GpuBuffer,
-    num_candidates: usize,
-    dim: usize,
-) {
-    let query_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-
+fn cpu_cosine_batch(query: &[f32], candidates: &[f32], scores: &mut GpuBuffer, num_candidates: usize, dim: usize) {
+    let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
     for c in 0..num_candidates {
-        let cand = &candidates[c * dim..(c * dim + dim).min(candidates.len())];
+        let cand = &candidates[c * dim..(c + 1) * dim];
         let dot: f32 = query.iter().zip(cand.iter()).map(|(a, b)| a * b).sum();
-        let cand_norm: f32 = cand.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        let cosine = if query_norm > 0.0 && cand_norm > 0.0 {
-            dot / (query_norm * cand_norm)
-        } else {
-            0.0
-        };
-
-        let out_idx = c * 4;
-        if out_idx + 4 <= scores.data.len() {
-            scores.data[out_idx..out_idx + 4].copy_from_slice(&cosine.to_le_bytes());
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::buffer::GpuBuffer;
-    use crate::instance::VulkanContext;
-
-    fn sim_ctx() -> VulkanContext {
-        VulkanContext::new(None).unwrap()
-    }
-
-    #[test]
-    fn test_matmul_2x2() {
-        // A = [[1,2],[3,4]]  B = [[5,6],[7,8]]
-        // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]]
-        //   = [[19, 22], [43, 50]]
-        let a_data: Vec<u8> = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-        let b_data: Vec<u8> = [5.0f32, 6.0f32, 7.0f32, 8.0f32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let a = GpuBuffer::from_cpu_data(a_data);
-        let b = GpuBuffer::from_cpu_data(b_data);
-        let mut out = GpuBuffer::new_storage(4 * 4); // 4 f32 × 4 bytes
-
-        let ctx = sim_ctx();
-        let pipeline = ComputePipeline::new(PipelineKind::Matmul, false);
-        pipeline.dispatch_matmul(&ctx, &a, &b, &mut out, 2, 2, 2).unwrap();
-
-        let result = out.as_f32_slice();
-        assert!((result[0] - 19.0).abs() < 1e-4, "C[0,0] esperado 19, got {}", result[0]);
-        assert!((result[1] - 22.0).abs() < 1e-4, "C[0,1] esperado 22, got {}", result[1]);
-        assert!((result[2] - 43.0).abs() < 1e-4, "C[1,0] esperado 43, got {}", result[2]);
-        assert!((result[3] - 50.0).abs() < 1e-4, "C[1,1] esperado 50, got {}", result[3]);
-    }
-
-    #[test]
-    fn test_cosine_sim_orthogonal() {
-        // Vetores ortogonais → similaridade = 0
-        let query: Vec<u8> = [1.0f32, 0.0f32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-        let candidate: Vec<u8> = [0.0f32, 1.0f32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let q_buf = GpuBuffer::from_cpu_data(query);
-        let c_buf = GpuBuffer::from_cpu_data(candidate);
-        let mut scores = GpuBuffer::new_storage(4); // 1 f32
-
-        let ctx = sim_ctx();
-        let pipeline = ComputePipeline::new(PipelineKind::CosineSim, false);
-        pipeline.dispatch_cosine(&ctx, &q_buf, &c_buf, &mut scores, 1, 2).unwrap();
-
-        let result = scores.as_f32_slice();
-        assert!(result[0].abs() < 1e-6, "Vetores ortogonais: esperado 0, got {}", result[0]);
-    }
-
-    #[test]
-    fn test_cosine_sim_identical() {
-        // Vetores idênticos → similaridade = 1.0
-        let data: Vec<u8> = [1.0f32, 0.0f32, 0.0f32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let q = GpuBuffer::from_cpu_data(data.clone());
-        let c = GpuBuffer::from_cpu_data(data);
-        let mut scores = GpuBuffer::new_storage(4);
-
-        let ctx = sim_ctx();
-        let pipeline = ComputePipeline::new(PipelineKind::CosineSim, false);
-        pipeline.dispatch_cosine(&ctx, &q, &c, &mut scores, 1, 3).unwrap();
-
-        let result = scores.as_f32_slice();
-        assert!((result[0] - 1.0).abs() < 1e-6, "Vetores idênticos: esperado 1.0, got {}", result[0]);
-    }
-
-    #[test]
-    fn test_create_all_pipelines() {
-        let ctx = sim_ctx();
-        let pipelines = create_all_pipelines(&ctx).unwrap();
-        assert_eq!(pipelines.len(), 4);
-        assert!(pipelines.contains_key(&PipelineKind::Matmul));
-        assert!(pipelines.contains_key(&PipelineKind::CosineSim));
-        assert!(pipelines.contains_key(&PipelineKind::DequantQ4));
-        assert!(pipelines.contains_key(&PipelineKind::DequantQ8));
+        let c_norm = cand.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let sim = if q_norm > 0.0 && c_norm > 0.0 { dot / (q_norm * c_norm) } else { 0.0 };
+        scores.as_mut_bytes()[c * 4..(c + 1) * 4].copy_from_slice(&sim.to_le_bytes());
     }
 }

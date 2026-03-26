@@ -31,6 +31,13 @@ pub trait DataTransport: Send + Sync {
 
     /// Throughput máximo teórico em bytes/segundo.
     fn theoretical_max_throughput_bps(&self) -> u64;
+
+    /// Inicia uma transferência líquida (micro-fatias em paralelo).
+    fn transfer_liquid(
+        &self,
+        request: &LiquidTransferRequest,
+        callback: Box<dyn Fn(TransferResult) + Send + Sync>,
+    ) -> Result<(), NodeStorError>;
 }
 
 /// Trait para parsers de formatos de modelo.

@@ -8,3 +8,57 @@
 //! - [ ] `prefetch.rs` — DiskANN pre-fetch integrado
 
 pub mod pipeline;
+
+#[cfg(test)]
+mod tests {
+    use super::pipeline::{InferencePipeline, InferenceConfig};
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_full_7_layer_pipeline_orchestration() {
+        // SETUP: Criação do ambiente de teste (Camada 3/HAL)
+        let dir = tempdir().unwrap();
+        let model_path = dir.path().join("llama3_fake.gguf");
+        let mut file = std::fs::File::create(&model_path).unwrap();
+        // Simula um cabeçalho GGUF v3 real com 1 tensor (Camada 1/6)
+        use byteorder::{LittleEndian, WriteBytesExt};
+        file.write_u32::<LittleEndian>(0x46554747).unwrap(); // "GGUF"
+        file.write_u32::<LittleEndian>(3).unwrap();          // v3
+        file.write_u64::<LittleEndian>(1).unwrap();          // 1 Tensor
+        file.write_u64::<LittleEndian>(0).unwrap();          // 0 KVs
+        
+        // Tensor definition: name (len + data), n_dims, dims, type, offset
+        let t_name = "test_tensor";
+        file.write_u64::<LittleEndian>(t_name.len() as u64).unwrap();
+        file.write_all(t_name.as_bytes()).unwrap();
+        file.write_u32::<LittleEndian>(1).unwrap();          // 1 dim
+        file.write_u64::<LittleEndian>(128).unwrap();        // 128 elms
+        file.write_u32::<LittleEndian>(0).unwrap();          // F32
+        file.write_u64::<LittleEndian>(0).unwrap();          // offset 0
+        
+        file.write_all(&[0u8; 1024]).unwrap(); // Dummy tensor data (padding)
+
+        // CONFIG: Parametrização da Engine (Camada 7/API)
+        let config = InferenceConfig {
+            model_path: model_path.to_str().unwrap().to_string(),
+            prefetch_depth: 2,
+            buffer_size: 1024,
+        };
+
+        // BOOT: Inicialização do Cérebro (Camada 1, 3, 6)
+        let pipeline = InferencePipeline::init(config).expect("Falha ao inicializar 7 camadas");
+        
+        // EXEC: Geração de Tokens com RAG e Streaming (Camada 2, 4, 5, 6)
+        let (output, stats) = pipeline.generate("Olá NodeStor!", 5).await
+            .expect("Falha na geração via 7 camadas");
+
+        // PROOF: Verificação de métricas e vitalidade
+        assert!(stats.generated_tokens > 0, "Deveria gerar tokens");
+        assert!(stats.tokens_per_second >= 0.0, "TPS deve ser mensurável");
+        assert!(!output.is_empty(), "A resposta não deve ser vazia");
+        
+        println!("Super-Teste Concluído: {} tokens a {:.2} t/s", 
+            stats.generated_tokens, stats.tokens_per_second);
+    }
+}

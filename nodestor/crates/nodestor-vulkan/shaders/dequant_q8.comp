@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants {
+    uint NUM_BLOCKS;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    uint q8_data[];
+};
+
+layout(set = 0, binding = 1) buffer OutputBuffer {
+    float f32_data[];
+};
+
+uint get_byte(uint byte_idx) {
+    uint word = q8_data[byte_idx / 4];
+    return (word >> (8 * (byte_idx % 4))) & 0xFFu;
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15) & 0x00000001u;
+    uint e = (h >> 10) & 0x0000001Fu;
+    uint m = h & 0x000003FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s == 1u) ? -0.0 : 0.0;
+        return (s == 1u ? -1.0 : 1.0) * 5.960464477539063e-8 * (float(m) / 1024.0);
+    } else if (e == 31u) {
+        return (m == 0u) ? ((s == 1u) ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    }
+    return (s == 1u ? -1.0 : 1.0) * pow(2.0, float(e) - 15.0) * (1.0 + float(m) / 1024.0);
+}
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.NUM_BLOCKS) return;
+
+    uint byte_offset = block_idx * 34;
+    
+    uint s0 = get_byte(byte_offset);
+    uint s1 = get_byte(byte_offset + 1);
+    uint scale_bits = s0 | (s1 << 8);
+    float f_scale = f16_to_f32(scale_bits);
+    
+    uint out_offset = block_idx * 32;
+
+    for (uint i = 0; i < 32; i++) {
+        uint byte_val = get_byte(byte_offset + 2 + i);
+        int val = int(byte_val);
+        if (val > 127) val -= 256; 
+        f32_data[out_offset + i] = float(val) * f_scale;
+    }
+}

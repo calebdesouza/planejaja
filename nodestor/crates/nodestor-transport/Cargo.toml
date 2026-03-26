@@ -11,6 +11,14 @@ memmap2 = { workspace = true }
 zstd = { workspace = true }
 lz4_flex = { workspace = true }
 tracing = { workspace = true }
+rayon = "1"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO"
+]
 
 [target.'cfg(unix)'.dependencies]
 io-uring = "0.7"

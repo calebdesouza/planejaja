@@ -354,6 +354,37 @@ pub struct TransferRequest {
     pub compressed: bool,
 }
 
+/// Dica de compressão/formato para o motor de streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionHint {
+    None,
+    Lz4,
+    Zstd,
+    GgmlQ4,
+    GgmlQ8,
+    GDeflate,      // Microsoft DirectStorage lossless
+    ZstdLossless,  // NodeStor custom lossless
+}
+
+impl CompressionHint {
+    pub fn decompress_on_gpu(&self) -> bool {
+        match self {
+            Self::GgmlQ4 | Self::GgmlQ8 | Self::GDeflate | Self::ZstdLossless => true,
+            _ => false,
+        }
+    }
+}
+
+/// Requisição para streaming 'Líquido' (Micro-Fatiado).
+pub struct LiquidTransferRequest {
+    pub file_path: String,
+    pub file_offset: u64,
+    pub tensor_name: String,
+    pub total_size: usize,
+    pub chunk_size: usize,
+    pub compression: CompressionHint,
+}
+
 /// Resultado de uma transferência.
 #[derive(Debug, Clone)]
 pub struct TransferResult {

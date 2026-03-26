@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 nodestor-core = { path = "../nodestor-core" }
+nodestor-vulkan = { path = "../nodestor-vulkan" }
 thiserror = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }

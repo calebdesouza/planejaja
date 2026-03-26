@@ -1,5 +1,36 @@
 # Rust
 nodestor/target/
+debug/
+release/
+
+# Binaries
+*.exe
+*.pdb
+*.bin
+*.dll
+*.so
+*.dylib
+
+# Models
+*.gguf
+test_model/
+
+# Logs and temporary files
+*.log
+*.txt
+*.tmp
+build_error.txt
+build_log.txt
+cli_build_log.txt
+error.txt
+server_build_log.txt
+server_debug.log
+server_error.log
+server_universal_build.log
+server_v1_build.log
+server_v1_build_2.log
+server_v1_build_3.log
+test_output.txt
 
 # IDEs
 .vscode/

@@ -9,6 +9,7 @@ members = [
     "crates/nodestor-streaming",
     "crates/nodestor-metadata",
     "crates/nodestor-inference",
+    "crates/nodestor-python",
     "nodestor-cli",
     "nodestor-server",
 ]
@@ -54,6 +55,12 @@ byteorder = "1"
 tempfile = "3"
 criterion = { version = "0.5" }
 dirs = "5"
+
+# === Telemetria ===
+opentelemetry = "0.24"
+opentelemetry_sdk = "0.24"
+opentelemetry-otlp = "0.17"
+prometheus = "0.13"
 
 [profile.release]
 lto = true

@@ -11,6 +11,7 @@ nodestor-vulkan = { path = "../nodestor-vulkan" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+zstd = "0.13"
+ash = "0.38"
 
-[dev-dependencies]
 tempfile = { workspace = true }

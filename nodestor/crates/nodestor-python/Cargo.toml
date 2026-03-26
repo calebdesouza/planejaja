@@ -1,0 +1,16 @@
+[package]
+name = "nodestor-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nodestor"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+nodestor-core = { path = "../nodestor-core" }
+nodestor-scanner = { path = "../nodestor-scanner" }
+nodestor-inference = { path = "../nodestor-inference" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

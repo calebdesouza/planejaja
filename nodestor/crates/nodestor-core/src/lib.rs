@@ -4,7 +4,9 @@
 pub mod error;
 pub mod types;
 pub mod traits;
+pub mod telemetry;
 
 pub use error::NodeStorError;
 pub use types::*;
 pub use traits::*;
+pub use telemetry::*;

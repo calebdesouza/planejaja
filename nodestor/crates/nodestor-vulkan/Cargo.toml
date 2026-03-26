@@ -13,3 +13,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[build-dependencies]
+naga = { version = "0.19", features = ["glsl-in", "spv-out", "wgsl-out"] }

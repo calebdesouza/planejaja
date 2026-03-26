@@ -20,7 +20,7 @@ pub struct PrefetchedBlock {
 pub struct MesPrefetchQueue {
     request_tx: mpsc::Sender<TransferRequest>,
     result_rx: mpsc::Receiver<PrefetchedBlock>,
-    model_path: Arc<String>,
+    _model_path: Arc<String>,
 }
 
 impl MesPrefetchQueue {
@@ -64,13 +64,24 @@ impl MesPrefetchQueue {
 
                 match load_result {
                     Ok(Ok(transfer_result)) => {
-                        // Copia os dados do Host Array gerado pelo transport para o GpuBuffer mapeado.
-                        // *No futuro, io_uring + DMABUF lerá *direto* pro ponteiro do GpuBuffer.*
                         let tensor_data = transfer_result.data;
                         let gpu_buf = p_buf.buffer.as_mut().unwrap();
                         let dest = gpu_buf.as_mut_bytes();
-                        let len = tensor_data.len().min(dest.len());
-                        dest[..len].copy_from_slice(&tensor_data[..len]);
+
+                        let _bytes_written = if req.compressed {
+                            let mut cursor = std::io::Cursor::new(dest);
+                            match zstd::stream::copy_decode(&tensor_data[..], &mut cursor) {
+                                Ok(_) => cursor.position() as usize,
+                                Err(e) => {
+                                    error!("Descompressão Zstd falhou: {}", e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let len = tensor_data.len().min(dest.len());
+                            dest[..len].copy_from_slice(&tensor_data[..len]);
+                            len
+                        };
 
                         let block = PrefetchedBlock {
                             buffer: p_buf,
@@ -93,7 +104,7 @@ impl MesPrefetchQueue {
         Self {
             request_tx: req_tx,
             result_rx: res_rx,
-            model_path: path_arc,
+            _model_path: path_arc,
         }
     }
 

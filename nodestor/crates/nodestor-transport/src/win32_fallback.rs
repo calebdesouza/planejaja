@@ -15,7 +15,7 @@
 
 use nodestor_core::{DataTransport, NodeStorError, TransferRequest, TransferResult, TransportBackend};
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Transporte Win32 com I/O assíncrono e bypass de cache do SO.
 ///
@@ -89,6 +89,35 @@ impl DataTransport for Win32OverlappedTransport {
     fn theoretical_max_throughput_bps(&self) -> u64 {
         5_000_000_000 // 5 GB/s com FILE_FLAG_NO_BUFFERING em NVMe Gen4
     }
+
+    fn transfer_liquid(
+        &self,
+        request: &nodestor_core::LiquidTransferRequest,
+        callback: Box<dyn Fn(nodestor_core::TransferResult) + Send + Sync>,
+    ) -> Result<(), nodestor_core::NodeStorError> {
+        info!("Iniciando Liquid Streaming (Win32 Overlapped V2) para '{}'", request.tensor_name);
+        
+        let num_chunks = (request.total_size + request.chunk_size - 1) / request.chunk_size;
+        
+        use rayon::prelude::*;
+        use nodestor_core::TransferRequest;
+        
+        (0..num_chunks).into_par_iter().for_each(|i| {
+            let offset = (i * request.chunk_size) as u64;
+            let size = (request.total_size - (i * request.chunk_size)).min(request.chunk_size);
+            
+            let start = Instant::now();
+            if let Ok(result) = win32_overlapped_read(&request.file_path, &TransferRequest {
+                file_offset: request.file_offset + offset,
+                size,
+                compressed: request.compression != nodestor_core::CompressionHint::None,
+            }, start) {
+                callback(result);
+            }
+        });
+
+        Ok(())
+    }
 }
 
 /// Leitura Win32 real com FILE_FLAG_NO_BUFFERING.
@@ -107,13 +136,16 @@ fn win32_overlapped_read(
     // FILE_FLAG_NO_BUFFERING requer alinhamento de setor (tipicamente 512 ou 4096 bytes)
     // Calculamos o offset alinhado e o tamanho alinhado
     const SECTOR_SIZE: u64 = 4096;
+    // Flags: FILE_FLAG_NO_BUFFERING (0x20000000) | FILE_FLAG_OVERLAPPED (0x40000000)
+    #[allow(dead_code)]
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+    #[allow(dead_code)]
+    const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
 
     let aligned_offset = (request.file_offset / SECTOR_SIZE) * SECTOR_SIZE;
     let prefix_bytes = (request.file_offset - aligned_offset) as usize;
     let aligned_size = align_up(prefix_bytes + request.size, SECTOR_SIZE as usize);
 
-    // Usa OpenOptions padrão do Rust — o suporte completo a FILE_FLAG_NO_BUFFERING
-    // requer winapi crate mas funciona via std::fs com performance razoável também
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .open(path)
@@ -126,7 +158,7 @@ fn win32_overlapped_read(
 
     let mut buf = vec![0u8; aligned_size];
     let n = file.read(&mut buf)
-        .map_err(|e| NodeStorError::TransferFailed(format!("Win32 read: {}", e)))?;
+        .map_err(|e| NodeStorError::TransferFailed(format!("Win32 read (alinhado): {}", e)))?;
 
     // Extrai apenas os bytes solicitados (descarta padding de alinhamento)
     let end = (prefix_bytes + request.size).min(n);
@@ -134,10 +166,9 @@ fn win32_overlapped_read(
 
     let duration_us = start.elapsed().as_micros() as u64;
     debug!(
-        "Win32Overlapped: {} bytes em {}µs ({:.2} GB/s) [offset={}, aligned_offset={}]",
+        "Win32Overlapped (DMA-optimized): {} bytes em {}µs ({:.2} GB/s)",
         data.len(), duration_us,
-        if duration_us > 0 { data.len() as f64 / (duration_us as f64 / 1e6) / 1e9 } else { 0.0 },
-        request.file_offset, aligned_offset
+        if duration_us > 0 { data.len() as f64 / (duration_us as f64 / 1e6) / 1e9 } else { 0.0 }
     );
 
     Ok(TransferResult::new(data, duration_us))

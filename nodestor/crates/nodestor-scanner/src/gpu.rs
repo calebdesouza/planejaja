@@ -2,59 +2,30 @@ use nodestor_core::{GpuCapabilities, GpuVendor};
 use tracing::debug;
 
 /// Detecta GPUs disponíveis no sistema.
-/// Tenta via sysinfo; em um sistema completo isso seria via Vulkan instance query.
 pub fn detect_gpus() -> Vec<GpuCapabilities> {
-    use sysinfo::{Components, System};
-
-    let mut gpus = Vec::new();
-
-    // Tenta detectar via sysinfo (informação básica)
-    // Em produção completa: usar ash para query Vulkan physical devices
-    let sys = System::new_all();
-
-    // sysinfo não expõe GPUs diretamente; usamos heurística por componentes
-    let components = Components::new_with_refreshed_list();
-    for component in &components {
-        let label = component.label().to_lowercase();
-        if label.contains("gpu") || label.contains("vga") {
-            debug!("Componente GPU detectado: {}", component.label());
-        }
+    // 1. Tenta via Vulkan Engine (Passe 1 do Scanner)
+    let mut gpus = nodestor_vulkan::VulkanEngine::probe_gpus();
+    
+    if !gpus.is_empty() {
+        debug!("Vulkan probe detectou {} GPU(s)", gpus.len());
+        // Em um sistema real, poderíamos enriquecer as caps aqui (ex: VRAM via sysinfo)
+        return gpus;
     }
 
-    // Detecção via variáveis de ambiente (útil em CI/CD e containers)
-    if let Ok(cuda_visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        if !cuda_visible.is_empty() && cuda_visible != "-1" {
-            debug!("CUDA_VISIBLE_DEVICES={}", cuda_visible);
-        }
-    }
-
-    // Heurística de detecção por driver files
+    // 2. Fallback para heurísticas de SO/System info
+    debug!("Vulkan probe não retornou GPUs. Usando heurísticas de fallback.");
+    
     let nvidia = detect_nvidia_gpu();
     let amd = detect_amd_gpu();
     let intel = detect_intel_gpu();
 
-    if let Some(gpu) = nvidia {
-        gpus.push(gpu);
-    }
-    if let Some(gpu) = amd {
-        gpus.push(gpu);
-    }
-    if let Some(gpu) = intel {
-        gpus.push(gpu);
-    }
+    if let Some(gpu) = nvidia { gpus.push(gpu); }
+    if let Some(gpu) = amd { gpus.push(gpu); }
+    if let Some(gpu) = intel { gpus.push(gpu); }
 
-    // Se nenhuma GPU foi detectada, adiciona um placeholder CPU (para testes)
     if gpus.is_empty() {
         debug!("Nenhuma GPU detectada. Usando CPU fallback.");
-        gpus.push(GpuCapabilities {
-            vendor: GpuVendor::Unknown,
-            device_name: "CPU Fallback (sem GPU dedicada)".to_string(),
-            vram_bytes: 0,
-            supports_vulkan_compute: false,
-            supports_cooperative_matrix2: false,
-            supports_cooperative_matrix_khr: false,
-            supports_bfloat16: false,
-        });
+        gpus.push(GpuCapabilities::default());
     }
 
     gpus
@@ -120,6 +91,22 @@ fn detect_amd_gpu() -> Option<GpuCapabilities> {
             }
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        if std::path::Path::new("C:\\Windows\\System32\\amdvlk64.dll").exists()
+            || std::path::Path::new("C:\\Windows\\System32\\atidxx64.dll").exists()
+        {
+            return Some(GpuCapabilities {
+                vendor: GpuVendor::Amd,
+                device_name: "AMD Radeon GPU (Windows)".to_string(),
+                vram_bytes: 0,
+                supports_vulkan_compute: true,
+                supports_cooperative_matrix2: false,
+                supports_cooperative_matrix_khr: true,
+                supports_bfloat16: true,
+            });
+        }
+    }
     None
 }
 
@@ -139,6 +126,20 @@ fn detect_intel_gpu() -> Option<GpuCapabilities> {
             });
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        if std::path::Path::new("C:\\Windows\\System32\\igvk64.dll").exists() {
+            return Some(GpuCapabilities {
+                vendor: GpuVendor::Intel,
+                device_name: "Intel HD/Iris Graphics (Windows)".to_string(),
+                vram_bytes: 0,
+                supports_vulkan_compute: true,
+                supports_cooperative_matrix2: false,
+                supports_cooperative_matrix_khr: false,
+                supports_bfloat16: false,
+            });
+        }
+    }
     None
 }
 
@@ -149,6 +150,7 @@ fn read_nvidia_name() -> Option<String> {
         .map(|_| "NVIDIA GPU".to_string())
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "linux"))]
 fn read_nvidia_name() -> Option<String> {
     None
@@ -177,6 +179,7 @@ fn read_nvidia_vram() -> u64 {
     0
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "linux"))]
 fn read_nvidia_vram() -> u64 {
     0
@@ -200,6 +203,7 @@ fn check_driver_version_nvidia_cm2() -> bool {
     false
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "linux"))]
 fn check_driver_version_nvidia_cm2() -> bool {
     false

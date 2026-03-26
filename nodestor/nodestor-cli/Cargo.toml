@@ -12,9 +12,20 @@ nodestor-core = { path = "../crates/nodestor-core" }
 nodestor-scanner = { path = "../crates/nodestor-scanner" }
 nodestor-formats = { path = "../crates/nodestor-formats" }
 nodestor-transport = { path = "../crates/nodestor-transport" }
-clap = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+dialoguer = "0.11"
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+urlencoding = "2.1"
+nodestor-inference = { path = "../crates/nodestor-inference" }
+nodestor-vulkan = { path = "../crates/nodestor-vulkan" }
+nodestor-streaming = { path = "../crates/nodestor-streaming" }
+walkdir = "2"

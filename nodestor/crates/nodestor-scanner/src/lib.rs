@@ -8,7 +8,7 @@ mod storage;
 mod os_info;
 
 use nodestor_core::{HardwareProfile, NodeStorError, TransportBackend};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub use gpu::detect_gpus;
 pub use storage::detect_storage;
@@ -51,39 +51,57 @@ fn select_transport(
 ) -> TransportBackend {
     use nodestor_core::{GpuVendor, OsType};
 
-    // NVIDIA GPU no Linux → tentar GDS (requer driver + cuFile)
     let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
+    let has_amd = gpus.iter().any(|g| g.vendor == GpuVendor::Amd);
+    let has_vulkan = gpus.iter().any(|g| g.supports_vulkan_compute);
 
     match os {
         OsType::Linux => {
+            // 1. NVIDIA + Linux + cuFile disponível -> NvidiaGds
             if has_nvidia && gds_available() {
                 return TransportBackend::NvidiaGds;
             }
+            // 2. AMD + Linux + ROCm disponível -> RocmDirectGma
+            if has_amd && rocm_available() {
+                return TransportBackend::RocmDirectGma;
+            }
+            
             let kernel = parse_kernel_version(os_version);
+            // 4. Linux + kernel ≥ 6.16 -> IoUringDmabuf
             if kernel >= (6, 16, 0) {
-                warn!("io_uring + DMABUF requer kernel 6.16+. Versão: {}", os_version);
-                TransportBackend::IoUringDmabuf
-            } else if kernel >= (5, 11, 0) {
-                TransportBackend::IoUringStandard
-            } else {
-                warn!("Kernel antigo ({}). Usando fallback pread.", os_version);
-                TransportBackend::PreadFallback
+                return TransportBackend::IoUringDmabuf;
+            }
+            // 5. Linux + kernel ≥ 5.11 -> IoUringStandard
+            if kernel >= (5, 11, 0) {
+                return TransportBackend::IoUringStandard;
             }
         }
         OsType::Windows => {
+            // 3. Windows + DirectStorage DLLs presentes -> DirectStorage
             if directstorage_available() {
-                TransportBackend::DirectStorage
-            } else {
-                warn!("DirectStorage DLLs não encontradas. Use Win32 fallback.");
-                warn!("Para melhor performance, baixe: https://github.com/microsoft/DirectStorage/releases");
-                TransportBackend::Win32Fallback
+                return TransportBackend::DirectStorage;
             }
         }
-        _ => {
-            warn!("SO não suportado para transporte de alta performance. Usando pread.");
-            TransportBackend::PreadFallback
-        }
+        _ => {}
     }
+
+    // 6. Qualquer (Intel, Mac, sem GPU, CPU-only) -> VulkanGeneric (DMA via Vulkan)
+    if has_vulkan {
+        TransportBackend::VulkanGeneric
+    } else {
+        TransportBackend::PreadFallback
+    }
+}
+
+/// Tenta detectar se ROCm/DirectGMA está disponível.
+fn rocm_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/dev/kfd").exists() && 
+        std::path::Path::new("/opt/rocm").exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 /// Tenta detectar se cuFile/GDS está disponível.
@@ -102,9 +120,31 @@ fn gds_available() -> bool {
 fn directstorage_available() -> bool {
     #[cfg(target_os = "windows")]
     {
+        // 1. Verifica no diretório do executável atual
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(parent) = exe_path.parent() {
+                if parent.join("dstorage.dll").exists() && parent.join("dstoragecore.dll").exists() {
+                    return true;
+                }
+            }
+        }
+
+        // 2. Verifica no CWD (Diretório de trabalho)
         let cwd = std::env::current_dir().unwrap_or_default();
-        cwd.join("dstorage.dll").exists()
-            || std::path::Path::new("C:\\Windows\\System32\\dstorage.dll").exists()
+        if cwd.join("dstorage.dll").exists() && cwd.join("dstoragecore.dll").exists() {
+            return true;
+        }
+
+        // 3. Verifica no System32 (Onde o Windows instala componentes globais)
+        let system32 = std::path::Path::new("C:\\Windows\\System32");
+        if system32.join("dstorage.dll").exists() {
+            return true;
+        }
+
+        // 4. Fallback: Tenta ver se está no PATH (se pode carregar via OS)
+        // Em um sistema real, poderíamos usar LoadLibraryExA com flags específicas,
+        // mas para o Scanner, a presença do arquivo no System32 ou CWD é o sinal mais forte.
+        false
     }
     #[cfg(not(target_os = "windows"))]
     false

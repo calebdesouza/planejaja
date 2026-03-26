@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nodestor"
+version = "0.1.0"
+description = "NodeStor — High-performance AI Engine with Vulkan & DMA"
+requires-python = ">=3.10"
+authors = [{name = "NodeStor Team"}]
+license = {text = "MIT"}
+dependencies = []
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "crates/nodestor-python/Cargo.toml"
+module-name = "nodestor"

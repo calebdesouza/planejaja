@@ -12,8 +12,9 @@
 //! - [ ] `metralhadora.rs` — batch submission assíncrono
 
 pub mod buffer_pool;
-pub mod metralhadora;
 pub mod scheduler;
+pub mod metralhadora;
+pub mod liquid;
 
 pub use buffer_pool::{BufferPool, PooledBuffer};
 pub use metralhadora::{MesPrefetchQueue, PrefetchedBlock};

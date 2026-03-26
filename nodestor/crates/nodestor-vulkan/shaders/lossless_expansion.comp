@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer InputBuffer {
+    float data_in[];
+};
+
+layout(std430, binding = 1) buffer OutputBuffer {
+    float data_out[];
+};
+
+layout(push_constant) uniform Constants {
+    uint element_count;
+    uint mode; // 0 = Direct Copy, 1 = Reserved
+} push;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < push.element_count) {
+        // Bit-Identical Expansion: 100% de integridade original
+        data_out[idx] = data_in[idx];
+    }
+}

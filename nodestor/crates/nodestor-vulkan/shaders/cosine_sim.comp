@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants {
+    uint DIM;         // Dimensão do vetor (ex: 4096)
+    uint NUM_CANDS;   // Número de candidatos no banco
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    float query[];
+};
+
+layout(set = 0, binding = 1) readonly buffer CandidateBuffer {
+    float candidates[]; // [NUM_CANDS * DIM]
+};
+
+layout(set = 0, binding = 2) buffer ScoreBuffer {
+    float scores[];     // [NUM_CANDS]
+};
+
+void main() {
+    uint cand_idx = gl_GlobalInvocationID.x;
+    if (cand_idx >= pc.NUM_CANDS) return;
+
+    float dot_product = 0.0;
+    float norm_q = 0.0;
+    float norm_c = 0.0;
+
+    uint cand_offset = cand_idx * pc.DIM;
+
+    // TODO: Na vida real usaremos Subgroups L1 cache para reduzir lookup
+    for (uint i = 0; i < pc.DIM; i++) {
+        float q = query[i];
+        float c = candidates[cand_offset + i];
+
+        dot_product += q * c;
+        norm_q += q * q;
+        norm_c += c * c;
+    }
+
+    if (norm_q > 0.0 && norm_c > 0.0) {
+        scores[cand_idx] = dot_product / (sqrt(norm_q) * sqrt(norm_c));
+    } else {
+        scores[cand_idx] = 0.0;
+    }
+}

@@ -105,6 +105,30 @@ impl DataTransport for PreadFallback {
     fn theoretical_max_throughput_bps(&self) -> u64 {
         1_500_000_000 // 1.5 GB/s conservador
     }
+
+    fn transfer_liquid(
+        &self,
+        request: &nodestor_core::LiquidTransferRequest,
+        callback: Box<dyn Fn(nodestor_core::TransferResult) + Send + Sync>,
+    ) -> Result<(), nodestor_core::NodeStorError> {
+        use rayon::prelude::*;
+        let num_chunks = (request.total_size + request.chunk_size - 1) / request.chunk_size;
+        
+        (0..num_chunks).into_par_iter().for_each(|i| {
+            let offset = (i * request.chunk_size) as u64;
+            let size = (request.total_size - (i * request.chunk_size)).min(request.chunk_size);
+            
+            let req = nodestor_core::TransferRequest {
+                file_offset: request.file_offset + offset, // Note: LiquidTransferRequest doesn't have an outer offset, assuming 0 or add if needed
+                size,
+                compressed: false,
+            };
+            if let Ok(res) = self.transfer(&request.file_path, &req) {
+                callback(res);
+            }
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -10,8 +10,14 @@ nodestor-streaming = { path = "../nodestor-streaming" }
 nodestor-metadata = { path = "../nodestor-metadata" }
 nodestor-formats = { path = "../nodestor-formats" }
 tokio = { workspace = true }
+tokio-stream = "0.1"
+futures = "0.3"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 nodestor-scanner = { path = "../nodestor-scanner" }
 nodestor-transport = { path = "../nodestor-transport" }
 nodestor-vulkan = { path = "../nodestor-vulkan" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+byteorder = "1.5"

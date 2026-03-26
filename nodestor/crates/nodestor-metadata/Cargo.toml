@@ -6,7 +6,17 @@ description = "Metadata engine — LanceDB, DiskANN, Binary Quantization"
 
 [dependencies]
 nodestor-core = { path = "../nodestor-core" }
+nodestor-formats = { path = "../nodestor-formats" }
+futures = "0.3"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# Dependências nativas C++ para Vector DB (opcionais)
+lancedb = { version = "0.10", optional = true }
+arrow = { version = "51.0", optional = true }
+
+[features]
+default = []
+lancedb_native = ["lancedb", "arrow"]
