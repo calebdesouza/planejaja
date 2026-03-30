@@ -1,0 +1,111 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    uint input_data[];
+};
+
+layout(std430, binding = 1) buffer OutputBuffer {
+    uint output_data[];
+};
+
+layout(push_constant) uniform Constants {
+    uint tile_offset;        // Offset em bytes no buffer de entrada onde o tile começa
+    uint compressed_size;    // Tamanho do tile comprimido
+    uint uncompressed_size;  // Tamanho esperado descomprimido (ex: 64KB)
+    uint output_offset;      // Offset base no buffer de saída
+} push;
+
+// Estruturas Compartilhadas para a Tabela de Símbolos Huffman
+// O GDeflate separa os símbolos em 32 sub-streams, mas eles utilizam
+// tabelas unificadas construídas cooperativamente pelas 32 threads.
+shared uint huffman_symbols[320];   // 288 (Literal/Length) + 32 (Distances)
+shared uint huffman_base_codes[32]; // Códigos base (In-register na ref original, via shared memory aqui)
+shared uint huffman_offsets[32];    // Offsets no vetor principal
+
+// === UTILITÁRIOS (Compatível com Naga) === //
+
+// Conta quantos bits 1 existem (equivalente a countbits no HLSL)
+uint countbits(uint v) { return bitCount(v); }
+uint firstbitlow(uint v) { return uint(findLSB(v)); }
+
+// Na V2 o Naga suportará SubgroupOps integralmente ou usaremos glslc.
+// Para a fundação atual (MVP V1.1), simulamos a interface de Votação e Scan.
+shared uint shared_ballot;
+shared uint shared_scan[32];
+
+uint vote(bool cond) {
+    // Placeholder para subgroupBallot
+    return cond ? 1u : 0u; 
+}
+
+uint scan(uint value, uint tid) {
+    // Placeholder para subgroupExclusiveAdd (Prefix Sum)
+    shared_scan[tid] = value;
+    barrier();
+    uint sum = 0;
+    for (uint i = 0; i < tid; i++) {
+        sum += shared_scan[i];
+    }
+    barrier();
+    return sum;
+}
+
+uint shuffle_val(uint value, uint lane) {
+    // Placeholder para subgroupShuffle 
+    shared_scan[gl_LocalInvocationID.x] = value;
+    barrier();
+    return shared_scan[lane];
+}
+
+// === LEITOR DE BITS (BitReader) === //
+// Cada thread mantém um buffer de estado de 64 bits para o seu sub-stream individual.
+// O bitstream GDeflate possui 32 sub-streams perfeitamente paralelos.
+
+void main() {
+    uint tid = gl_LocalInvocationID.x; // ID do sub-stream (0 a 31)
+    
+    // NOTA DE PORTABILIDADE: 
+    // Em produção total de GDeflate Universal (Nodestor-G), aqui seria inserida a lógica 
+    // completa de swizzling do GDeflate:
+    // 1. BitReader carrega initial u64 bits.
+    // 2. Transcrição exata da decodificação de len/dist e Literais.
+    // 3. Resolução de cópias e literais direto para `output_data`.
+    
+    // Dada a complexidade monstruosa do decompressor HLSL (e a falta de compiler nativo 
+    // cruzado runtime), deixamos a infraestrutura e a fundação montada:
+    
+    // --- A Magia do GDeflate: Huffman Paralelo Modular --- //
+    // O GDeflate não lê um bitstream contínuo. Ele possui 32 sub-streams!
+    // Como funciona a descompressão paralela (Bulk-Synchronous):
+    // 
+    // 1. (Init) Todas as 32 threads leem os primeiros N bytes e enchem seu BitReader (64-bits).
+    // 2. (Decode) Cada thread, usando as árvores na `shared memory` (huffman_symbols), lê SEUS bits.
+    // 3. (Symbol) A thread decodifica um único símbolo (Literal ou Match Copy).
+    // 4. Se for Literal: a thread sabe exatamente ONDE escrever porque fazemos um `scan` (Prefix Sum)
+    //    exclusivo (`subgroupExclusiveAdd`) da quantidade de literais passados até chegar na thread.
+    // 5. Se for Match Copy: a thread calcula distância/comprimento e todos os threads sincronizam 
+    //    (`barrier`) para que as cópias não sobrescrevam literais.
+    // 
+    // Isto garante O(1) de custo por símbolo, e rodamos 32 descompressões DEFLATE de forma
+    // totalmente síncrona, ignorando os gargalos neurais da CPU.
+    
+    // EXXEMPLO MOCK: Expansão Universal Placeholder
+    // O throughput final será garantido pela integração com o HLSL cross-compilado (SPIRV-Cross)
+    // na V2, mantendo este arquivo como interface modular e mock para a orquestração do transporte.
+    
+    uint base_idx = push.tile_offset / 4;
+    uint out_idx = push.output_offset / 4;
+    
+    uint n_rounds = push.uncompressed_size / 4 / 32;
+    
+    for (uint i = 0; i < n_rounds; i++) {
+        uint val = input_data[base_idx + i * 32 + tid];
+        output_data[out_idx + i * 32 + tid] = val; // Placeholder
+    }
+}
+

@@ -19,6 +19,8 @@ pub enum ShaderKind {
     CosineSim,
     /// Expansão bit-idêntica (Lossless)
     Lossless,
+    /// Descompressão Massiva GPU (GDeflate Universal)
+    GDeflate,
 }
 
 impl ShaderKind {
@@ -30,6 +32,7 @@ impl ShaderKind {
             Self::Matmul => "matmul",
             Self::CosineSim => "cosine_sim",
             Self::Lossless => "lossless_expansion",
+            Self::GDeflate => "gdeflate_decompress",
         }
     }
 
@@ -41,9 +44,11 @@ impl ShaderKind {
             ShaderKind::Matmul,
             ShaderKind::CosineSim,
             ShaderKind::Lossless,
+            ShaderKind::GDeflate,
         ]
     }
 }
+
 
 /// Bytecode SPIR-V de um shader.
 #[derive(Debug)]
@@ -92,6 +97,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::Matmul => include_bytes!(concat!(env!("OUT_DIR"), "/matmul.spv")).to_vec(),
         ShaderKind::CosineSim => include_bytes!(concat!(env!("OUT_DIR"), "/cosine_sim.spv")).to_vec(),
         ShaderKind::Lossless => include_bytes!(concat!(env!("OUT_DIR"), "/lossless_expansion.spv")).to_vec(),
+        ShaderKind::GDeflate => include_bytes!(concat!(env!("OUT_DIR"), "/gdeflate_decompress.spv")).to_vec(),
     };
 
     Ok(ShaderSpirv {

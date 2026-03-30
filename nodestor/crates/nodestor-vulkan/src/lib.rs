@@ -49,6 +49,44 @@ impl VulkanEngine {
         Ok((output_buf, fence))
     }
 
+    /// Descompressão Massiva GPU (GDeflate Universal)
+    /// Recebe um stream GDeflate (com header NodeStor ou puro, ajustado pela engine)
+    pub fn decompress_gdeflate(
+        &self,
+        chunk: &[u8],
+        expected_size: usize,
+    ) -> Result<(GpuBuffer, ash::vk::Fence), NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::GDeflate)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline GDeflate not available".into()))?;
+
+        // 1. Upload do payload comprimido para a VRAM (DMA Zero-Copy)
+        let input_buf = self.ctx.upload_to_gpu(chunk)?;
+        // 2. Alocação do buffer de saída completo
+        let mut output_buf = self.ctx.alloc_gpu_buffer(expected_size)?;
+
+        // Em uma implementação real do pipeline Nodestor-G com headers de tile:
+        // let (tiles, _tile_size, header_len) = nodestor_gdeflate::tile::SerializedGDeflateStream::parse_header(chunk)?;
+        // Aqui assumiremos um mock simplificado de 1 bloco unificado para validação da fundação Vulkan
+        let tile_offset = 0; // offset após o header
+        let compressed_size = chunk.len() as u32;
+        let uncompressed_size = expected_size as u32;
+        let output_offset = 0;
+
+        // 3. Dispatch do Compute Shader
+        let fence = pipeline.dispatch_gdeflate(
+            &self.ctx,
+            &input_buf,
+            &mut output_buf,
+            tile_offset,
+            compressed_size,
+            uncompressed_size,
+            output_offset,
+        )?;
+
+        Ok((output_buf, fence))
+    }
+
+
     pub fn matmul(&self, a: &GpuBuffer, b: &GpuBuffer, m: u32, k: u32, n: u32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::Matmul).ok_or_else(|| NodeStorError::VulkanError("Pipeline Matmul not available".into()))?;
         let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;

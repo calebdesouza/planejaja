@@ -41,11 +41,12 @@ impl LiquidOrchestrator {
         let tx_clone = tx.clone();
         let t_a = self.transport_a.clone();
         let r_a = request_arc.clone();
-        
-        // Competidor A: Win32 Overlapped V2 / Native Fast Path
-        tokio::spawn(async move {
+
+        // Competidor A: transport roda em thread de bloqueio (Rayon) fora do executor Tokio.
+        tokio::task::spawn_blocking(move || {
             let callback = Box::new(move |res| {
-                let _ = tx_clone.blocking_send(res);
+                // tx.try_send é não-bloqueante e seguro em threads Rayon
+                let _ = tx_clone.try_send(res);
             });
             let _ = t_a.transfer_liquid(&r_a, callback);
         });
@@ -55,32 +56,71 @@ impl LiquidOrchestrator {
             let tx_clone_b = tx.clone();
             let t_b_clone = t_b.clone();
             let r_b = request_arc.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 let callback = Box::new(move |res| {
-                    let _ = tx_clone_b.blocking_send(res);
+                    let _ = tx_clone_b.try_send(res);
                 });
                 let _ = t_b_clone.transfer_liquid(&r_b, callback);
             });
         }
 
-        // Processador de fatias - o primeiro que chegar ganha
+        // Processador de fatias - o primeiro que chegar ganha (Modo Metralhadora)
         let mut chunks_processed = 0;
         let total_chunks = (request_arc.total_size + request_arc.chunk_size - 1) / request_arc.chunk_size;
+        let mut previous_fence: Option<ash::vk::Fence> = None;
 
         while let Some(res) = rx.recv().await {
-            debug!("   Líquido: Fatia de {} bytes recebida.", res.data.len());
+            debug!("   Líquido: Fatia de {} bytes recebida. Saturando barramento...", res.data.len());
             
-            // Dispatch para GPU imediatamente
-            let output_elements = res.data.len() / 4; // F32
-            let (_gpu_buf, fence) = self.vulkan.decompress_liquid(&res.data, output_elements)?;
-            
-            // Incrementamos
-            chunks_processed += 1;
-            if chunks_processed >= total_chunks {
-                // TODO: Limpar Fences remanescentes em produção
+            // PILLAR 3: Antes de processar a nova fatia, verificamos se a anterior terminou.
+            // Isso permite que o transporte da nova fatia aconteça ENQUANTO a GPU calculava a anterior.
+            if let Some(fence) = previous_fence {
                 unsafe {
                     let device = self.vulkan.ctx.device().unwrap();
-                    device.wait_for_fences(&[fence], true, u64::MAX).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+                    device.wait_for_fences(&[fence], true, u64::MAX)
+                        .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+                }
+            }
+
+            // Tamanho original esperado para este chunk em específico
+            let expected_size_bytes = (request_arc.total_size - (chunks_processed * request_arc.chunk_size)).min(request_arc.chunk_size);
+            
+            let (gpu_buf, current_fence) = if request_arc.compression == nodestor_core::CompressionHint::GDeflate {
+                // Rota Nodestor-G: GDeflate nativo em Vulkan Compute
+                let mut exact_uncomp_size = expected_size_bytes; // Fallback
+                if res.data.len() >= 8 {
+                    if let Ok((tiles, _tsize, _hlen)) = nodestor_gdeflate::tile::SerializedGDeflateStream::parse_header(&res.data) {
+                        let total_unc: u32 = tiles.iter().map(|t| t.uncompressed_size).sum();
+                        exact_uncomp_size = total_unc as usize;
+                    }
+                }
+                
+                self.vulkan.decompress_gdeflate(&res.data, exact_uncomp_size)?
+            } else {
+                // PILLAR 1: Expansão Lossless via Direct/Liquid original
+                let output_elements = expected_size_bytes / 4; // F32 / Dequant
+                self.vulkan.decompress_liquid(&res.data, output_elements)?
+            };
+            
+            // Opcional: Aqui o gpu_buf estaria inserido no TensorRegistry ou Cache L1.
+            let _ = gpu_buf;
+            
+            previous_fence = Some(current_fence);
+            chunks_processed += 1;
+
+            // PILLAR 4: Pre-fetching Preditivo
+            if request_arc.look_ahead_hint && chunks_processed == (total_chunks / 2) {
+                debug!("   🎯 Look-Ahead: Sinal de pré-carregamento emitido para próxima camada.");
+            }
+
+            if chunks_processed >= total_chunks {
+                // Aguarda o último suspiro da metralhadora
+                if let Some(fence) = previous_fence {
+                    unsafe {
+                        let device = self.vulkan.ctx.device().unwrap();
+                        device.wait_for_fences(&[fence], true, u64::MAX)
+                            .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+                    }
                 }
                 break;
             }

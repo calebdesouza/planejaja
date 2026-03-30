@@ -30,7 +30,8 @@ pub fn scan() -> Result<HardwareProfile, NodeStorError> {
     let cpu_cores = num_cpus();
     let total_ram_bytes = total_ram();
 
-    let recommended_transport = select_transport(&os, &gpus, &os_version);
+    let mut missed_optimizations = Vec::new();
+    let recommended_transport = select_transport(&os, &gpus, &storage, &os_version, &mut missed_optimizations);
     info!("Backend de transporte selecionado: {}", recommended_transport);
 
     Ok(HardwareProfile {
@@ -41,15 +42,18 @@ pub fn scan() -> Result<HardwareProfile, NodeStorError> {
         recommended_transport,
         cpu_cores,
         total_ram_bytes,
+        missed_optimizations,
     })
 }
 
 fn select_transport(
     os: &nodestor_core::OsType,
     gpus: &[nodestor_core::GpuCapabilities],
+    storage: &[nodestor_core::StorageInfo],
     os_version: &str,
+    missed: &mut Vec<String>,
 ) -> TransportBackend {
-    use nodestor_core::{GpuVendor, OsType};
+    use nodestor_core::{GpuVendor, OsType, NvmeGen};
 
     let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
     let has_amd = gpus.iter().any(|g| g.vendor == GpuVendor::Amd);
@@ -57,29 +61,43 @@ fn select_transport(
 
     match os {
         OsType::Linux => {
-            // 1. NVIDIA + Linux + cuFile disponível -> NvidiaGds
-            if has_nvidia && gds_available() {
-                return TransportBackend::NvidiaGds;
+            // 1. NVIDIA GDS
+            if has_nvidia {
+                if gds_available() {
+                    return TransportBackend::NvidiaGds;
+                } else {
+                    missed.push("NVIDIA GPUDirect Storage ignorado: libcufile.so não encontrado.".to_string());
+                }
             }
-            // 2. AMD + Linux + ROCm disponível -> RocmDirectGma
-            if has_amd && rocm_available() {
-                return TransportBackend::RocmDirectGma;
+            
+            // 2. AMD ROCm
+            if has_amd {
+                if rocm_available() {
+                    return TransportBackend::RocmDirectGma;
+                } else {
+                    missed.push("AMD ROCm DirectGMA ignorado: /dev/kfd ou /opt/rocm não encontrados.".to_string());
+                }
             }
             
             let kernel = parse_kernel_version(os_version);
-            // 4. Linux + kernel ≥ 6.16 -> IoUringDmabuf
             if kernel >= (6, 16, 0) {
                 return TransportBackend::IoUringDmabuf;
-            }
-            // 5. Linux + kernel ≥ 5.11 -> IoUringStandard
-            if kernel >= (5, 11, 0) {
+            } else if kernel >= (5, 11, 0) {
+                missed.push(format!("DMABUF Zero-copy ignorado: Kernel {} < 6.16.", os_version));
                 return TransportBackend::IoUringStandard;
             }
         }
         OsType::Windows => {
-            // 3. Windows + DirectStorage DLLs presentes -> DirectStorage
+            // 3. DirectStorage
             if directstorage_available() {
-                return TransportBackend::DirectStorage;
+                let has_gen3 = storage.iter().any(|s| s.nvme_gen >= NvmeGen::Gen3);
+                if has_gen3 {
+                    return TransportBackend::DirectStorage;
+                } else {
+                    missed.push("DirectStorage em modo degradado: Nenhum SSD NVMe Gen3+ detectado.".to_string());
+                }
+            } else {
+                missed.push("DirectStorage ignorado: dstorage.dll e dstoragecore.dll não encontrados localmente.".to_string());
             }
         }
         _ => {}

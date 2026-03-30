@@ -17,6 +17,7 @@ pub enum PipelineKind {
     Matmul,
     CosineSim,
     Lossless,
+    GDeflate,
 }
 
 /// Compute pipeline encapsulando um shader e seus recursos.
@@ -79,10 +80,11 @@ impl ComputePipeline {
                 .map_err(|e: ash::vk::Result| VulkanError::DeviceCreation(e.to_string()))?;
 
             let layouts = [descriptor_set_layout];
+            let push_constant_size = if kind == PipelineKind::GDeflate { 16 } else { 12 };
             let push_constant_ranges = [ash::vk::PushConstantRange::default()
                 .stage_flags(ash::vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(12)];
+                .size(push_constant_size)];
             
             let pipeline_layout_info = ash::vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&layouts)
@@ -229,6 +231,67 @@ impl ComputePipeline {
             Ok(fence)
         }
     }
+    pub fn dispatch_gdeflate(
+        &self,
+        ctx: &VulkanContext,
+        input: &GpuBuffer,
+        output: &mut GpuBuffer,
+        tile_offset: u32,
+        compressed_size: u32,
+        uncompressed_size: u32,
+        output_offset: u32,
+    ) -> Result<ash::vk::Fence, NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("Cannot run GDeflate CPU fallback via pipeline, use nodestor_gdeflate instead".into()));
+        }
+
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            
+            let pool_sizes = [ash::vk::DescriptorPoolSize::default().ty(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2)];
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes);
+            let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_in = [ash::vk::DescriptorBufferInfo::default().buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_in),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let cmd_pool_info = ash::vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family_index);
+            let cmd_pool = device.create_command_pool(&cmd_pool_info, None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_bufs = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            // push_constants: 4 u32 (16 bytes) conform mapping no shader glsl
+            let constants = [tile_offset, compressed_size, uncompressed_size, output_offset];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 16);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            // GDeflate usa 32 threads por bloco = 1 wavefront. No shader: layout(local_size_x = 32) in
+            // Uma chamada de compute processa 1 tile inteiro de 64KB usando 32 sub-streams simultâneos.
+            // Para N tiles, chamaríamos dispatch(N, 1, 1). Aqui despachamos 1 para a abstração tile-a-tile.
+            device.cmd_dispatch(cmd_buf, 1, 1, 1);
+            
+            device.end_command_buffer(cmd_buf).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let fence = device.create_fence(&ash::vk::FenceCreateInfo::default(), None).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], fence).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            Ok(fence)
+        }
+    }
 
     pub fn dispatch_matmul(
         &self,
@@ -362,6 +425,7 @@ pub fn create_all_pipelines(
         map.insert(PipelineKind::Matmul, ComputePipeline::new_simulation(PipelineKind::Matmul));
         map.insert(PipelineKind::CosineSim, ComputePipeline::new_simulation(PipelineKind::CosineSim));
         map.insert(PipelineKind::Lossless, ComputePipeline::new_simulation(PipelineKind::Lossless));
+        map.insert(PipelineKind::GDeflate, ComputePipeline::new_simulation(PipelineKind::GDeflate));
         return Ok(map);
     }
 
@@ -373,7 +437,9 @@ pub fn create_all_pipelines(
             ShaderKind::Matmul => PipelineKind::Matmul,
             ShaderKind::CosineSim => PipelineKind::CosineSim,
             ShaderKind::Lossless => PipelineKind::Lossless,
+            ShaderKind::GDeflate => PipelineKind::GDeflate,
         };
+
         let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
         map.insert(kind, pipeline);
     }

@@ -15,6 +15,9 @@ pub enum NodeStorError {
     #[error("Vulkan error: {0}")]
     VulkanError(String),
 
+    #[error("GDeflate error: {0}")]
+    GDeflateError(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

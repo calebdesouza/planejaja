@@ -2356,6 +2356,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdeflate"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3592607e4bf12b707c22523c1ee82b1b6c7b7aac8d24bc055afe62e41734fa2d"
+dependencies = [
+ "gdeflate-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "gdeflate-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57d037ff28c21adce29618dbe9271e8b5a7ed121efe8482b43182db9649797d0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3856,6 +3875,7 @@ dependencies = [
  "futures",
  "nodestor-core",
  "nodestor-formats",
+ "nodestor-gdeflate",
  "nodestor-inference",
  "nodestor-scanner",
  "nodestor-streaming",
@@ -3870,6 +3890,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
@@ -3895,6 +3916,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "nodestor-gdeflate"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "gdeflate",
+ "nodestor-core",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -3985,6 +4017,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "nodestor-core",
+ "nodestor-gdeflate",
  "nodestor-transport",
  "nodestor-vulkan",
  "tempfile",

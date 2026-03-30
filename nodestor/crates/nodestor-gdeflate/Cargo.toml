@@ -1,0 +1,12 @@
+[package]
+name = "nodestor-gdeflate"
+
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+gdeflate = "0.4.1"
+byteorder.workspace = true

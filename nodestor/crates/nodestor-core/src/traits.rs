@@ -13,6 +13,12 @@ pub trait DataTransport: Send + Sync {
         request: &TransferRequest,
     ) -> Result<TransferResult, NodeStorError>;
 
+    /// Envia dados brutos do host (RAM) para um buffer na VRAM (SSD-Offloading).
+    /// Usado para o Zero-Loss Context Paging.
+    fn write_to_vram_buffer(&self, _data: &[u8]) -> Result<(), NodeStorError> {
+        Ok(())
+    }
+
     /// Enfileira múltiplas transferências (Modo Metralhadora).
     /// Implementação default: executa sequencialmente.
     fn transfer_batch(

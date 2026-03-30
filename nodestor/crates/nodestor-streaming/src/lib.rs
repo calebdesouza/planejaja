@@ -15,7 +15,8 @@ pub mod buffer_pool;
 pub mod scheduler;
 pub mod metralhadora;
 pub mod liquid;
-
+pub mod layer_graph;
+pub mod speculative;
 pub use buffer_pool::{BufferPool, PooledBuffer};
 pub use metralhadora::{MesPrefetchQueue, PrefetchedBlock};
-pub use scheduler::StreamScheduler;
+pub use scheduler::BurstScheduler;

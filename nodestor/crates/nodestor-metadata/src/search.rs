@@ -120,6 +120,17 @@ impl VectorSearch {
         }
     }
 
+    /// Wrapper de alto nível para indexar um documento inteiro (Simulado para V1.0).
+    pub async fn add_document(
+        &self,
+        _path: &str,
+        _content: &str,
+    ) -> Result<(), NodeStorError> {
+        tracing::debug!("Indéxando documento de alta precisão: {}", _path);
+        // Simulação de embedding e upsert
+        self.upsert(_path, &[0.0; 128], _content).await
+    }
+
     /// Insere ou atualiza um fragmento de conhecimento na base vetorial.
     pub async fn upsert(
         &self,

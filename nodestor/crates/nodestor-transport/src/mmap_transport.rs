@@ -74,18 +74,42 @@ impl DataTransport for MmapTransport {
         callback: Box<dyn Fn(nodestor_core::TransferResult) + Send + Sync>,
     ) -> Result<(), nodestor_core::NodeStorError> {
         use rayon::prelude::*;
+        use nodestor_core::CompressionHint;
+
         let num_chunks = (request.total_size + request.chunk_size - 1) / request.chunk_size;
-        
+        let use_zstd = request.compression == CompressionHint::ZstdLossless
+            || request.compression == CompressionHint::Zstd;
+
         (0..num_chunks).into_par_iter().for_each(|i| {
             let offset = (i * request.chunk_size) as u64;
             let size = (request.total_size - (i * request.chunk_size)).min(request.chunk_size);
-            
+
             let req = nodestor_core::TransferRequest {
                 file_offset: request.file_offset + offset,
                 size,
-                compressed: false,
+                compressed: use_zstd,
             };
-            if let Ok(res) = self.transfer(&request.file_path, &req) {
+
+            if let Ok(mut res) = self.transfer(&request.file_path, &req) {
+                // PILLAR 1 — Lossless decompression on the transport path (CPU-assist)
+                // The GPU kernel then receives clean FP16/FP32 bytes with zero quality loss.
+                if use_zstd {
+                    match zstd::decode_all(res.data.as_slice()) {
+                        Ok(decoded) => {
+                            tracing::debug!(
+                                "Lossless Zstd: {} bytes -> {} bytes (ratio: {:.2}x)",
+                                res.data.len(), decoded.len(),
+                                decoded.len() as f64 / res.data.len().max(1) as f64
+                            );
+                            res.data = decoded;
+                        }
+                        Err(_) => {
+                            // Dados não comprimidos — continua com bytes brutos (compatível com
+                            // arquivos GGUF sem compressão, tornando o sistema universal)
+                            tracing::debug!("Chunk {}: dados não comprimidos, passando direto.", i);
+                        }
+                    }
+                }
                 callback(res);
             }
         });

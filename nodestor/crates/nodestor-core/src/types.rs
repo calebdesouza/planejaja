@@ -67,6 +67,14 @@ pub struct GpuCapabilities {
     pub supports_cooperative_matrix_khr: bool,
     /// Suporte a BF16 (importante para inferência moderna).
     pub supports_bfloat16: bool,
+    /// Geração PCIe (ex: 3, 4, 5).
+    pub pcie_gen: u32,
+    /// Número de lanes PCIe (ex: 16).
+    pub pcie_lanes: u32,
+    /// Se Resizable BAR está ativado.
+    pub resizable_bar_enabled: bool,
+    /// Versão do driver instalada.
+    pub driver_version: String,
 }
 
 impl Default for GpuCapabilities {
@@ -79,6 +87,10 @@ impl Default for GpuCapabilities {
             supports_cooperative_matrix2: false,
             supports_cooperative_matrix_khr: false,
             supports_bfloat16: false,
+            pcie_gen: 0,
+            pcie_lanes: 0,
+            resizable_bar_enabled: false,
+            driver_version: "N/A".to_string(),
         }
     }
 }
@@ -185,6 +197,8 @@ pub struct HardwareProfile {
     pub cpu_cores: usize,
     /// RAM total do sistema em bytes.
     pub total_ram_bytes: u64,
+    /// Motivos pelos quais backends mais rápidos foram ignorados.
+    pub missed_optimizations: Vec<String>,
 }
 
 impl HardwareProfile {
@@ -383,6 +397,8 @@ pub struct LiquidTransferRequest {
     pub total_size: usize,
     pub chunk_size: usize,
     pub compression: CompressionHint,
+    /// Dica para o motor disparar a próxima carga antecipadamente.
+    pub look_ahead_hint: bool,
 }
 
 /// Resultado de uma transferência.

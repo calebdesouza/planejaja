@@ -11,7 +11,7 @@ members = [
     "crates/nodestor-inference",
     "crates/nodestor-python",
     "nodestor-cli",
-    "nodestor-server",
+    "nodestor-server", "crates/nodestor-gdeflate",
 ]
 
 [workspace.package]

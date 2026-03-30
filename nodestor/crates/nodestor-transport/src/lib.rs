@@ -122,7 +122,19 @@ pub fn recommend_backend(profile: &HardwareProfile) -> TransportBackend {
     let has_amd = profile.gpus.iter().any(|g| g.vendor == GpuVendor::Amd);
     let has_vulkan = profile.gpus.iter().any(|g| g.supports_vulkan_compute);
 
+    let has_rebar = profile.gpus.iter().any(|g| g.resizable_bar_enabled);
+
     match os {
+        OsType::Windows => {
+            if directstorage_dlls_available() {
+                TransportBackend::DirectStorage
+            } else if has_rebar && has_vulkan {
+                // Re-BAR permite que o Mmap (VulkanGeneric) seja Ultra-Rápido, superando Win32 Overlapped
+                TransportBackend::VulkanGeneric
+            } else {
+                TransportBackend::Win32Fallback
+            }
+        }
         OsType::Linux => {
             if has_nvidia && nvidia_gds_available_static() {
                 TransportBackend::NvidiaGds
@@ -132,15 +144,6 @@ pub fn recommend_backend(profile: &HardwareProfile) -> TransportBackend {
                 TransportBackend::IoUringDmabuf
             } else {
                 TransportBackend::IoUringStandard
-            }
-        }
-        OsType::Windows => {
-            if directstorage_dlls_available() {
-                TransportBackend::DirectStorage
-            } else if has_vulkan {
-                TransportBackend::VulkanGeneric
-            } else {
-                TransportBackend::Win32Fallback
             }
         }
         _ => {

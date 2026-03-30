@@ -60,15 +60,7 @@ impl VulkanContext {
             queue_family_index: 0,
             allocator: None,
             vulkan_available: false,
-            capabilities: GpuCapabilities {
-                vendor: nodestor_core::GpuVendor::Unknown,
-                device_name: "CPU Simulation".to_string(),
-                vram_bytes: 0,
-                supports_vulkan_compute: false,
-                supports_cooperative_matrix2: false,
-                supports_cooperative_matrix_khr: false,
-                supports_bfloat16: false,
-            },
+            capabilities: GpuCapabilities::default(),
             device_name: "CPU Simulation".to_string(),
         }
     }
@@ -91,14 +83,50 @@ pub fn probe_physical_devices() -> Result<Vec<GpuCapabilities>, VulkanError> {
         for pdevice in pdevices {
             let props = instance.get_physical_device_properties(pdevice);
             let name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+            
+            let mem_props = instance.get_physical_device_memory_properties(pdevice);
+            let mut rebar_enabled = false;
+            let mut vram_bytes = 0;
+            
+            for heap in mem_props.memory_heaps.iter() {
+                if heap.flags.contains(ash::vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                    vram_bytes += heap.size;
+                }
+            }
+
+            // Heurística Re-BAR
+            for i in 0..mem_props.memory_type_count {
+                let m_type = mem_props.memory_types[i as usize];
+                if m_type.property_flags.contains(ash::vk::MemoryPropertyFlags::DEVICE_LOCAL | ash::vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                    let heap_index = m_type.heap_index;
+                    let heap_size = mem_props.memory_heaps[heap_index as usize].size;
+                    if heap_size >= vram_bytes * 8 / 10 {
+                        rebar_enabled = true;
+                    }
+                }
+            }
+
             results.push(GpuCapabilities {
-                vendor: nodestor_core::GpuVendor::Unknown,
+                vendor: match props.vendor_id {
+                    0x10DE => nodestor_core::GpuVendor::Nvidia,
+                    0x1002 => nodestor_core::GpuVendor::Amd,
+                    0x8086 => nodestor_core::GpuVendor::Intel,
+                    _ => nodestor_core::GpuVendor::Unknown,
+                },
                 device_name: name,
-                vram_bytes: 0, 
+                vram_bytes, 
                 supports_vulkan_compute: true,
                 supports_cooperative_matrix2: false,
                 supports_cooperative_matrix_khr: false,
                 supports_bfloat16: false,
+                pcie_gen: 0,
+                pcie_lanes: 0,
+                resizable_bar_enabled: rebar_enabled,
+                driver_version: format!("{}.{}.{}", 
+                    (props.driver_version >> 22) & 0x3FF,
+                    (props.driver_version >> 14) & 0xFF,
+                    props.driver_version & 0x3FFF
+                ),
             });
         }
         Ok(results)
@@ -116,6 +144,7 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
         for pdevice in pdevices {
             let props = instance.get_physical_device_properties(pdevice);
             let name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
+            
             if gpu_hint.map_or(true, |h| name.contains(&h.device_name)) {
                 let queue_props = instance.get_physical_device_queue_family_properties(pdevice);
                 let q_index = queue_props.iter().enumerate()
@@ -135,6 +164,12 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                     allocation_sizes: Default::default(),
                 }).map_err(|e| VulkanError::DeviceCreation(e.to_string()))?;
 
+                let driver_ver = format!("{}.{}.{}", 
+                    (props.driver_version >> 22) & 0x3FF,
+                    (props.driver_version >> 14) & 0xFF,
+                    props.driver_version & 0x3FFF
+                );
+
                 return Ok(VulkanContext {
                     entry: Some(entry),
                     instance: Some(instance),
@@ -144,15 +179,24 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                     allocator: Some(std::sync::Arc::new(std::sync::Mutex::new(allocator))),
                     vulkan_available: true,
                     capabilities: GpuCapabilities {
-                        vendor: nodestor_core::GpuVendor::Unknown,
-                        device_name: name.clone().into_owned(),
-                        vram_bytes: 0,
+                        vendor: match props.vendor_id {
+                            0x10DE => nodestor_core::GpuVendor::Nvidia,
+                            0x1002 => nodestor_core::GpuVendor::Amd,
+                            0x8086 => nodestor_core::GpuVendor::Intel,
+                            _ => nodestor_core::GpuVendor::Unknown,
+                        },
+                        device_name: name.into_owned(),
+                        vram_bytes: 0, 
                         supports_vulkan_compute: true,
                         supports_cooperative_matrix2: false,
                         supports_cooperative_matrix_khr: false,
                         supports_bfloat16: false,
+                        pcie_gen: 0,
+                        pcie_lanes: 0,
+                        resizable_bar_enabled: false,
+                        driver_version: driver_ver,
                     },
-                    device_name: name.into_owned(),
+                    device_name: "Gpu Context".to_string(),
                 });
             }
         }

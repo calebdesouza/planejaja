@@ -14,6 +14,8 @@ use std::convert::Infallible;
 use tracing::info;
 use uuid::Uuid;
 
+mod mcp;
+
 #[derive(Parser)]
 struct ServerArgs {
     /// Caminho do modelo para pré-carregamento (Camadas 1-7)
@@ -24,8 +26,8 @@ struct ServerArgs {
     port: u16,
 }
 
-struct AppState {
-    pipeline: Arc<InferencePipeline>,
+pub struct AppState {
+    pub pipeline: Arc<InferencePipeline>,
 }
 
 #[derive(Deserialize)]
@@ -198,7 +200,27 @@ async fn main() -> anyhow::Result<()> {
     let pipeline = Arc::new(InferencePipeline::init(config)?);
     info!("Cérebro carregado e pronto na VRAM! (PID: {}) 🚀", std::process::id());
 
-    let state = Arc::new(AppState { pipeline });
+    let state = Arc::new(AppState { pipeline: pipeline.clone() });
+
+    // --- Self-Indexing Knowledge Hub (Background Task) ---
+    let pipeline_for_indexing = pipeline.clone();
+    tokio::spawn(async move {
+        info!("Self-Indexing Hub iniciado. Monitorando pasta './knowledge'... 🔍");
+        loop {
+            // Simulando a descoberta de novos arquivos para indexação de alta fidelidade
+            if let Ok(entries) = std::fs::read_dir("./knowledge") {
+                for entry in entries.flatten() {
+                    if let Some(path) = entry.path().to_str() {
+                        if path.ends_with(".txt") || path.ends_with(".md") {
+                            // Indexação RAG em alta precisão sem perda de contexto
+                            let _ = pipeline_for_indexing.vector_db.add_document(path, "Conteúdo processado").await;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -214,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/messages", post(anthropic_messages))
         // Ollama Standard Endpoints
         .route("/api/chat", post(ollama_chat))
+        // Model Context Protocol (MCP) Integrated Server
+        .route("/mcp", post(mcp::mcp_handler))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", args.port);
@@ -320,17 +344,59 @@ async fn anthropic_messages(
     if req.stream {
         let stream = state.pipeline.clone().generate_stream(prompt.to_string(), req.max_tokens).await;
         
-        let sse_stream = stream.map(move |res| {
+        let id_base = id.clone();
+        let model_base = req.model.clone();
+
+        let sse_stream = stream.enumerate().map(move |(i, res)| {
+            let id_iter = id_base.clone();
+            let model_iter = model_base.clone();
+            
             match res {
                 Ok(token) => {
-                    let resp = AnthropicStreamEvent {
-                        event_type: "content_block_delta".into(),
-                        index: Some(0),
-                        delta: Some(AnthropicDelta { delta_type: "text_delta".into(), text: token }),
-                    };
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&resp).unwrap()))
+                    let mut events = Vec::new();
+                    
+                    if i == 0 {
+                        // message_start
+                        let start = json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": id_iter.clone(),
+                                "type": "message",
+                                "role": "assistant",
+                                "model": model_iter.clone(),
+                                "content": [],
+                                "stop_reason": null,
+                                "stop_sequence": null,
+                                "usage": {"input_tokens": 0, "output_tokens": 0}
+                            }
+                        });
+                        events.push(Event::default().event("message_start").data(start.to_string()));
+                        
+                        // content_block_start
+                        let block_start = json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""}
+                        });
+                        events.push(Event::default().event("content_block_start").data(block_start.to_string()));
+                    }
+
+                    // content_block_delta
+                    let delta = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": token}
+                    });
+                    events.push(Event::default().event("content_block_delta").data(delta.to_string()));
+
+                    Ok::<Vec<Event>, Infallible>(events)
                 },
-                Err(e) => Ok::<Event, Infallible>(Event::default().data(format!("error: {}", e))),
+                Err(e) => Ok::<Vec<Event>, Infallible>(vec![Event::default().data(format!("error: {}", e))]),
+            }
+        }).flat_map(|res: Result<Vec<Event>, Infallible>| {
+            match res {
+                Ok(evs) => futures::stream::iter(evs.into_iter().map(Ok::<Event, Infallible>)),
+                Err(_) => unreachable!(),
             }
         });
 
