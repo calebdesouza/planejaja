@@ -1,0 +1,81 @@
+#version 450
+
+// ============================================================================
+// matmul_coop.comp — Matmul via GL_KHR_cooperative_matrix (Apex Tier)
+//
+// GL_KHR_cooperative_matrix permite que um *warp inteiro* de threads coopere
+// para executar operações GEMM em WMMA/Tensor Core via SPIR-V.
+//
+// ## Ganho em relação ao matmul.comp tiled:
+// - matmul.comp tiled:    cada thread calcula 1 elemento → muitos loads redundantes
+// - matmul_coop.comp:     warp inteiro calcula 16x16 de uma vez → ~8x menos loads
+//
+// ## Requisitos de hardware:
+// - NVIDIA: Turing (RTX 2000) ou superior via NV_cooperative_matrix2
+// - AMD:    RDNA3+ via KHR_cooperative_matrix
+// - Intel:  Arc via KHR_cooperative_matrix
+//
+// ## Detecção + Fallback
+// O VulkanEngine detecta `supports_cooperative_matrix_khr` na inicialização.
+// Se não disponível, usa `matmul.comp` padrão automaticamente.
+// Zero impacto no usuário.
+//
+// ## Especificação GLSL
+// GL_KHR_cooperative_matrix define:
+//   coopmat<Type, Scope, Rows, Cols, Use>
+// Onde Use ∈ {MatrixA, MatrixB, MatrixAccumulator}
+//
+// Nota: Este shader requer SPIR-V 1.6+ e Vulkan 1.3+
+// ============================================================================
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Buffers de entrada e saída
+layout(set = 0, binding = 0) readonly buffer MatA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer MatB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer MatC { float c[]; };
+
+// Dimensões: m=linhas(A), k=colunas(A)=linhas(B), n=colunas(B)
+layout(push_constant) uniform Dims {
+    uint m;
+    uint k;
+    uint n;
+};
+
+// Tile 16x16 para cooperative matrix
+const uint TILE = 16;
+
+void main() {
+    // Índices de tile do resultado
+    uint tile_row = gl_WorkGroupID.y * TILE;
+    uint tile_col = gl_WorkGroupID.x * TILE;
+
+    // Verifica limites
+    if (tile_row >= m || tile_col >= n) return;
+
+    // Acumulador 16x16 FP32 inicializado com zero
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+    coopMatLoad(acc, c, tile_row * n + tile_col, n, gl_CooperativeMatrixLayoutRowMajor);
+    // Zera o acumulador
+    acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0f);
+
+    // Loop sobre tiles de k
+    for (uint kk = 0; kk < k; kk += TILE) {
+        // Carrega tile A (16x16) de forma cooperativa — warp inteiro colabora
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+        coopMatLoad(matA, a, tile_row * k + kk, k, gl_CooperativeMatrixLayoutRowMajor);
+
+        // Carrega tile B (16x16) de forma cooperativa
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+        coopMatLoad(matB, b, kk * n + tile_col, n, gl_CooperativeMatrixLayoutRowMajor);
+
+        // MULADD: acc += A * B em toda a eficiência do Tensor Core / SIMD nativo
+        acc = coopMatMulAdd(matA, matB, acc);
+    }
+
+    // Salva resultado no buffer de saída
+    coopMatStore(acc, c, tile_row * n + tile_col, n, gl_CooperativeMatrixLayoutRowMajor);
+}

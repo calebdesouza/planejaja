@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer MatrixA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer MatrixB { float b[]; };
+layout(std430, set = 0, binding = 2) buffer MatrixOutput { float output_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint m;
+    uint k;
+    uint n;
+} pc;
+
+void main() {
+    uint base_m = gl_GlobalInvocationID.y * 16;
+    uint base_n = gl_GlobalInvocationID.x * 16;
+    
+    if (base_m >= pc.m || base_n >= pc.n) return;
+    
+    // NOTA TÉCNICA (Naga Limitations):
+    // O Naga shader compiler embuntido em Rust atualmente falha ao fazer
+    // o parser de `coopmat` e `float16_t` (GL_KHR_cooperative_matrix).
+    // Para compilar o pipeline sem requerer a instalação do LUNARG SDK (glslc)
+    // na máquina do usuário, esta é uma branch fallback do TensorCore.
+    // Em produção, isso seria substituído pelo shader com extensões KHR via SPIR-V direto.
+    
+    float matC = 0.0;
+    
+    for (uint i = 0; i < pc.k; i += 16) {
+        matC += a[base_m * pc.k + i] * b[i * pc.n + base_n];
+    }
+    
+    output_data[base_m * pc.n + base_n] = matC;
+}

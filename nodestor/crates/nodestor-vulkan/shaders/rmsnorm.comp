@@ -1,0 +1,53 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Input { float x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Weight { float w[]; };
+layout(std430, set = 0, binding = 2) buffer Output { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_size;
+    float eps;
+} pc;
+
+shared float sq_sum[256];
+shared float inv_rms;
+
+void main() {
+    uint pos = gl_WorkGroupID.y; // token index in sequence
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (pos >= pc.seq_len) return;
+    
+    uint base_idx = pos * pc.hidden_size;
+    
+    // Calcula soma dos quadrados em paralelo
+    float local_sq_sum = 0.0;
+    for (uint i = tid; i < pc.hidden_size; i += 256) {
+        float val = x[base_idx + i];
+        local_sq_sum += val * val;
+    }
+    sq_sum[tid] = local_sq_sum;
+    barrier();
+    
+    // Redução paralela dentro do workgroup
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sq_sum[tid] += sq_sum[tid + stride];
+        }
+        barrier();
+    }
+    
+    // Thread 0 calcula o inverso da raiz quadrada
+    if (tid == 0) {
+        float mean_sq = sq_sum[0] / float(pc.hidden_size);
+        inv_rms = inversesqrt(mean_sq + pc.eps);
+    }
+    barrier();
+    
+    // Aplica o RMSNorm
+    for (uint i = tid; i < pc.hidden_size; i += 256) {
+        y[base_idx + i] = x[base_idx + i] * inv_rms * w[i];
+    }
+}

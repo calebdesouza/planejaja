@@ -3,11 +3,20 @@ mod error;
 mod instance;
 mod pipeline;
 mod shader_loader;
+pub mod transformer;
+pub mod command_recycler;
+pub mod triple_buffer;
+pub mod external_memory;
 
 pub use buffer::{GpuBuffer, GpuBufferUsage};
 pub use error::VulkanError;
 pub use instance::VulkanContext;
 pub use pipeline::{ComputePipeline, PipelineKind};
+pub use transformer::*;
+pub use buffer::MemoryPath;
+pub use command_recycler::CommandRecycler;
+pub use triple_buffer::TripleBufferPipeline;
+pub use external_memory::{try_import_host_memory, is_supported as ext_memory_supported};
 
 use nodestor_core::{GpuCapabilities, HardwareProfile, NodeStorError};
 use tracing::{info, warn};
@@ -92,6 +101,66 @@ impl VulkanEngine {
         let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;
         pipeline.dispatch_matmul(&self.ctx, a, b, &mut output, m, k, n)?;
         Ok(output)
+    }
+
+    pub fn rmsnorm(&self, input: &GpuBuffer, weight: &GpuBuffer, seq_len: u32, hidden_size: u32, eps: f32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::RmsNorm).ok_or_else(|| NodeStorError::VulkanError("RmsNorm missing".into()))?;
+        let mut output = self.ctx.alloc_gpu_buffer((seq_len * hidden_size * 4) as usize)?;
+        pipeline.dispatch_rmsnorm(&self.ctx, input, weight, &mut output, seq_len, hidden_size, eps)?;
+        Ok(output)
+    }
+
+    pub fn rope(&self, q: &mut GpuBuffer, k: &mut GpuBuffer, seq_len: u32, num_heads_q: u32, num_heads_k: u32, head_dim: u32, freq_base: f32, start_pos: u32) -> Result<(), NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::RoPe).ok_or_else(|| NodeStorError::VulkanError("RoPE missing".into()))?;
+        pipeline.dispatch_rope(&self.ctx, q, k, seq_len, num_heads_q, num_heads_k, head_dim, freq_base, start_pos)
+    }
+
+    pub fn silu(&self, input: &GpuBuffer, total_elements: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::SiLu).ok_or_else(|| NodeStorError::VulkanError("SiLU missing".into()))?;
+        let mut output = self.ctx.alloc_gpu_buffer((total_elements * 4) as usize)?;
+        pipeline.dispatch_silu(&self.ctx, input, &mut output, total_elements)?;
+        Ok(output)
+    }
+
+    pub fn softmax_in_place(&self, buffer: &mut GpuBuffer, seq_len: u32, vocab_size: u32) -> Result<(), NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::Softmax).ok_or_else(|| NodeStorError::VulkanError("Softmax missing".into()))?;
+        pipeline.dispatch_softmax(&self.ctx, buffer, seq_len, vocab_size)
+    }
+
+    pub fn attention(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, seq_len: u32, head_dim: u32, scale: f32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::Attention).ok_or_else(|| NodeStorError::VulkanError("Attention missing".into()))?;
+        let mut out_attn = self.ctx.alloc_gpu_buffer((seq_len * head_dim * 4) as usize)?;
+        pipeline.dispatch_attention(&self.ctx, q, k, v, &mut out_attn, seq_len, head_dim, scale)?;
+        Ok(out_attn)
+    }
+
+    pub fn alloc_buffer(&self, size_bytes: usize) -> Result<GpuBuffer, NodeStorError> {
+        self.ctx.alloc_gpu_buffer(size_bytes)
+    }
+
+    /// Aloca buffer Via Expressa (Triple-Path: ReBAR → Pinned DMA → Staging Fallback).
+    /// Zero configuração. Detecta o melhor caminho automaticamente.
+    pub fn alloc_pinned_buffer(&self, size_bytes: usize) -> Result<GpuBuffer, NodeStorError> {
+        GpuBuffer::allocate_pinned(&self.ctx, size_bytes)
+    }
+
+    pub fn upload(&self, data: &[u8]) -> Result<GpuBuffer, NodeStorError> {
+        self.ctx.upload_to_gpu(data)
+    }
+
+    /// Upload via Via Expressa com Write-Combining.
+    pub fn upload_pinned(&self, data: &[u8]) -> Result<GpuBuffer, NodeStorError> {
+        self.ctx.upload_pinned(data)
+    }
+
+    /// `true` se a GPU tem ReBAR ativo (SSD pode escrever direto na VRAM).
+    pub fn has_rebar(&self) -> bool { self.ctx.has_rebar }
+
+    /// `true` se há uma fila de transferência dedicada (DMA async sem bloquear compute).
+    pub fn has_dedicated_transfer_queue(&self) -> bool { self.ctx.has_dedicated_transfer_queue }
+
+    pub fn download_f32(&self, buffer: &GpuBuffer) -> Result<Vec<f32>, NodeStorError> {
+        self.ctx.download_from_gpu(buffer)
     }
 
     pub fn cosine_similarity_batch(&self, query: &GpuBuffer, candidates: &GpuBuffer, num_candidates: u32, dim: u32) -> Result<Vec<f32>, NodeStorError> {

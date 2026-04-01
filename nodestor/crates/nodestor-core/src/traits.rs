@@ -19,6 +19,16 @@ pub trait DataTransport: Send + Sync {
         Ok(())
     }
 
+    /// Descarrega um bloco/página de contexto da RAM para o SSD em um arquivo de swap.
+    fn page_out_to_ssd(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<(), NodeStorError> {
+        Err(NodeStorError::ConfigError("page_out_to_ssd não suportado pelo backend atual".into()))
+    }
+
+    /// Carrega um bloco/página de contexto do SSD de volta para a RAM.
+    fn page_in_from_ssd(&self, _path: &str, _offset: u64, _size: usize) -> Result<Vec<u8>, NodeStorError> {
+        Err(NodeStorError::ConfigError("page_in_from_ssd não suportado pelo backend atual".into()))
+    }
+
     /// Enfileira múltiplas transferências (Modo Metralhadora).
     /// Implementação default: executa sequencialmente.
     fn transfer_batch(

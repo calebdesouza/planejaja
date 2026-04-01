@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer K { float k[]; };
+layout(std430, set = 0, binding = 2) readonly buffer V { float v[]; };
+layout(std430, set = 0, binding = 3) buffer Out_Attn { float out_attn[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint head_dim;
+    float scale;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // seq idx (query token)
+    uint col = gl_GlobalInvocationID.x; // head idx
+    
+    if (row >= pc.seq_len || col >= 1) return; // simplied placeholder logic
+    
+    // A verdadeira implementação PagedAttention é massiva e complexa,
+    // este é o entrypoint para o binding lógico que permite à engine 
+    // enfileirar as instruções do Attention com KV Caching.
+    
+    float sum = 0.0;
+    for(uint i=0; i < pc.head_dim; i++) {
+        sum += q[row * pc.head_dim + i] * k[i];
+    }
+    out_attn[row * pc.head_dim] = sum * pc.scale;
+}

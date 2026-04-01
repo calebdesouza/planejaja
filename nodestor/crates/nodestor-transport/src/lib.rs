@@ -21,12 +21,14 @@
 mod fallback;
 mod win32_fallback;
 mod mmap_transport;
+pub mod direct_io;
 
 #[cfg(target_os = "linux")]
 mod io_uring_transport;
 
 pub use fallback::PreadFallback;
 pub use win32_fallback::{Win32OverlappedTransport, directstorage_dlls_available};
+pub use direct_io::DirectIOReader;
 
 use nodestor_core::{DataTransport, HardwareProfile, TransportBackend, GpuVendor};
 use tracing::info;
@@ -207,12 +209,13 @@ mod tests {
             recommended_transport: TransportBackend::PreadFallback,
             cpu_cores: 4,
             total_ram_bytes: 8 * 1024 * 1024 * 1024,
+            missed_optimizations: vec![],
         }
     }
 
     #[test]
     fn test_recommend_priority_linux_nvidia_gds() {
-        let mut profile = make_profile(OsType::Linux, vec![GpuCapabilities {
+        let profile = make_profile(OsType::Linux, vec![GpuCapabilities {
             vendor: GpuVendor::Nvidia,
             ..Default::default()
         }]);

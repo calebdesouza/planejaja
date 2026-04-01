@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
             Commands::Inspect { path, tensors } => cmd_inspect(&path, tensors),
             Commands::Bench { path, block_mb } => cmd_bench(&path, block_mb),
             Commands::BenchLiquid { path, chunk_mb } => cmd_bench_liquid(&path, chunk_mb).await,
-            Commands::BenchSts { path } => cmd_bench_sts(&path).await?,
+            Commands::BenchSts { path } => cmd_bench_sts(&path).await,
             Commands::Calibrate => cmd_calibrate(),
             Commands::Chat { server } => cmd_chat(&server).await,
             Commands::Latency { model } => cmd_latency(model).await,

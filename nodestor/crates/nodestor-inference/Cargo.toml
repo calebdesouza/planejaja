@@ -17,6 +17,8 @@ thiserror = { workspace = true }
 nodestor-scanner = { path = "../nodestor-scanner" }
 nodestor-transport = { path = "../nodestor-transport" }
 nodestor-vulkan = { path = "../nodestor-vulkan" }
+tokenizers = "0.19.1"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

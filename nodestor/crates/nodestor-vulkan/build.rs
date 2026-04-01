@@ -16,6 +16,15 @@ fn main() {
             let entry = entry.expect("Erro na entrada do diretório");
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("comp") {
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                // matmul_coop.comp usa GL_KHR_cooperative_matrix — não suportado pelo Naga.
+                // O shader é carregado opcionalmente em runtime via `load_shader_by_kind(CoopMatrix)`.
+                // Quando glslc/glslangValidator estiver disponível, compilar manualmente e ativar
+                // a linha em `load_shader_by_kind` para incluir o .spv no binário.
+                if name == "matmul_coop" {
+                    println!("cargo:info=CoopMatrix shader excluído da compilação Naga (requer glslc + driver moderno)");
+                    continue;
+                }
                 compile_shader(&path, dest_path);
             }
         }

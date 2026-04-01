@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) buffer InOutQ { float q[]; };
+layout(std430, set = 0, binding = 1) buffer InOutK { float k[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads_q;
+    uint num_heads_k;
+    uint head_dim;
+    float freq_base;
+    uint start_pos;
+} pc;
+
+void main() {
+    uint pos = gl_WorkGroupID.y; // seq idx
+    uint head = gl_WorkGroupID.x; // head idx
+    uint tid = gl_LocalInvocationID.x; // dim idx em pares
+    
+    if (pos >= pc.seq_len) return;
+    if (tid * 2 >= pc.head_dim) return;
+    
+    uint actual_pos = pc.start_pos + pos;
+    // RoPE Frequency = 1.0 / (base ^ (2i / d))
+    float freq = 1.0 / pow(pc.freq_base, float(tid * 2) / float(pc.head_dim));
+    float val = float(actual_pos) * freq;
+    
+    float fcos = cos(val);
+    float fsin = sin(val);
+    
+    // Rotação em Q
+    if (head < pc.num_heads_q) {
+        uint q_idx = pos * (pc.num_heads_q * pc.head_dim) + head * pc.head_dim + tid * 2;
+        float q0 = q[q_idx];
+        float q1 = q[q_idx + 1];
+        q[q_idx] = q0 * fcos - q1 * fsin;
+        q[q_idx + 1] = q0 * fsin + q1 * fcos;
+    }
+    
+    // Rotação em K
+    if (head < pc.num_heads_k) {
+        uint k_idx = pos * (pc.num_heads_k * pc.head_dim) + head * pc.head_dim + tid * 2;
+        float k0 = k[k_idx];
+        float k1 = k[k_idx + 1];
+        k[k_idx] = k0 * fcos - k1 * fsin;
+        k[k_idx + 1] = k0 * fsin + k1 * fcos;
+    }
+}

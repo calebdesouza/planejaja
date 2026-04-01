@@ -129,6 +129,40 @@ impl DataTransport for PreadFallback {
         });
         Ok(())
     }
+
+    fn page_out_to_ssd(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), NodeStorError> {
+        use std::io::Write;
+        let start = Instant::now();
+        
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| NodeStorError::IoError(e))?;
+
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| NodeStorError::TransferFailed(format!("Seek para page out falhou: {}", e)))?;
+        
+        file.write_all(data)
+            .map_err(|e| NodeStorError::TransferFailed(format!("Write para page out falhou: {}", e)))?;
+            
+        file.sync_data().map_err(|e| NodeStorError::IoError(e))?;
+        
+        debug!("PreadFallback: Page OUT {} bytes no offset {} em {}µs", data.len(), offset, start.elapsed().as_micros());
+        Ok(())
+    }
+
+    fn page_in_from_ssd(&self, path: &str, offset: u64, size: usize) -> Result<Vec<u8>, NodeStorError> {
+        let req = TransferRequest {
+            file_offset: offset,
+            size,
+            compressed: false,
+        };
+        let res = self.transfer(path, &req)?;
+        debug!("PreadFallback: Page IN {} bytes no offset {}", size, offset);
+        Ok(res.data)
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +285,23 @@ mod tests {
         assert_eq!(t.backend_name(), "PreadFallback");
         assert_eq!(t.backend_type(), TransportBackend::PreadFallback);
         assert!(t.theoretical_max_throughput_bps() > 0);
+    }
+
+    #[test]
+    fn test_kv_paging_out_and_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let swap_path = dir.path().join("nodestor_swap.bin");
+        let transport = PreadFallback::new();
+
+        let page_data = b"CONTEXT_KV_PAGE_DATA_123";
+        let offset = 4096;
+
+        // Escreve para SSD
+        transport.page_out_to_ssd(swap_path.to_str().unwrap(), offset, page_data).unwrap();
+
+        // Lê de volta do SSD
+        let read_data = transport.page_in_from_ssd(swap_path.to_str().unwrap(), offset, page_data.len()).unwrap();
+        
+        assert_eq!(read_data, page_data);
     }
 }

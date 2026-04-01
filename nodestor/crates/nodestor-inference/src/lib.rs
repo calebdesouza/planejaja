@@ -8,6 +8,9 @@
 //! - [ ] `prefetch.rs` — DiskANN pre-fetch integrado
 
 pub mod pipeline;
+pub mod kv_cache;
+pub mod tokenizer;
+pub mod sampler;
 
 #[cfg(test)]
 mod tests {
@@ -54,9 +57,11 @@ mod tests {
             .expect("Falha na geração via 7 camadas");
 
         // PROOF: Verificação de métricas e vitalidade
-        assert!(stats.generated_tokens > 0, "Deveria gerar tokens");
+        assert_eq!(stats.generated_tokens, 5, "Deveria gerar exatamente max_tokens solicitados");
         assert!(stats.tokens_per_second >= 0.0, "TPS deve ser mensurável");
-        assert!(!output.is_empty(), "A resposta não deve ser vazia");
+        assert!(stats.total_time_ms > 0, "Geração deve levar algum tempo real (ms)");
+        assert!(!output.is_empty(), "A resposta não deve ser vazia e os tokens devem ser parseados");
+        assert!(output.contains("<unk>") || output.contains("Hello"), "Output deve usar o vocab dummy");
         
         println!("Super-Teste Concluído: {} tokens a {:.2} t/s", 
             stats.generated_tokens, stats.tokens_per_second);

@@ -1,0 +1,61 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer InOutX { float x[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint vocab_size; // Or head size
+} pc;
+
+shared float max_val[256];
+shared float sum_val[256];
+
+void main() {
+    uint seq_idx = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (seq_idx >= pc.seq_len) return;
+    uint base_idx = seq_idx * pc.vocab_size;
+    
+    // Pass 1: Maximum
+    float local_max = -1e20;
+    for (uint i = tid; i < pc.vocab_size; i += 256) {
+        local_max = max(local_max, x[base_idx + i]);
+    }
+    max_val[tid] = local_max;
+    barrier();
+    
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            max_val[tid] = max(max_val[tid], max_val[tid + stride]);
+        }
+        barrier();
+    }
+    
+    float global_max = max_val[0];
+    
+    // Pass 2: Sum of EXPs
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.vocab_size; i += 256) {
+        float val = exp(x[base_idx + i] - global_max);
+        local_sum += val;
+        x[base_idx + i] = val; // Store intermediate EXP
+    }
+    sum_val[tid] = local_sum;
+    barrier();
+    
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_val[tid] += sum_val[tid + stride];
+        }
+        barrier();
+    }
+    
+    float inv_sum = 1.0 / sum_val[0];
+    
+    // Pass 3: Normalize
+    for (uint i = tid; i < pc.vocab_size; i += 256) {
+        x[base_idx + i] *= inv_sum;
+    }
+}

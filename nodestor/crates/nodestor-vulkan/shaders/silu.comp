@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Input { float x[]; };
+layout(std430, set = 0, binding = 1) buffer Output { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint total_elements;
+} pc;
+
+void main() {
+    uint global_idx = gl_GlobalInvocationID.x;
+    
+    if (global_idx >= pc.total_elements) return;
+    
+    float val = x[global_idx];
+    // Função Sigmoid Local
+    float sig = 1.0 / (1.0 + exp(-val));
+    // Aplicação SiLU: x * sigmoid(x)
+    y[global_idx] = val * sig;
+}
