@@ -95,14 +95,25 @@ impl DirectIOReader {
     }
 
     fn probe_direct(path: &str) -> (bool, DirectIOAlignment) {
-        let _ = path; // Suprime aviso em platforms sem impl
+        let _ = path;
         #[cfg(target_os = "windows")]
         return (true, DirectIOAlignment { sector_size: 4096 });
 
         #[cfg(target_os = "linux")]
         return Self::probe_linux(path);
 
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        return (true, DirectIOAlignment { sector_size: 4096 });
+
+        #[cfg(target_os = "android")]
+        return Self::probe_android(path);
+
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android",
+        )))]
         (false, DirectIOAlignment::default())
     }
 
@@ -150,18 +161,93 @@ impl DirectIOReader {
     /// `true` se Direct I/O está ativo (sem Page Cache).
     pub fn is_direct(&self) -> bool { self.use_direct }
 
-    // ─── Plataforma: Windows ─────────────────────────────────────────────────
-
+    // Direct I/O real via FILE_FLAG_NO_BUFFERING + FILE_FLAG_OVERLAPPED.
+    // Usamos std::os::windows::fs::OpenOptionsExt::custom_flags() ao invés de
+    // CreateFileW direto — é idiomático em Rust e evita problemas de tipos do windows-sys.
+    // O SSD faz DMA direto para dst sem passar pelo Page Cache do Windows NT.
     #[cfg(target_os = "windows")]
     fn read_direct(&self, offset: u64, size: usize, dst: &mut [u8]) -> Result<usize, NodeStorError> {
-        // No Windows, FILE_FLAG_NO_BUFFERING exige:
-        // 1. Offset alinhado ao setor (garantido por `align_offset`)
-        // 2. Tamanho alinhado ao setor (garantido por `align_size`)
-        // 3. Buffer alinhado ao setor (buffers Pinned do Vulkan são alocados com alinhamento 4096)
-        //
-        // Por ora, delegamos para `read_buffered` até a integração com windows-sys ReadFileEx.
-        // O alinhamento já está correto — apenas a syscall precisa ser trocada.
-        self.read_buffered(offset, size, dst)
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING, TRUE};
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+
+        // u32 literals: evita newtypes do windows-sys que causam mismatched types
+        const FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        const FLAG_OVERLAPPED: u32   = 0x4000_0000;
+
+        let aligned_offset = self.alignment.align_offset(offset);
+        let prefix_skip    = (offset - aligned_offset) as usize;
+        let aligned_size   = self.alignment.align_size(prefix_skip + size.min(dst.len()));
+
+        // Abre com NO_BUFFERING: bypass do Page Cache do Windows NT
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FLAG_NO_BUFFERING | FLAG_OVERLAPPED)
+            .open(&self.path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("DirectIO Windows: custom_flags falhou ({}), usando buffered", e);
+                return self.read_buffered(offset, size, dst);
+            }
+        };
+
+        let h = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
+        // Closure que executa ReadFile com OVERLAPPED (I/O assíncrono real)
+        let do_read = |buf_ptr: *mut u8, buf_size: usize| -> Result<usize, NodeStorError> {
+            let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+            ov.Anonymous.Anonymous.Offset     = aligned_offset as u32;
+            ov.Anonymous.Anonymous.OffsetHigh = (aligned_offset >> 32) as u32;
+            let mut n: u32 = 0;
+
+            let ok = unsafe { ReadFile(h, buf_ptr as *mut _, buf_size as u32, &mut n, &mut ov) };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_IO_PENDING {
+                    // DMA em andamento — espera conclusão sem bloquear outros threads
+                    let done = unsafe { GetOverlappedResult(h, &ov, &mut n, TRUE) };
+                    if done == 0 {
+                        return Err(io_err(format!(
+                            "GetOverlappedResult falhou: err={}",
+                            unsafe { GetLastError() }
+                        )));
+                    }
+                } else {
+                    return Err(io_err(format!("ReadFile(OVERLAPPED) err={}", err)));
+                }
+            }
+            Ok(n as usize)
+        };
+
+        // Se dst não está alinhado a 4096B, usa buffer temporário alinhado
+        let needs_intermediate = (dst.as_ptr() as usize) % self.alignment.sector_size != 0
+            || dst.len() < aligned_size;
+
+        if needs_intermediate {
+            let layout = std::alloc::Layout::from_size_align(
+                aligned_size, self.alignment.sector_size
+            ).map_err(|e| io_err(e.to_string()))?;
+            let tmp = unsafe { std::alloc::alloc(layout) };
+            if tmp.is_null() { return Err(io_err("OOM: Direct I/O Windows buffer")); }
+            match do_read(tmp, aligned_size) {
+                Ok(n) => {
+                    let copy_len = (n.saturating_sub(prefix_skip)).min(size).min(dst.len());
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(tmp.add(prefix_skip), dst.as_mut_ptr(), copy_len);
+                        std::alloc::dealloc(tmp, layout);
+                    }
+                    Ok(copy_len)
+                }
+                Err(e) => { unsafe { std::alloc::dealloc(tmp, layout) }; Err(e) }
+            }
+        } else {
+            // Pinned Memory do Vulkan: DMA direto — zero cópias, zero CPU
+            do_read(dst.as_mut_ptr(), aligned_size)
+                .map(|n| n.saturating_sub(prefix_skip).min(size))
+        }
     }
 
     // ─── Plataforma: Linux ────────────────────────────────────────────────────
@@ -226,7 +312,89 @@ impl DirectIOReader {
 
     // ─── Plataforma: Outros (macOS, etc.) ────────────────────────────────────
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    // ─── Plataforma: macOS ────────────────────────────────────────────────────
+    // fcntl(F_NOCACHE, 1): instrui o kernel Darwin a NÃO usar o Unified Buffer Cache.
+    // No Apple Silicon (UMA), CPU e GPU compartilham a mesma memória física —
+    // o dado que o SSD escreve na RAM já está na GPU sem cópia PCIe.
+    #[cfg(target_os = "macos")]
+    fn read_direct(&self, offset: u64, size: usize, dst: &mut [u8]) -> Result<usize, NodeStorError> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::File::open(&self.path)
+            .map_err(|e| io_err(e.to_string()))?;
+
+        // F_NOCACHE = 48 em macOS: desativa o page cache para este file descriptor.
+        // O dado vai direto do SSD para o nosso buffer sem passar pelo cache do kernel.
+        let nocache_ret = unsafe { libc::fcntl(file.as_raw_fd(), 48 /* F_NOCACHE */, 1i32) };
+        if nocache_ret < 0 {
+            // fcntl pode falhar em FS de rede (NFS, SMB) — fallback gracioso
+            debug!("macOS F_NOCACHE indisponível, usando buffered read");
+            return self.read_buffered(offset, size, dst);
+        }
+
+        let mut f = file;
+        f.seek(SeekFrom::Start(offset)).map_err(|e| io_err(e.to_string()))?;
+        let len = size.min(dst.len());
+        f.read(&mut dst[..len]).map_err(|e| io_err(e.to_string()))
+    }
+
+    // ─── Plataforma: Android ─────────────────────────────────────────────────
+    // Android (Linux) suporta O_DIRECT em storage interno (API Level 26+).
+    // `probe_android` testa se O_DIRECT funciona antes de usar.
+    #[cfg(target_os = "android")]
+    fn probe_android(path: &str) -> (bool, DirectIOAlignment) {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+        {
+            Ok(_) => {
+                debug!("Android: O_DIRECT suportado em {}", path);
+                (true, DirectIOAlignment { sector_size: 4096 })
+            }
+            Err(e) => {
+                warn!("Android: O_DIRECT não suportado ({}), usando buffered", e);
+                (false, DirectIOAlignment::default())
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn read_direct(&self, offset: u64, size: usize, dst: &mut [u8]) -> Result<usize, NodeStorError> {
+        // Android usa O_DIRECT idêntico ao Linux — reutiliza a implementação pread
+        let aligned_offset = self.alignment.align_offset(offset);
+        let prefix_skip = (offset - aligned_offset) as usize;
+
+        let use_intermediate = (dst.as_ptr() as usize) % self.alignment.sector_size != 0;
+
+        if use_intermediate {
+            let aligned_size = self.alignment.align_size(prefix_skip + size);
+            let layout = std::alloc::Layout::from_size_align(aligned_size, self.alignment.sector_size)
+                .map_err(|e| io_err(e.to_string()))?;
+            unsafe {
+                let buf = std::alloc::alloc(layout);
+                if buf.is_null() { return Err(io_err("OOM: Android Direct I/O")); }
+                let r = self.pread_direct(aligned_offset, aligned_size, buf);
+                let copy_len = size.min(dst.len());
+                std::ptr::copy_nonoverlapping(buf.add(prefix_skip), dst.as_mut_ptr(), copy_len);
+                std::alloc::dealloc(buf, layout);
+                r.map(|_| copy_len)
+            }
+        } else {
+            self.pread_direct(aligned_offset, size.min(dst.len()), dst.as_mut_ptr())
+                .map(|n| n.min(size))
+        }
+    }
+
+    // ─── Plataforma: Outros ───────────────────────────────────────────────────
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+    )))]
     fn read_direct(&self, offset: u64, size: usize, dst: &mut [u8]) -> Result<usize, NodeStorError> {
         self.read_buffered(offset, size, dst)
     }

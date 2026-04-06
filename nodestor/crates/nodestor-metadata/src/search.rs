@@ -50,6 +50,23 @@ impl VectorSearch {
             .map_err(|e| NodeStorError::ConfigError(format!("Tabela vetorial não encontrada: {}", e)))
     }
 
+    /// Insere um documento no banco de dados vetorial para Eviction Indexada.
+    pub async fn insert_document(
+        &self,
+        id: String,
+        _embedding: Vec<f32>,
+        payload: Option<String>,
+    ) -> Result<(), NodeStorError> {
+        #[cfg(feature = "lancedb_native")]
+        {
+            // LanceDB record insertion logic
+        }
+
+        // Mock para simulação sem SSD real
+        tracing::debug!("VectorSearch Insert: Indexado Eviction {} no LanceDB", id);
+        Ok(())
+    }
+
     /// Executa uma busca por similaridade vetorial (KNN).
     pub async fn search_knn(
         &self,

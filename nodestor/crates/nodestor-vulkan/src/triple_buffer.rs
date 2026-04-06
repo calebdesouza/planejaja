@@ -97,7 +97,7 @@ impl TripleBufferPipeline {
         })
     }
 
-    fn simulation(bucket_size: usize) -> Self {
+    pub fn simulation(bucket_size: usize) -> Self {
         let buckets = (0..3).map(|_| Bucket {
             buffer: GpuBuffer::new_storage(bucket_size),
             fence: ash::vk::Fence::null(),
@@ -142,6 +142,45 @@ impl TripleBufferPipeline {
         Ok((idx, &mut self.buckets[idx].buffer))
     }
 
+    /// Wrapper de simulação para benchmarks puramente focados no SSD
+    pub fn acquire_write_bucket_sim(&mut self) -> (usize, &mut GpuBuffer) {
+        let idx = self.write_idx % 3;
+        self.buckets[idx].state = BucketState::Free;
+        self.buckets[idx].bytes_written = 0;
+        self.write_idx += 1;
+        (idx, &mut self.buckets[idx].buffer)
+    }
+
+    /// Retorna o índice de escrita atual (para cálculo pós-borrow do bucket_idx).
+    /// Usado pelo ApexOrchestrator após liberar o empréstimo do balde.
+    pub fn write_offset(&self) -> usize { self.write_idx }
+
+    /// API de alto nível para simulação: executa o ciclo completo de leitura
+    /// sem expor referências internas que causariam conflito de borrow.
+    ///
+    /// O closure `read_fn` recebe `&mut [u8]` (o buffer do balde), preenche-o
+    /// e retorna quantos bytes foram escritos. O pipeline cuida do `mark_ready`
+    /// e `submit_next_sim` internamente.
+    ///
+    /// Em produção (GPU real), os dados ficam no GpuBuffer e não são copiados.
+    /// Em simulação, retorna `Vec<u8>` com os bytes lidos.
+    pub fn read_via_sim<E>(
+        &mut self,
+        read_fn: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<Vec<u8>, E> {
+        let idx = self.write_idx % 3;
+        self.buckets[idx].state = BucketState::Free;
+        self.buckets[idx].bytes_written = 0;
+        self.write_idx += 1;
+
+        let n = read_fn(self.buckets[idx].buffer.as_mut_bytes())?;
+        let data = self.buckets[idx].buffer.as_bytes()[..n].to_vec();
+
+        self.mark_ready(idx, n);
+        self.submit_next_sim();
+        Ok(data)
+    }
+
     /// Marca o balde `idx` como cheio depois que o SSD terminou de escrever.
     pub fn mark_ready(&mut self, idx: usize, bytes_written: usize) {
         self.buckets[idx].state = BucketState::ReadyForGpu;
@@ -182,6 +221,15 @@ impl TripleBufferPipeline {
         Ok(Some((idx, bytes)))
     }
 
+    /// Wrapper de simulação sem bloqueio de GPU real
+    pub fn submit_next_sim(&mut self) {
+        let idx = self.submit_idx % 3;
+        if self.buckets[idx].state == BucketState::ReadyForGpu {
+            self.buckets[idx].state = BucketState::InFlight;
+            self.submit_idx += 1;
+        }
+    }
+
     /// Aguarda todos os baldes em voo terminarem. Usado no shutdown.
     pub fn drain(&mut self, device: &ash::Device) {
         if !self.vulkan_active { return; }
@@ -193,6 +241,9 @@ impl TripleBufferPipeline {
             unsafe { let _ = device.wait_for_fences(&fences, true, 10_000_000_000); }
         }
     }
+
+    /// Dummy de simulação para benchmarking
+    pub fn drain_sim(&mut self) {}
 
     /// Qual caminho de memória os baldes estão usando.
     pub fn memory_path(&self) -> MemoryPath { self.buckets[0].buffer.memory_path }

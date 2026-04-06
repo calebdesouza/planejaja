@@ -7,6 +7,18 @@ edition.workspace = true
 name = "nodestor"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench_apex"
+path = "src/bin/bench_apex.rs"
+
+[[bin]]
+name = "bench_full_apex"
+path = "src/bin/bench_full_apex.rs"
+
+[[bin]]
+name = "bench_apex_v2"
+path = "src/bin/bench_apex_v2.rs"
+
 [dependencies]
 nodestor-core = { path = "../crates/nodestor-core" }
 nodestor-scanner = { path = "../crates/nodestor-scanner" }

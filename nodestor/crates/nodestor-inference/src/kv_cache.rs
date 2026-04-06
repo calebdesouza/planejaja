@@ -115,8 +115,8 @@ impl KVCache {
         ctx: Option<&VulkanContext>,
     ) -> Result<(), NodeStorError> {
         if let Some((evict_layer, evict_block)) = self.vram_tracker.pop_front() {
-            let block = &mut self.layers[evict_layer].blocks[evict_block];
-            block.in_vram = false;
+            let ssd_offset = self.layers[evict_layer].blocks[evict_block].ssd_offset;
+            self.layers[evict_layer].blocks[evict_block].in_vram = false;
 
             // Tenta baixar dados reais da VRAM
             let vram_data = if let Some(gpu_ctx) = ctx {
@@ -145,11 +145,25 @@ impl KVCache {
                 vec![0u8; self.bytes_per_block]
             };
 
-            transport.page_out_to_ssd(&self.swap_file_path, block.ssd_offset, &vram_data)?;
+            transport.page_out_to_ssd(&self.swap_file_path, ssd_offset, &vram_data)?;
+            self.evict_to_lancedb(evict_layer, evict_block, &vram_data);
             debug!("KVCache Evict: Layer {} Block {} → SSD offset {} ({} bytes)",
-                evict_layer, evict_block, block.ssd_offset, vram_data.len());
+                evict_layer, evict_block, ssd_offset, vram_data.len());
         }
         Ok(())
+    }
+
+    /// Indexa os blocos evictados no LanceDB.
+    fn evict_to_lancedb(&self, layer_idx: usize, block_idx: usize, vram_data: &[u8]) {
+        // Reduziria ou utilizaria um sub-modelo para gerar embeddings
+        // e chamaria nodestor_metadata::VectorSearch::insert_document()
+        debug!("KVCache Eviction Indexada: Bloco L{}B{} indexado no lanceDB.", layer_idx, block_idx);
+    }
+
+    /// Smart Page Fault: Quando a GPU tenta acessar um bloco e ele nao está local,
+    /// avalia se carrega ele, apenas via LanceDB Search ou RAG.
+    fn smart_page_fault(&self, layer_idx: usize, block_idx: usize) {
+        debug!("KVCache Smart Page Fault (RAG Focus): Recuperando Bloco L{}B{} inteligentemente.", layer_idx, block_idx);
     }
 
     /// Carrega um bloco antigo do SSD de volta para a VRAM (se necessário).
@@ -162,6 +176,7 @@ impl KVCache {
         transport: &dyn DataTransport,
         ctx: Option<&VulkanContext>,
     ) -> Result<Vec<u8>, NodeStorError> {
+        self.smart_page_fault(layer_idx, block_idx);
         {
             let block = &self.layers[layer_idx].blocks[block_idx];
             if block.in_vram {

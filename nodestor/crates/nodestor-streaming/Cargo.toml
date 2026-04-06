@@ -16,3 +16,4 @@ ash = "0.38"
 
 tempfile = { workspace = true }
 nodestor-gdeflate = { version = "0.1.0", path = "../nodestor-gdeflate" }
+serde_json = { workspace = true }

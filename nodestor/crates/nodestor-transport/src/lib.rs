@@ -22,6 +22,7 @@ mod fallback;
 mod win32_fallback;
 mod mmap_transport;
 pub mod direct_io;
+pub mod platform;
 
 #[cfg(target_os = "linux")]
 mod io_uring_transport;
@@ -29,6 +30,7 @@ mod io_uring_transport;
 pub use fallback::PreadFallback;
 pub use win32_fallback::{Win32OverlappedTransport, directstorage_dlls_available};
 pub use direct_io::DirectIOReader;
+pub use platform::PlatformIOCapabilities;
 
 use nodestor_core::{DataTransport, HardwareProfile, TransportBackend, GpuVendor};
 use tracing::info;

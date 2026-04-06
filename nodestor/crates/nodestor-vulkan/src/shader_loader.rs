@@ -13,6 +13,8 @@ pub enum ShaderKind {
     DequantQ4,
     /// Dequantização Q8_0 → F16 (GGML 8-bit)
     DequantQ8,
+    /// Dequantização Q6_K → F16 (GGML 6-bit K-quant, perda ~2-3%)
+    DequantQ6K,
     /// Multiplicação de matrizes F16
     Matmul,
     /// Similaridade cosseno (busca vetorial DiskANN)
@@ -41,6 +43,7 @@ impl ShaderKind {
         match self {
             Self::DequantQ4 => "dequant_q4",
             Self::DequantQ8 => "dequant_q8",
+            Self::DequantQ6K => "dequant_q6k",
             Self::Matmul => "matmul",
             Self::CosineSim => "cosine_sim",
             Self::Lossless => "lossless_expansion",
@@ -61,6 +64,7 @@ impl ShaderKind {
         &[
             ShaderKind::DequantQ4,
             ShaderKind::DequantQ8,
+            ShaderKind::DequantQ6K,
             ShaderKind::Matmul,
             ShaderKind::CosineSim,
             ShaderKind::Lossless,
@@ -72,8 +76,7 @@ impl ShaderKind {
             ShaderKind::SiLu,
             ShaderKind::Softmax,
             ShaderKind::Attention,
-            // CoopMatrix NÃO está em `all()` — é carregado separadamente com
-            // detecção de suporte em `create_all_pipelines()`.
+            // CoopMatrix NO está em `all()` — carregado separadamente.
         ]
     }
 }
@@ -123,6 +126,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
     let bytecode = match kind {
         ShaderKind::DequantQ4 => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q4.spv")).to_vec(),
         ShaderKind::DequantQ8 => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q8.spv")).to_vec(),
+        ShaderKind::DequantQ6K => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q6k.spv")).to_vec(),
         ShaderKind::Matmul => include_bytes!(concat!(env!("OUT_DIR"), "/matmul.spv")).to_vec(),
         ShaderKind::CosineSim => include_bytes!(concat!(env!("OUT_DIR"), "/cosine_sim.spv")).to_vec(),
         ShaderKind::Lossless => include_bytes!(concat!(env!("OUT_DIR"), "/lossless_expansion.spv")).to_vec(),

@@ -2,15 +2,35 @@
 //!
 //! Orquestra: scanner → transport → streaming kernel → modelo → tokens.
 //!
-//! ## Status
-//! - [x] Estrutura do crate
-//! - [ ] `pipeline.rs` — orquestração do fluxo
-//! - [ ] `prefetch.rs` — DiskANN pre-fetch integrado
+//! ## Motor COBER Neural Engine
+//! - [`vram_budget`] — Orçamento VRAM baseado no livre real
+//! - [`candidate_engine`] — HNSW + BM25 + RRF anti-alucinação
+//! - [`cober`] — Draft → Verify → Accept (Rejection Sampling lossless)
+//! - [`caches`] — Expert LRU Cache (MoE) + Feature Cache (Diffusion)
 
 pub mod pipeline;
 pub mod kv_cache;
 pub mod tokenizer;
 pub mod sampler;
+pub mod vram_budget;
+pub mod candidate_engine;
+pub mod cober;
+pub mod caches;
+pub mod prompt_lookup;
+pub mod bloom_filter;
+pub mod golden_ngrams;
+pub mod rest_trie;
+pub mod syntactic_skeleton;
+pub mod medusa_heads;
+pub mod fractal_memory;
+pub mod multi_tenant;
+pub mod insight_indexer;
+pub mod multi_draft;
+pub mod cross_modal;
+pub mod jitter_buffer;
+pub mod vulkan_adaptive;
+pub mod bench_cober_v2;
+
 
 #[cfg(test)]
 mod tests {

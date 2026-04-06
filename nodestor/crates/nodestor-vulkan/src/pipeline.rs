@@ -14,6 +14,8 @@ use std::collections::HashMap;
 pub enum PipelineKind {
     DequantQ4,
     DequantQ8,
+    /// Q6_K (6-bit K-quant) — para embeddings residentes na VRAM.
+    DequantQ6K,
     Matmul,
     CosineSim,
     Lossless,
@@ -25,9 +27,6 @@ pub enum PipelineKind {
     SiLu,
     Softmax,
     Attention,
-    /// Cooperative Matrix (WMMA/Tensor Core via GL_KHR_cooperative_matrix).
-    /// Disponibilizado automaticamente se o hardware suportar.
-    /// Fallback transparente para `Matmul` se não suportado.
     CoopMatrix,
 }
 
@@ -779,6 +778,7 @@ pub fn create_all_pipelines(
     if !ctx.vulkan_available {
         map.insert(PipelineKind::DequantQ4, ComputePipeline::new_simulation(PipelineKind::DequantQ4));
         map.insert(PipelineKind::DequantQ8, ComputePipeline::new_simulation(PipelineKind::DequantQ8));
+        map.insert(PipelineKind::DequantQ6K, ComputePipeline::new_simulation(PipelineKind::DequantQ6K));
         map.insert(PipelineKind::Matmul, ComputePipeline::new_simulation(PipelineKind::Matmul));
         map.insert(PipelineKind::CosineSim, ComputePipeline::new_simulation(PipelineKind::CosineSim));
         map.insert(PipelineKind::Lossless, ComputePipeline::new_simulation(PipelineKind::Lossless));
@@ -790,7 +790,6 @@ pub fn create_all_pipelines(
         map.insert(PipelineKind::SiLu, ComputePipeline::new_simulation(PipelineKind::SiLu));
         map.insert(PipelineKind::Softmax, ComputePipeline::new_simulation(PipelineKind::Softmax));
         map.insert(PipelineKind::Attention, ComputePipeline::new_simulation(PipelineKind::Attention));
-        // CoopMatrix: sempre criado como simulação quando Vulkan indisponível
         map.insert(PipelineKind::CoopMatrix, ComputePipeline::new_simulation(PipelineKind::CoopMatrix));
         return Ok(map);
     }
@@ -824,6 +823,7 @@ pub fn create_all_pipelines(
         let kind = match shader.kind {
             ShaderKind::DequantQ4 => PipelineKind::DequantQ4,
             ShaderKind::DequantQ8 => PipelineKind::DequantQ8,
+            ShaderKind::DequantQ6K => PipelineKind::DequantQ6K,
             ShaderKind::Matmul => PipelineKind::Matmul,
             ShaderKind::CosineSim => PipelineKind::CosineSim,
             ShaderKind::Lossless => PipelineKind::Lossless,
@@ -835,8 +835,6 @@ pub fn create_all_pipelines(
             ShaderKind::SiLu => PipelineKind::SiLu,
             ShaderKind::Softmax => PipelineKind::Softmax,
             ShaderKind::Attention => PipelineKind::Attention,
-            // CoopMatrix é carregado separadamente antes deste loop — não aparece em `all()`
-            // mas o match deve ser exaustivo; este arm nunca é atingido em prática.
             ShaderKind::CoopMatrix => PipelineKind::CoopMatrix,
         };
 
@@ -869,6 +867,33 @@ fn cpu_cosine_batch(query: &[f32], candidates: &[f32], scores: &mut GpuBuffer, n
         let sim = if q_norm > 0.0 && c_norm > 0.0 { dot / (q_norm * c_norm) } else { 0.0 };
         scores.as_mut_bytes()[c * 4..(c + 1) * 4].copy_from_slice(&sim.to_le_bytes());
     }
+}
+
+/// Cria um mapa de pipelines em modo simulação (sem Vulkan).
+/// Usado por `VulkanEngine::new_simulation()` para garantir funcionamento
+/// em ambientes sem GPU (CI/CD, Docker, benchmarks headless).
+pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
+    let mut map = HashMap::new();
+    for kind in [
+        PipelineKind::DequantQ4,
+        PipelineKind::DequantQ8,
+        PipelineKind::DequantQ6K,
+        PipelineKind::Matmul,
+        PipelineKind::CosineSim,
+        PipelineKind::Lossless,
+        PipelineKind::GDeflate,
+        PipelineKind::MatmulQ4,
+        PipelineKind::MatmulTensorCore,
+        PipelineKind::RmsNorm,
+        PipelineKind::RoPe,
+        PipelineKind::SiLu,
+        PipelineKind::Softmax,
+        PipelineKind::Attention,
+        PipelineKind::CoopMatrix,
+    ] {
+        map.insert(kind, ComputePipeline::new_simulation(kind));
+    }
+    map
 }
 
 #[cfg(test)]

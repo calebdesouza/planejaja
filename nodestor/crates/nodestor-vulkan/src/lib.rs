@@ -42,6 +42,23 @@ impl VulkanEngine {
         Ok(Self { ctx, pipelines })
     }
 
+    /// Cria um VulkanEngine em modo de simulação (sem GPU real).
+    /// Usado em benchmarks, testes e ambientes headless (CI/CD, Docker).
+    pub fn new_simulation() -> Self {
+        // VulkanContext::new(None) retorna simulação automaticamente se Vulkan falhar.
+        let ctx = match VulkanContext::new(None) {
+            Ok(c) => c,
+            Err(_) => {
+                // Última linha de defesa: contexto totalmente sem Vulkan
+                // Isso não pode falhar — é pura RAM do processo.
+                VulkanContext::new(None)
+                    .expect("VulkanContext::new always returns Ok (simulation fallback is internal)")
+            }
+        };
+        let pipelines = pipeline::create_simulation_pipelines();
+        Self { ctx, pipelines }
+    }
+
     /// Descompressão Líquida (Streaming de Micro-Fatias)
     pub fn decompress_liquid(
         &self,
