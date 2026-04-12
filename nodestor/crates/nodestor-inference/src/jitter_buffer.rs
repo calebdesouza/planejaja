@@ -16,6 +16,7 @@
 /// Funciona com QUALQUER modelo. Não depende de hardware específico.
 
 use crate::cross_modal::{ModalityType, ModalDraft};
+use crate::semantic_attention;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -53,6 +54,8 @@ pub struct UnifiedConcept {
     pub dispatch_ns: u64,
     /// Se todos os slots esperados chegaram
     pub is_complete: bool,
+    /// Modalidade dominante calculada via Cross-Modal Attention
+    pub dominant_modality: ModalityType,
 }
 
 /// Layout de um tensor alinhado para VRAM zero-copy
@@ -261,7 +264,7 @@ impl JitterBuffer {
 
     /// Despacha o conceito atual para a fila de VRAM
     fn dispatch_current(&mut self, dispatch_ns: u64) {
-        let slots: Vec<ModalSlot> = self.current_slots.drain().map(|(_, v)| v).collect();
+        let mut slots: Vec<ModalSlot> = self.current_slots.drain().map(|(_, v)| v).collect();
         if slots.is_empty() {
             return;
         }
@@ -284,6 +287,37 @@ impl JitterBuffer {
         self.stats.avg_jitter_ns =
             (prev_total + jitter as f64) / self.stats.concepts_dispatched as f64;
 
+        // --- Cross-Modal Attention ---
+        // Calcula pesos de atenção via softmax sobre as confianças.
+        // Simulamos a temperatura = 1.0
+        let mut confidences: Vec<f32> = slots.iter().map(|s| s.confidence).collect();
+        semantic_attention::inplace_softmax(&mut confidences);
+
+        // Soft-clip cognitivo: Garante que nenhuma modalidade fique cega (< 8%)
+        let min_baseline_attention = 0.08;
+        let mut sum_alpha = 0.0;
+        for alpha in confidences.iter_mut() {
+            if *alpha < min_baseline_attention {
+                *alpha = min_baseline_attention;
+            }
+            sum_alpha += *alpha;
+        }
+        for alpha in confidences.iter_mut() {
+            *alpha /= sum_alpha;
+        }
+
+        // Identifica dominante
+        let mut dominant_modality = slots[0].modality;
+        let mut max_alpha = -1.0;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let alpha = confidences[i];
+            // Opcional: A integridade do slot poderia guardar o peso para o Vulkan (gpu_buffer_weight)
+            if alpha > max_alpha {
+                max_alpha = alpha;
+                dominant_modality = slot.modality;
+            }
+        }
+
         // Calcula layouts de tensor alinhados (simulação zero-copy)
         let layouts = self.compute_aligned_layouts(&slots);
         let total_bytes: usize = layouts.iter().map(|l| l.size_bytes).sum();
@@ -295,6 +329,7 @@ impl JitterBuffer {
             sync_jitter_ns: jitter,
             dispatch_ns,
             is_complete,
+            dominant_modality,
         };
 
         self.tensor_layouts = layouts;

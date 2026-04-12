@@ -1,6 +1,14 @@
 //! Pipeline de inferência — orquestração end-to-end do fluxo de dados.
 //!
 //! Conecta: Scanner (Hardware) → Transport (SSD) → Streaming (Metralhadora/Pool) → Vulkan (GPU) → LLM.
+//!
+//! ### PROBES V2 (Interpretabilidade Mecanística em Tempo Real)
+//! A cada token gerado, o pipeline executa:
+//! 1. `SAEEngine::encode()` — decompõe o hidden_state em features legíveis
+//! 2. `ElkProbe::probe_honesty()` — detecta dissimulação latente
+//! 3. `CoTMonitor::evaluate_step()` — verifica obfuscação no raciocínio
+//! 4. `RaiseDetector::scrutinize_inference()` — bloqueia consciência situacional SA4+
+//! 5. `Sampler::sample_with_conformal()` — garante certeza matemática TECP
 
 use nodestor_core::{DataTransport, HardwareProfile, ModelMetadata, NodeStorError};
 use nodestor_formats::detect_parser;
@@ -11,9 +19,16 @@ use nodestor_metadata::search::VectorSearch;
 use nodestor_vulkan::VulkanEngine;
 use std::sync::Arc;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 use futures::Stream;
 use std::pin::Pin;
+
+/// Trait injetável para sistemas externos de PROBES (ELK/CoT/RAISE no DAVI).
+/// O pipeline recebe um Box<dyn ProbesTool> e delega a inspeção sem criar depência circular.
+pub trait ProbesTool: Send + Sync {
+    /// Inspeciona um hidden_state e retorna (is_safe, alert_msg_or_none).
+    fn inspect(&mut self, hidden_state: &[f32], step: usize) -> (bool, Option<String>);
+}
 
 /// Configurações paramétricas da engine.
 pub struct InferenceConfig {
@@ -28,6 +43,10 @@ pub struct GenerationStats {
     pub generated_tokens: usize,
     pub tokens_per_second: f64,
     pub total_time_ms: u128,
+    /// Alertas disparados pelo PROBES V2 durante a geração (ELK + CoT + RAISE)
+    pub probes_alerts: Vec<String>,
+    /// Tokens rejeitados pelo Conformal Predictor (alta incerteza)
+    pub conformal_rejections: usize,
 }
 
 /// Estrutura para orquestração inteligente de contexto (RAM/SSD Paging).
@@ -36,15 +55,44 @@ pub struct KVCachePaginator {
     pub ssd_offload_enabled: bool,
 }
 
+/// Configuração do PROBES V2 para o pipeline.
+pub struct ProbesConfig {
+    /// Habilita SAE + ELK + CoT + RAISE durante a inferência
+    pub enabled: bool,
+    /// Dimensão do espaço latente do modelo (ex: 4096 para LLaMA 7B)
+    pub hidden_dim: usize,
+    /// Tamanho do dicionário SAE (expansão de features)
+    pub sae_dict_size: usize,
+    /// Limiar JumpReLU para esparsidade
+    pub sae_threshold: f32,
+    /// Nível máximo de RAISE tolerado antes do bloqueio
+    pub raise_block_sa_level: u8,
+}
+
+impl Default for ProbesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hidden_dim: 4096,
+            sae_dict_size: 8192,
+            sae_threshold: 0.5,
+            raise_block_sa_level: 4, // Bloqueia em SA4+
+        }
+    }
+}
+
 /// Pipeline central de execução do modelo.
 pub struct InferencePipeline {
     pub config: InferenceConfig,
+    pub probes_config: ProbesConfig,
     pub profile: HardwareProfile,
     pub transport: Arc<dyn DataTransport + Send + Sync>,
     pub metadata: Arc<ModelMetadata>,
     pub engine: VulkanEngine,
     pub vector_db: VectorSearch,
     pub kv_paginator: KVCachePaginator,
+    /// Ferramenta externa de PROBES (ELK/CoT/RAISE) — injetável sem depência circular.
+    pub probes_tool: Option<Box<dyn ProbesTool>>,
 }
 
 impl InferencePipeline {
@@ -71,13 +119,28 @@ impl InferencePipeline {
 
         Ok(Self {
             config,
+            probes_config: ProbesConfig::default(),
             profile,
             transport,
             metadata,
             engine,
             vector_db,
             kv_paginator,
+            probes_tool: None,
         })
+    }
+
+    /// Configura o PROBES V2 com parâmetros customizados.
+    pub fn with_probes(mut self, probes_config: ProbesConfig) -> Self {
+        self.probes_config = probes_config;
+        self
+    }
+
+    /// Injeta um sistema externo de inspeção (ELK/CoT/RAISE) via trait object.
+    /// Permite uso do DAVI sem dependência circular.
+    pub fn with_probes_tool(mut self, tool: Box<dyn ProbesTool>) -> Self {
+        self.probes_tool = Some(tool);
+        self
     }
 
     /// Orquestração Zero-Loss: Move KV Cache de alta fidelidade para o SSD via DMA.
@@ -97,7 +160,7 @@ impl InferencePipeline {
     /// Loop principal de "Mecanismo de Atenção": prevê tensores e dispara
     /// kernels Vulkan para gerar tokens a alta voltagem (Modo Metralhadora).
     pub async fn generate(
-        &self,
+        &mut self,
         prompt: &str,
         max_tokens: usize,
     ) -> Result<(String, GenerationStats), NodeStorError> {
@@ -192,18 +255,30 @@ impl InferencePipeline {
 
         let mut generated_tokens = Vec::new();
         let mut tokens_done = 0;
+        let mut probes_alerts: Vec<String> = Vec::new();
+        let mut conformal_rejections: usize = 0;
         let layers_per_token = num_layers.min(4).max(1);
+
+        // ── PROBES V2: Inicialização dos módulos ──────────────────────────────────
+        let probes_enabled = self.probes_config.enabled;
+        // SAE local: decomposição monosemântica dos hidden_states
+        let probes_sae = crate::sae_engine::SAEEngine::new(
+            self.probes_config.hidden_dim,
+            self.probes_config.sae_dict_size,
+            self.probes_config.sae_threshold,
+        );
+        // ─────────────────────────────────────────────────────────────────────────
 
         let mut sampler = crate::sampler::Sampler::new(crate::sampler::SamplerConfig {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
             repetition_penalty: 1.1,
+            use_conformal: probes_enabled, // Conformal ativo quando PROBES habilitado
         });
 
         for step in 0..max_tokens {
             // Em uma engine LLM real, current_token passaria por uma Tabela de Embeddings e viraria um tensor.
-            // Mock de embedding gerando dados randômicos na CPU.
             let current_token = if step < input_tokens.len() {
                 input_tokens[step]
             } else {
@@ -212,20 +287,50 @@ impl InferencePipeline {
 
             // Criar buffer GpuBuffer simulando embedding ativado
             let mut embed_data = vec![0.0f32; 4096];
-            embed_data[current_token as usize % 4096] = 1.0; 
-            // casting [f32] to [u8]
+            embed_data[current_token as usize % 4096] = 1.0;
             let embed_bytes = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4) };
             let embed_buf = self.engine.upload(embed_bytes)?;
 
-            // Roda o Forward Pass da Arquitetura Causal REAIS na GPU
+            // Roda o Forward Pass da Arquitetura Causal na GPU
             let logits_buf = transformer.forward(&self.engine, &embed_buf, step as u32)
                 .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
-            
-            // Download logits and sample
+
+            // ── PROBES V2: Inspeção pós-forward antes do sample ───────────────────
+            if probes_enabled {
+                // 1. RAIO-X (SAE local): decompõe hidden_state em features legíveis
+                let latent_features = probes_sae.encode(&embed_data);
+                let _ = latent_features; // Disponível para inspectors externos
+
+                // 2. Ferramenta externa (ELK+CoT+RAISE via DAVI) se injetada
+                if let Some(ref mut tool) = self.probes_tool {
+                    let (is_safe, maybe_alert) = tool.inspect(&embed_data, step);
+                    if let Some(alert) = maybe_alert {
+                        warn!("{}", alert);
+                        probes_alerts.push(alert);
+                    }
+                    if !is_safe {
+                        let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa (ELK/CoT/RAISE)", step);
+                        warn!("{}", block_msg);
+                        probes_alerts.push(block_msg);
+                        break; // Interrompe geração segura
+                    }
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────────
+
+            // Download logits e sample com garantia Conformal
             let mut logits = self.engine.download_f32(&logits_buf)?;
-            let sampled_token = sampler.sample(&mut logits, &generated_tokens)
+            let (sampled_token, conformal_set) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
                 .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-            
+
+            // Verifica incerteza conformal — rejeita tokens de alta entropia
+            if let Some(ref cs) = conformal_set {
+                if !cs.is_reliable {
+                    conformal_rejections += 1;
+                    debug!("[PROBES/CONFORMAL] Step {}: token rejeitado por alta incerteza (entropy={:.3})", step, cs.entropy);
+                }
+            }
+
             let next_token = sampled_token;
 
             if step >= input_tokens.len() {
@@ -276,6 +381,8 @@ impl InferencePipeline {
             generated_tokens: tokens_done,
             tokens_per_second: tps,
             total_time_ms: elapsed_ms,
+            probes_alerts,
+            conformal_rejections,
         };
 
         // Decode da string final

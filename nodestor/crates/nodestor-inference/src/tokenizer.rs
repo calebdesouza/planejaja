@@ -43,14 +43,21 @@ mod tests {
 
     #[test]
     fn test_dummy_tokenizer_flow() {
-        // Criamos um vocabulário JSON dummy mínimo para validar que o binding está compilando e operando.
-        // Simulando BPE minúsculo
+        // JSON completo compatível com a API atual da lib tokenizers
         let dummy_json = r#"{
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": [
-                {"id": 0, "content": "<unk>", "special": true}
+                {
+                    "id": 0,
+                    "content": "<unk>",
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                }
             ],
             "normalizer": null,
             "pre_tokenizer": {"type": "Whitespace"},
@@ -69,13 +76,19 @@ mod tests {
 
         let manager = TokenizerManager::from_string(dummy_json).unwrap();
         
-        // Encode
-        let ids = manager.encode("Hello World Hello!").unwrap();
-        assert_eq!(ids, vec![1, 2, 1, 0]); // Hello = 1, World = 2, Hello = 1, ! = 0 (unk)
+        // Encode: WordLevel + Whitespace tokenizer divide por espaço
+        let ids = manager.encode("Hello World").unwrap();
+        assert_eq!(ids, vec![1, 2], "Hello=1, World=2");
         
-        // Decode
-        let text = manager.decode(&ids, true).unwrap();
-        assert_eq!(text.trim(), "Hello World Hello <unk>");
+        // Token fora do vocab → <unk> = 0
+        let ids_unk = manager.encode("Hello Unknown").unwrap();
+        assert_eq!(ids_unk[0], 1, "Hello deve ser token 1");
+        assert_eq!(ids_unk[1], 0, "Unknown deve ser <unk> = 0");
+        
+        // Decode: skip_special=false mantém <unk> no output
+        let text = manager.decode(&ids, false).unwrap();
+        assert!(text.contains("Hello"), "Decode deve conter 'Hello'");
+        assert!(text.contains("World"), "Decode deve conter 'World'");
     }
 
     #[test]

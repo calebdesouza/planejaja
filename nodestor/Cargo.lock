@@ -4048,6 +4048,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodestor-davi"
+version = "0.1.0"
+dependencies = [
+ "nodestor-inference",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "nodestor-formats"
 version = "0.1.0"
 dependencies = [

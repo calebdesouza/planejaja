@@ -29,8 +29,13 @@ pub mod multi_draft;
 pub mod cross_modal;
 pub mod jitter_buffer;
 pub mod vulkan_adaptive;
+pub mod semantic_attention;
+pub mod semantic_paging;
 pub mod bench_cober_v2;
-
+pub mod bench_master;
+pub mod conformal_predictor;
+pub mod sae_engine;
+pub mod steering_engine;
 
 #[cfg(test)]
 mod tests {
@@ -38,7 +43,11 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    /// Teste de orquestração completa das 7 camadas do pipeline.
+    /// REQUER: GPU com suporte Vulkan disponível.
+    /// Para executar explicitamente: cargo test -- --ignored test_full_7_layer_pipeline
     #[tokio::test]
+    #[ignore = "Requer GPU Vulkan real — execução em ambiente de integração/CI com GPU"]
     async fn test_full_7_layer_pipeline_orchestration() {
         // SETUP: Criação do ambiente de teste (Camada 3/HAL)
         let dir = tempdir().unwrap();
@@ -70,7 +79,7 @@ mod tests {
         };
 
         // BOOT: Inicialização do Cérebro (Camada 1, 3, 6)
-        let pipeline = InferencePipeline::init(config).expect("Falha ao inicializar 7 camadas");
+        let mut pipeline = InferencePipeline::init(config).expect("Falha ao inicializar 7 camadas");
         
         // EXEC: Geração de Tokens com RAG e Streaming (Camada 2, 4, 5, 6)
         let (output, stats) = pipeline.generate("Olá NodeStor!", 5).await

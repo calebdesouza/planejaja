@@ -101,14 +101,47 @@ impl FractalMemory {
             .min()
     }
 
-    /// L0 -> L1: Calcula embedding representativo do bloco e joga fora os tokens
+    /// L0 -> L1: Calcula embedding representativo com Atenção Semântica (Sobrevivência do Mais Apto)
     fn compact_l0_to_l1(&mut self, id: usize) {
         if let Some(block) = self.blocks.get_mut(&id) {
-            // Em aplicação real, usaria o LLM/pooler pra gerar o vector real 
-            let mock_vector = vec![0.1f32; 128]; // Mock do embedding semantico
+            // Se existirem tokens, normalmente teríamos uma matriz de embeddings [N, emb_dim].
+            // Para mockar a atenção semântica, simularemos N embeddings e ponderaremos via soft-attn.
+            let mock_query = vec![1.0; 128]; // O "contexto Master" atual ou surpresa
             
-            block.tokens = None; // Libera a RAM/VRAM dos tokens (Memory Eviction real!)
-            block.vector = Some(mock_vector); // Mantem apenas o L1
+            // Simula 3 tokens neste bloco
+            let tok1 = vec![0.8; 128];
+            let tok2 = vec![0.1; 128]; // ruido
+            let tok3 = vec![0.9; 128];
+            
+            let keys: Vec<&[f32]> = vec![&tok1, &tok2, &tok3];
+            
+            // Temperatura = 3.0 para suavizar (soften) a atenção e não matar o ruído periférico (contraditório)
+            let mut alphas = crate::semantic_attention::compute_attention_weights(&mock_query, &keys, 3.0);
+            
+            // Aplica um piso mínimo (Soft-clip cognitivo) para evitar viés de confirmação absoluto
+            let min_attention_floor = 0.10;
+            let mut sum_alpha = 0.0;
+            for alpha in alphas.iter_mut() {
+                if *alpha < min_attention_floor {
+                    *alpha = min_attention_floor;
+                }
+                sum_alpha += *alpha;
+            }
+            // Renormaliza para somar 1.0
+            for alpha in alphas.iter_mut() {
+                *alpha /= sum_alpha;
+            }
+            
+            // O vetor compactado final não é uma média cega, mas a soma ponderada pelos Alphas!
+            let mut final_vector = vec![0.0f32; 128];
+            for (alpha, tok_emb) in alphas.iter().zip(keys.iter()) {
+                for i in 0..128 {
+                    final_vector[i] += alpha * tok_emb[i];
+                }
+            }
+            
+            block.tokens = None; // Libera a RAM/VRAM dos tokens brutos (Eviction real!)
+            block.vector = Some(final_vector); // Mantém apenas o L1 compactado inteligentemente
             block.level = MemoryLevel::L1Vectors;
         }
     }

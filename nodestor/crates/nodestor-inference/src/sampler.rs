@@ -14,6 +14,7 @@ pub struct SamplerConfig {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    pub use_conformal: bool,
 }
 
 impl Default for SamplerConfig {
@@ -23,17 +24,38 @@ impl Default for SamplerConfig {
             top_k: 40,
             top_p: 0.9,
             repetition_penalty: 1.1,
+            use_conformal: false,
         }
     }
 }
 
+use crate::conformal_predictor::{ConformalPredictor, ConformalSet};
+
 pub struct Sampler {
     config: SamplerConfig,
+    pub conformal: Option<ConformalPredictor>,
 }
 
 impl Sampler {
     pub fn new(config: SamplerConfig) -> Self {
-        Self { config }
+        let conformal = if config.use_conformal {
+            Some(ConformalPredictor::new(0.95))
+        } else {
+            None
+        };
+        Self { config, conformal }
+    }
+
+    /// Executa a amostragem retornando o token e opcionalmente o Set Conformal.
+    pub fn sample_with_conformal(&mut self, logits: &mut [f32], context: &[u32]) -> Result<(u32, Option<ConformalSet>), NodeStorError> {
+        let conformal_set = if let Some(cp) = &mut self.conformal {
+            Some(cp.predict_set(logits))
+        } else {
+            None
+        };
+        
+        let token = self.sample(logits, context)?;
+        Ok((token, conformal_set))
     }
 
     /// Executa a amostragem sobre os logits brutos (após Softmax ou Linears) exportados da GPU.
@@ -133,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_greedy_returns_argmax() {
-        let config = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 };
+        let config = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, use_conformal: false };
         let sampler = Sampler::new(config);
         let mut logits = vec![0.1, 5.0, 2.0, -1.0];
         let token = sampler.sample(&mut logits, &[]).unwrap();
@@ -142,8 +164,8 @@ mod tests {
 
     #[test]
     fn test_temperature_sharpens() {
-        let config_hot = SamplerConfig { temperature: 2.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 };
-        let config_cold = SamplerConfig { temperature: 0.1, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 };
+        let config_hot = SamplerConfig { temperature: 2.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, use_conformal: false };
+        let config_cold = SamplerConfig { temperature: 0.1, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, use_conformal: false };
         let sampler_hot = Sampler::new(config_hot);
         let sampler_cold = Sampler::new(config_cold);
         
@@ -161,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_top_k_truncates() {
-        let config = SamplerConfig { temperature: 1.0, top_k: 1, top_p: 1.0, repetition_penalty: 1.0 };
+        let config = SamplerConfig { temperature: 1.0, top_k: 1, top_p: 1.0, repetition_penalty: 1.0, use_conformal: false };
         let sampler = Sampler::new(config);
         let mut logits = vec![1.0, 10.0, 2.0, 3.0];
         let token = sampler.sample(&mut logits, &[]).unwrap();
@@ -171,7 +193,7 @@ mod tests {
     #[test]
     fn test_top_p_nucleus() {
         // Se top_p = 0.5, e o logit 1 tem > 0.5 prob absoluta, só ele sobrevive
-        let config = SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.5, repetition_penalty: 1.0 };
+        let config = SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.5, repetition_penalty: 1.0, use_conformal: false };
         let sampler = Sampler::new(config);
         let mut logits = vec![0.0, 20.0, 0.0, 0.0];
         let token = sampler.sample(&mut logits, &[]).unwrap();
@@ -180,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_repetition_penalty() {
-        let config = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 2.0 };
+        let config = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 2.0, use_conformal: false };
         let sampler = Sampler::new(config);
         // Sem penalty, token 1 seria o argmax
         let mut logits = vec![1.0, 10.0, 8.0, 1.0];

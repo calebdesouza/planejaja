@@ -169,11 +169,14 @@ fn directstorage_available() -> bool {
 }
 
 fn parse_kernel_version(version_str: &str) -> (u32, u32, u32) {
-    // Extrai "6.16.0" de strings como "Linux 6.16.0-generic"
+    // Extrai "6.16.2" de strings como "Linux 6.16.2-generic" ou "6.1.88-1-MANJARO"
     let nums: Vec<u32> = version_str
         .split_whitespace()
         .flat_map(|part| part.split('.'))
-        .filter_map(|s| s.parse().ok())
+        .filter_map(|s| {
+            // Remove sufixos como "-generic", "-MANJARO" antes de parsear
+            s.split('-').next().unwrap_or(s).parse::<u32>().ok()
+        })
         .take(3)
         .collect();
 
@@ -201,32 +204,147 @@ fn total_ram() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodestor_core::{GpuVendor, TransportBackend};
 
+    /// Testa que `scan()` funciona em qualquer sistema operacional e retorna um perfil válido.
     #[test]
     fn test_scan_returns_profile() {
         let profile = scan().expect("Scanner deve funcionar em qualquer sistema");
         // SO deve ser detectado
         assert_ne!(profile.os_version, "", "Versão do SO não deve ser vazia");
-        // CPU cores deve ser >= 1
+        // CPU cores deve ser >= 1 (funciona em qualquer máquina)
         assert!(profile.cpu_cores >= 1, "Deve ter pelo menos 1 núcleo de CPU");
-        // RAM deve ser > 0
+        // RAM deve ser > 0 (funciona em qualquer máquina)
         assert!(profile.total_ram_bytes > 0, "RAM total deve ser > 0");
-        // Deve ter selecionado algum backend
+        // Deve ter GPU ou CPU-only fallback
+        assert!(!profile.gpus.is_empty(), "Deve ter pelo menos 1 device (GPU ou CPU-only)");
+        // Backend selecionado deve ser válido
         println!("Backend selecionado: {}", profile.recommended_transport);
+        println!("GPUs: {:?}", profile.gpus.iter().map(|g| &g.device_name).collect::<Vec<_>>());
+        println!("Storage: {} dispositivos", profile.storage.len());
     }
 
+    /// Testa que o throughput estimado é sempre > 0 (CPU-only ou qualquer GPU).
+    #[test]
+    fn test_profile_throughput_always_positive() {
+        let profile = scan().unwrap();
+        let throughput = profile.estimated_transport_throughput();
+        assert!(throughput > 0, "Throughput estimado deve ser > 0 mesmo sem GPU");
+    }
+
+    /// Testa CPU-only fallback: quando não há GPU, o device é Unknown e backend é PreadFallback.
+    #[test]
+    fn test_cpu_only_fallback_structure() {
+        let gpus_none: Vec<nodestor_core::GpuCapabilities> = Vec::new();
+        let storage: Vec<nodestor_core::StorageInfo> = Vec::new();
+        let mut missed = Vec::new();
+        let backend = select_transport(
+            &nodestor_core::OsType::Linux, 
+            &gpus_none, 
+            &storage, 
+            "5.10.0",
+            &mut missed
+        );
+        assert_eq!(backend, TransportBackend::PreadFallback, "Sem GPU/Vulkan deve usar PreadFallback");
+    }
+
+    /// Valida parsing de versão do kernel Linux em todos os formatos.
     #[test]
     fn test_parse_kernel_version() {
-        assert_eq!(parse_kernel_version("Linux 6.16.2-generic"), (6, 16, 0));
+        assert_eq!(parse_kernel_version("Linux 6.16.2-generic"), (6, 16, 2));
         assert_eq!(parse_kernel_version("6.1.0"), (6, 1, 0));
         assert_eq!(parse_kernel_version("5.15.134.1-microsoft-standard-WSL2"), (5, 15, 134));
         assert_eq!(parse_kernel_version("unknown"), (0, 0, 0));
+        assert_eq!(parse_kernel_version("6.16"), (6, 16, 0));
+        assert_eq!(parse_kernel_version(""), (0, 0, 0));
     }
 
+    /// Testa que a detecção de storage retorna pelo menos 1 dispositivo em qualquer máquina.
     #[test]
-    fn test_profile_methods() {
-        let profile = scan().unwrap();
-        let throughput = profile.estimated_transport_throughput();
-        assert!(throughput > 0, "Throughput estimado deve ser > 0");
+    fn test_storage_always_finds_at_least_one_device() {
+        let storage = detect_storage();
+        assert!(!storage.is_empty(), "Deve encontrar pelo menos 1 dispositivo de armazenamento");
+        // Primeiro dispositivo (mais rápido) deve ter throughput estimado > 0
+        assert!(storage[0].estimated_read_bps > 0, "Throughput de leitura deve ser > 0");
+    }
+
+    /// Testa que GPUs detectadas têm campos coerentes.
+    #[test]
+    fn test_gpus_have_coherent_fields() {
+        let gpus = detect_gpus();
+        assert!(!gpus.is_empty(), "Deve ter pelo menos 1 device (GPU ou CPU-only fallback)");
+        for gpu in &gpus {
+            assert!(!gpu.device_name.is_empty(), "Nome da GPU não deve ser vazio");
+            // CPU-only não suporta Vulkan — coerência
+            if gpu.vendor == GpuVendor::Unknown && gpu.device_name.contains("CPU-only") {
+                assert!(!gpu.supports_vulkan_compute, "CPU-only não deve reportar Vulkan");
+            }
+        }
+    }
+
+    /// Testa o backend Windows (DirectStorage) em ambientes sem a DLL.
+    #[test]
+    fn test_windows_backend_without_dstorage() {
+        #[cfg(target_os = "windows")]
+        {
+            // Em qualquer Windows sem DirectStorage, deve cair no VulkanGeneric ou PreadFallback
+            let profile = scan().unwrap();
+            match profile.recommended_transport {
+                TransportBackend::DirectStorage |
+                TransportBackend::VulkanGeneric |
+                TransportBackend::PreadFallback => {},
+                other => println!("Backend Windows: {}", other),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        { /* não aplicavel neste SO */ }
+    }
+
+    /// Testa que o BackEnd Linux seleciona corretamente por kernel version.
+    #[test]
+    fn test_linux_iouring_selection() {
+        let gpu_vulkan = vec![nodestor_core::GpuCapabilities {
+            vendor: GpuVendor::Unknown,
+            device_name: "TestGPU".to_string(),
+            vram_bytes: 0,
+            supports_vulkan_compute: true,
+            supports_cooperative_matrix2: false,
+            supports_cooperative_matrix_khr: false,
+            supports_bfloat16: false,
+            pcie_gen: 0, pcie_lanes: 0, resizable_bar_enabled: false,
+            driver_version: "".to_string(),
+        }];
+        let storage: Vec<nodestor_core::StorageInfo> = Vec::new();
+        let mut missed = Vec::new();
+
+        // Kernel 6.16+ deve selecionar IoUringDmabuf
+        let backend = select_transport(
+            &nodestor_core::OsType::Linux, 
+            &gpu_vulkan, 
+            &storage, 
+            "6.16.0",
+            &mut missed
+        );
+        assert_eq!(backend, TransportBackend::IoUringDmabuf, "Kernel 6.16+ com Vulkan deve usar IoUringDmabuf");
+
+        // Kernel 5.11 deve usar IoUringStandard
+        let backend2 = select_transport(
+            &nodestor_core::OsType::Linux, 
+            &gpu_vulkan, 
+            &storage, 
+            "5.11.0",
+            &mut missed
+        );
+        assert_eq!(backend2, TransportBackend::IoUringStandard, "Kernel 5.11 deve usar IoUringStandard");
+
+        // Kernel antigo deve usar VulkanGeneric
+        let backend3 = select_transport(
+            &nodestor_core::OsType::Linux, 
+            &gpu_vulkan, 
+            &storage, 
+            "5.4.0",
+            &mut missed
+        );
+        assert_eq!(backend3, TransportBackend::VulkanGeneric, "Kernel antigo com Vulkan deve usar VulkanGeneric");
     }
 }
