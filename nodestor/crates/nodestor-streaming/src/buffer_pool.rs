@@ -79,6 +79,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Requer VulkanContext real (GPU) — executar em CI com GPU ou manualmente"]
     async fn test_pool_acquire_and_release() {
         let ctx = VulkanContext::new(None).unwrap();
         let pool = BufferPool::new(&ctx, 1024, 2).unwrap();

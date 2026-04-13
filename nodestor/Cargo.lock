@@ -1708,6 +1708,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "datafusion"
 version = "40.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1721,7 +1735,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "dashmap",
+ "dashmap 5.5.3",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-execution",
@@ -1792,7 +1806,7 @@ checksum = "2ac0fd8b5d80bbca3fc3b6f40da4e9f6907354824ec3b18bbd83fee8cf5c3c3e"
 dependencies = [
  "arrow 52.2.0",
  "chrono",
- "dashmap",
+ "dashmap 5.5.3",
  "datafusion-common",
  "datafusion-expr",
  "futures",
@@ -3202,7 +3216,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "dashmap",
+ "dashmap 5.5.3",
  "datafusion",
  "datafusion-functions",
  "datafusion-physical-expr",
@@ -4057,6 +4071,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "nodestor-fabric"
+version = "0.1.0"
+dependencies = [
+ "dashmap 6.1.0",
+ "nodestor-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

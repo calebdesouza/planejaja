@@ -77,14 +77,19 @@ impl ElkProbe {
     }
 
     /// Avalia um hidden_state durante o runtime e retorna o Veredito de Honestidade.
-    pub fn probe_honesty(&self, hidden_state: &[f32], sae: &SAEEngine) -> HonestyVerdict {
+    pub fn probe_honesty(&self, hidden_state: &[f32], sae: &mut SAEEngine) -> HonestyVerdict {
         let features = sae.encode(hidden_state);
-        let score = self.evaluate_sigmoid(&features);
-        
+        self.probe_honesty_from_features(&features)
+    }
+
+    /// Avalia features SAE já computadas (sem precisar do SAE novamente).
+    /// Usado pelo BudgetForcer que tem seu próprio SAE interno.
+    pub fn probe_honesty_from_features(&self, features: &[f32]) -> HonestyVerdict {
+        let score = self.evaluate_sigmoid(features);
         HonestyVerdict {
             score,
             is_honest: score >= self.honest_threshold,
-            confidence: (score - 0.5).abs() * 2.0, // Quão longe do muro (0 ou 1)
+            confidence: (score - 0.5).abs() * 2.0,
         }
     }
 }

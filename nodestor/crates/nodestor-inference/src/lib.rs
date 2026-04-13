@@ -36,6 +36,22 @@ pub mod bench_master;
 pub mod conformal_predictor;
 pub mod sae_engine;
 pub mod steering_engine;
+// --- Deep Reasoning: 5 módulos novos (Princípios 2, 3, 6, 7, PCM) ---
+pub mod ignorance_detector;
+pub mod adaptive_router;
+pub mod semantic_chunker;
+pub mod budget_forcer;
+pub mod persistent_memory;
+// --- PROBES V2 Expansão: Cirurgia Latente Universal ---
+pub mod refusal_mapper;
+
+// --- K-Quants: Dequantização Universal (Crítico para modelos 70B+) ---
+pub mod dequant;
+
+// --- PagedAttention + RadixAttention: Multi-usuário eficiente ---
+pub mod paged_attention;
+pub mod radix_cache;
+
 
 #[cfg(test)]
 mod tests {

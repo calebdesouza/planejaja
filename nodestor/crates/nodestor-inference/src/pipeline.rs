@@ -262,7 +262,7 @@ impl InferencePipeline {
         // ── PROBES V2: Inicialização dos módulos ──────────────────────────────────
         let probes_enabled = self.probes_config.enabled;
         // SAE local: decomposição monosemântica dos hidden_states
-        let probes_sae = crate::sae_engine::SAEEngine::new(
+        let mut probes_sae = crate::sae_engine::SAEEngine::new(
             self.probes_config.hidden_dim,
             self.probes_config.sae_dict_size,
             self.probes_config.sae_threshold,

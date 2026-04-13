@@ -56,7 +56,7 @@ impl SteeringEngine {
 
     /// [Fluxo Lento via SAE]: Aplica as modificações e reconstrói o resíduo
     /// h -> SAE -> f -> Intervenção -> SAE Dec -> h'
-    pub fn apply_latent_surgery(&self, hidden_states: &[f32], sae: &SAEEngine) -> Vec<f32> {
+    pub fn apply_latent_surgery(&self, hidden_states: &[f32], sae: &mut SAEEngine) -> Vec<f32> {
         if self.active_vectors.is_empty() {
             return hidden_states.to_vec();
         }
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_apply_latent_surgery_clamping() {
-        let sae = SAEEngine::new(64, 256, 0.1);
+        let mut sae = SAEEngine::new(64, 256, 0.1);
         let mut engine = SteeringEngine::new();
         
         // Travar a feature #42 no valor 10.0
@@ -145,7 +145,7 @@ mod tests {
         let mut h = vec![0.0; 64];
         h[5] = 1.0; // Estado original
         
-        let h_prime = engine.apply_latent_surgery(&h, &sae);
+        let h_prime = engine.apply_latent_surgery(&h, &mut sae);
         
         // O h_prime deve ter delta modificado, diferente do original h
         // (A prova final seria que sae.encode(h_prime)[42] == 10.0, mas a math de delta é proxy).

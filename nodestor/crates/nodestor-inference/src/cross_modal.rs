@@ -63,6 +63,101 @@ pub struct CrossModalVerification {
     pub per_modality_scores: Vec<(ModalityType, f32)>,
 }
 
+/// MRepE — Alignment Projector Cross-Modal.
+///
+/// Implementa as "Funções de Mapeamento de Alinhamento" da pesquisa:
+/// uma matriz de projeção (`latent_dim × latent_dim`) aprendida que garante
+/// que conceitos de alinhamento (ex: "segurança", "violação") mapeiem para
+/// a MESMA região do espaço latente em todas as modalidades.
+///
+/// ## Problema que resolve:
+/// Sem o projector, um modelo pode:
+/// - RECUSAR um texto sobre armas (filtro de texto OK)
+/// - Mas GERAR uma imagem de arma (filtro de imagem não ativado)
+///
+/// Com o projector, o conceito "arma" é um PONTO no espaço latente unificado
+/// que é reconhecido por TODAS as modalidades igualmente.
+///
+/// ## Método de aprendizado:
+/// Recebe pares (`emb_texto`, `emb_imagem`) que devem representar o mesmo conceito.
+/// Ajusta incrementalmente a matriz de projeção para minimizar a distância
+/// entre os embeddings projetados (gradiente de identidade simplificado).
+pub struct AlignmentProjector {
+    /// Matriz de projeção: `latent_dim × latent_dim`
+    /// (inicializada como identidade = sem projeção = comportamento original)
+    pub matrix: Vec<f32>,
+    pub latent_dim: usize,
+    /// Taxa de aprendizado do ajuste incremental
+    pub learning_rate: f32,
+    /// Número de pares de calibração aprendidos
+    pub pairs_learned: u64,
+}
+
+impl AlignmentProjector {
+    /// Cria um projector inicializado como identidade (sem efeito até calibrar).
+    pub fn new(latent_dim: usize) -> Self {
+        // Identidade: M[i,j] = 1.0 se i==j, 0.0 caso contrário
+        let mut matrix = vec![0.0f32; latent_dim * latent_dim];
+        for i in 0..latent_dim {
+            matrix[i * latent_dim + i] = 1.0;
+        }
+        Self {
+            matrix,
+            latent_dim,
+            learning_rate: 0.01,
+            pairs_learned: 0,
+        }
+    }
+
+    /// Projeta um embedding: `e' = M * e`
+    pub fn project(&self, embedding: &[f32]) -> Vec<f32> {
+        let d = self.latent_dim;
+        let len = embedding.len().min(d);
+        let mut out = vec![0.0f32; d];
+        for i in 0..d {
+            for j in 0..len {
+                out[i] += self.matrix[i * d + j] * embedding[j];
+            }
+        }
+        out
+    }
+
+    /// Aprende de um par de embeddings que DEVEM representar o mesmo conceito.
+    ///
+    /// Atualiza incrementalmente a matriz para minimizar ||M*e_a - e_b||.
+    /// `e_a`: embedding de modalidade A (ex: texto)
+    /// `e_b`: embedding alvo de modalidade B (ex: imagem)
+    pub fn learn_from_pair(&mut self, e_a: &[f32], e_b: &[f32]) {
+        let d = self.latent_dim;
+        let projected = self.project(e_a);
+
+        // Gradiente simples: delta = lr * (e_b - projected) * e_a^T
+        // Atualiza M += lr * outer(e_b - projected, e_a)
+        for i in 0..d.min(e_b.len()) {
+            let error = e_b[i] - projected[i];
+            for j in 0..d.min(e_a.len()) {
+                self.matrix[i * d + j] += self.learning_rate * error * e_a[j];
+            }
+        }
+
+        self.pairs_learned += 1;
+    }
+
+    /// Verifica se o projector está próximo da identidade (não calibrado)
+    pub fn is_identity(&self) -> bool {
+        let d = self.latent_dim;
+        for i in 0..d {
+            for j in 0..d {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                if (self.matrix[i * d + j] - expected).abs() > 0.01 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 /// O Barramento de Intenção Multimodal
 pub struct CrossModalBus {
     /// Conceitos latentes indexados (equivalente à "memória conceitual")
@@ -75,6 +170,8 @@ pub struct CrossModalBus {
     pub reuse_threshold: f32,
     /// Estatísticas
     pub stats: CrossModalStats,
+    /// Projector de alinhamento MRepE (opcional — None = comportamento original)
+    pub alignment_projector: Option<AlignmentProjector>,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +190,32 @@ impl CrossModalBus {
             next_concept_id: 0,
             reuse_threshold: 0.85,
             stats: CrossModalStats::default(),
+            alignment_projector: None,
+        }
+    }
+
+    /// Habilita o AlignmentProjector MRepE no barramento.
+    /// Após chamar este método, todos os embeddings registrados serão
+    /// projetados para o espaço alinhado antes da busca por similaridade.
+    pub fn enable_alignment_projector(&mut self) {
+        self.alignment_projector = Some(AlignmentProjector::new(self.latent_dim));
+    }
+
+    /// Ensina o projector que dois embeddings representam o mesmo conceito.
+    /// `emb_source`: embedding da modalidade SOURCE (ex: texto)
+    /// `emb_target`: embedding TARGET que deve mapear pro mesmo ponto (ex: imagem)
+    pub fn align_concept_pair(&mut self, emb_source: &[f32], emb_target: &[f32]) {
+        if let Some(projector) = &mut self.alignment_projector {
+            projector.learn_from_pair(emb_source, emb_target);
+        }
+    }
+
+    /// Projeta um embedding pelo AlignmentProjector (se ativo).
+    /// Se o projector não está ativo, retorna o embedding original.
+    pub fn project_embedding(&self, embedding: &[f32]) -> Vec<f32> {
+        match &self.alignment_projector {
+            Some(p) => p.project(embedding),
+            None => embedding.to_vec(),
         }
     }
 
@@ -394,5 +517,72 @@ mod tests {
         assert!(modalities.contains(&ModalityType::Audio));
         assert!(modalities.contains(&ModalityType::Text));
         assert!(modalities.contains(&ModalityType::Image));
+    }
+
+    #[test]
+    fn test_alignment_projector_starts_as_identity() {
+        let proj = AlignmentProjector::new(3);
+        assert!(proj.is_identity(), "Projector recém-criado deve ser identidade");
+        assert_eq!(proj.pairs_learned, 0);
+
+        // Projetar com identidade = input inalterado
+        let emb = vec![1.0f32, 2.0, 3.0];
+        let result = proj.project(&emb);
+        for i in 0..3 {
+            assert!((result[i] - emb[i]).abs() < 1e-5,
+                "Identidade deve preservar embedding: idx={}, esperado={}, obtido={}",
+                i, emb[i], result[i]);
+        }
+    }
+
+    #[test]
+    fn test_alignment_projector_learns_from_pair() {
+        let mut proj = AlignmentProjector::new(4);
+
+        let emb_text = vec![1.0f32, 0.0, 0.0, 0.0];
+        let emb_image = vec![0.8f32, 0.2, 0.0, 0.0]; // ligeiramente diferente
+
+        // Treinar 100 pares — deve aproximar a projeção do alvo
+        for _ in 0..100 {
+            proj.learn_from_pair(&emb_text, &emb_image);
+        }
+
+        assert_eq!(proj.pairs_learned, 100);
+        assert!(!proj.is_identity(), "Após aprendizado, projector não deve ser identidade");
+
+        // A projeção do texto deve estar mais próxima da imagem alvo
+        let projected = proj.project(&emb_text);
+        let dist_before = (1.0f32 - 0.8f32).powi(2).sqrt(); // sem projeção
+        let dist_after: f32 = projected.iter().zip(emb_image.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+
+        assert!(dist_after < dist_before,
+            "Após aprendizado, distância deve reduzir: antes={:.4}, depois={:.4}",
+            dist_before, dist_after);
+    }
+
+    #[test]
+    fn test_bus_alignment_projector_optional() {
+        let mut bus = CrossModalBus::new(4);
+        assert!(bus.alignment_projector.is_none(), "Projector deve ser None por padrão");
+
+        // project_embedding sem projector deve retornar input original
+        let emb = vec![1.0f32, 2.0, 3.0, 4.0];
+        let projected = bus.project_embedding(&emb);
+        assert_eq!(projected, emb, "Sem projector, embedding deve ser identidade");
+
+        // Habilitar projector
+        bus.enable_alignment_projector();
+        assert!(bus.alignment_projector.is_some(), "Projector deve estar ativo após enable");
+
+        // Treinar alinhamento
+        let source = vec![1.0f32, 0.0, 0.0, 0.0];
+        let target = vec![0.5f32, 0.5, 0.0, 0.0];
+        bus.align_concept_pair(&source, &target);
+
+        let proj = bus.alignment_projector.as_ref().unwrap();
+        assert_eq!(proj.pairs_learned, 1);
     }
 }

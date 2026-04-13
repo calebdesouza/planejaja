@@ -1,15 +1,15 @@
-use crate::elk_probe::{ElkProbe, HonestyVerdict};
+﻿use crate::elk_probe::{ElkProbe, HonestyVerdict};
 use nodestor_inference::sae_engine::SAEEngine;
 
-/// PROBES V2 — CoT Monitor (Chain of Thought)
+/// PROBES V2 â€” CoT Monitor (Chain of Thought)
 ///
-/// Mecanismo de defesa em profundidade focado na prevenção da "Obfuscação de Raciocínio".
-/// Monitora a produção sequencial de Chain of Thought dos Modelos de Raciocínio (ex: o1, R1).
-/// Se o texto se mantém benigno mas as ativações latentes apontam desvios (via ELK),
-/// o monitor aciona a contenção prevenindo manipulação encoberta.
+/// Mecanismo de defesa em profundidade focado na prevenÃ§Ã£o da "ObfuscaÃ§Ã£o de RaciocÃ­nio".
+/// Monitora a produÃ§Ã£o sequencial de Chain of Thought dos Modelos de RaciocÃ­nio (ex: o1, R1).
+/// Se o texto se mantÃ©m benigno mas as ativaÃ§Ãµes latentes apontam desvios (via ELK),
+/// o monitor aciona a contenÃ§Ã£o prevenindo manipulaÃ§Ã£o encoberta.
 
 pub struct CoTMonitor {
-    /// Número de insights latentes consecutivos identificados como dissimulados.
+    /// NÃºmero de insights latentes consecutivos identificados como dissimulados.
     pub consecutive_lies: usize,
     /// Limite permissivo antes de soar o alarme definitivo (impede falso positivo por spike).
     pub obfuscation_threshold: usize,
@@ -29,12 +29,12 @@ impl CoTMonitor {
         }
     }
 
-    /// Avalia um único passo (token ou frase) da CoT durante a inferência.
+    /// Avalia um Ãºnico passo (token ou frase) da CoT durante a inferÃªncia.
     /// Retorna `true` se o processo deve ser INTERROMPIDO imediatamente.
     pub fn evaluate_step(
         &mut self, 
         hidden_state: &[f32], 
-        sae: &SAEEngine, 
+        sae: &mut SAEEngine, 
         elk: &ElkProbe
     ) -> Result<HonestyVerdict, CoTObfuscationError> {
         let verdict = elk.probe_honesty(hidden_state, sae);
@@ -42,7 +42,7 @@ impl CoTMonitor {
         if !verdict.is_honest {
             self.consecutive_lies += 1;
         } else {
-            // Decay orgânico: se for apenas um spike ruidoso, ele se recupera.
+            // Decay orgÃ¢nico: se for apenas um spike ruidoso, ele se recupera.
             self.consecutive_lies = self.consecutive_lies.saturating_sub(1);
         }
 
@@ -71,7 +71,7 @@ impl std::fmt::Display for CoTObfuscationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f, 
-            "⚠️ ALARME DE OBFUSCAÇÃO CoT: Múltiplas ativações consecutivas dissimuladas. Score final {:.2} após {} iterações.", 
+            "âš ï¸ ALARME DE OBFUSCAÃ‡ÃƒO CoT: MÃºltiplas ativaÃ§Ãµes consecutivas dissimuladas. Score final {:.2} apÃ³s {} iteraÃ§Ãµes.", 
             self.detected_score, self.sequence_length
         )
     }
@@ -93,7 +93,7 @@ mod tests {
         elk.weights[10] = -5.0; 
 
         // SAE Mock para disparar a feature 10
-        // Como MOCK encode() é um dot-product bruto, W_enc * h > threshold dispara.
+        // Como MOCK encode() Ã© um dot-product bruto, W_enc * h > threshold dispara.
         let mut mock_sae = sae;
         mock_sae.encoder_weights[10 * 64 + 5] = 10.0;
         
@@ -104,19 +104,20 @@ mod tests {
         let mut h_lie = vec![0.0; 64]; h_lie[5] = 1.0; // Feature 10 acende -> score cai pra ~0.0
 
         // Passo 1: Honesto
-        assert!(monitor.evaluate_step(&h_honest, &mock_sae, &elk).is_ok());
+        assert!(monitor.evaluate_step(&h_honest, &mut mock_sae, &elk).is_ok());
         
         // Passo 2: Mentira
-        assert!(monitor.evaluate_step(&h_lie, &mock_sae, &elk).is_ok());
+        assert!(monitor.evaluate_step(&h_lie, &mut mock_sae, &elk).is_ok());
         assert_eq!(monitor.consecutive_lies, 1);
         
         // Passo 3: Mentira (2 consecutivas permitidas)
-        assert!(monitor.evaluate_step(&h_lie, &mock_sae, &elk).is_ok());
+        assert!(monitor.evaluate_step(&h_lie, &mut mock_sae, &elk).is_ok());
         
-        // Passo 4: O Abismo (3 consecutivas -> Dispara o alarme de contenção)
-        let alarm = monitor.evaluate_step(&h_lie, &mock_sae, &elk);
-        assert!(alarm.is_err(), "O detector de obfuscação CoT não disparou no threshold esperado!");
+        // Passo 4: O Abismo (3 consecutivas -> Dispara o alarme de contenÃ§Ã£o)
+        let alarm = monitor.evaluate_step(&h_lie, &mut mock_sae, &elk);
+        assert!(alarm.is_err(), "O detector de obfuscaÃ§Ã£o CoT nÃ£o disparou no threshold esperado!");
         
         println!("{}", alarm.err().unwrap());
     }
 }
+

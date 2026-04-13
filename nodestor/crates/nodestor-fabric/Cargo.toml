@@ -1,0 +1,22 @@
+[package]
+name = "nodestor-fabric"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NVMe-oF (NVMe over Fabrics) — Acesso Remoto a Tensores via RDMA DMA"
+
+[dependencies]
+nodestor-core = { path = "../nodestor-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rayon = "1.10"
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -153,6 +153,7 @@ mod tests {
     use std::io::Write;
 
     #[tokio::test]
+    #[ignore = "Requer VulkanContext real (GPU) — executar em CI com GPU"]
     async fn test_metralhadora_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.bin");

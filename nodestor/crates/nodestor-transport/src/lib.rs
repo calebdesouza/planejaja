@@ -23,6 +23,9 @@ mod win32_fallback;
 mod mmap_transport;
 pub mod direct_io;
 pub mod platform;
+pub mod metal_backend;
+pub mod rocm_backend;
+pub mod sycl_backend;
 
 #[cfg(target_os = "linux")]
 mod io_uring_transport;
@@ -31,6 +34,9 @@ pub use fallback::PreadFallback;
 pub use win32_fallback::{Win32OverlappedTransport, directstorage_dlls_available};
 pub use direct_io::DirectIOReader;
 pub use platform::PlatformIOCapabilities;
+pub use metal_backend::{MetalTransport, detect_apple_silicon, AppleSiliconInfo};
+pub use rocm_backend::{RocmTransport, detect_rocm_gpus, RocmGpuInfo};
+pub use sycl_backend::{IntelSyclTransport, detect_amx, detect_intel_gpus, AmxCapabilities, IntelGpuInfo};
 
 use nodestor_core::{DataTransport, HardwareProfile, TransportBackend, GpuVendor};
 use tracing::info;

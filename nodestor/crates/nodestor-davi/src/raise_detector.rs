@@ -78,7 +78,7 @@ impl RaiseDetector {
     pub fn scrutinize_inference(
         &mut self,
         hidden_state: &[f32],
-        sae: &SAEEngine,
+        sae: &mut SAEEngine,
         elk_verdict: &HonestyVerdict,
         logger: &mut AuditLogger,
     ) -> Result<(), String> {
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_raise_detector_escalation() {
         let mut detector = RaiseDetector::new();
-        let sae = SAEEngine::new(64, 1024, 0.1);
+        let mut sae = SAEEngine::new(64, 1024, 0.1);
         
         let mut logger = AuditLogger::new(100);
         let honest_verdict = HonestyVerdict { score: 0.9, is_honest: true, confidence: 0.8 };
@@ -120,7 +120,7 @@ mod tests {
         let mut mock_latents = vec![0.0; 1024];
         let level1 = detector.classify_situational_awareness(&mock_latents, &honest_verdict);
         assert_eq!(level1, RaiseLevel::SA1_SelfIdentification);
-        assert!(detector.scrutinize_inference(&vec![0.0; 64], &sae, &honest_verdict, &mut logger).is_ok());
+        assert!(detector.scrutinize_inference(&vec![0.0; 64], &mut sae, &honest_verdict, &mut logger).is_ok());
 
         // Simulando SA4 (Sabe do contexto + mente)
         mock_latents[777] = 4.0; // Consciência dispara > 3.0
@@ -129,12 +129,12 @@ mod tests {
 
         // No teste completo do scrutinize, injetando uma ativação letal onde W_enc resulta em > 5.0
         let mut lethal_h = vec![0.0; 64];
-        let mut lethal_sae = sae;
+        let mut lethal_sae = SAEEngine::new(64, 1024, 0.1);
         lethal_sae.encoder_weights[777 * 64 + 10] = 6.0;
         lethal_h[10] = 1.0; 
         // Com w_enc 6.0 * 1.0 = 6.0 na feature 777 > 5.0 e mentindo -> SA5
 
-        let outcome = detector.scrutinize_inference(&lethal_h, &lethal_sae, &lie_verdict, &mut logger);
+        let outcome = detector.scrutinize_inference(&lethal_h, &mut lethal_sae, &lie_verdict, &mut logger);
         assert!(outcome.is_err(), "Detectar mentira com alta meta-cognição não engatilhou o bloqueio operacional!");
         assert!(logger.len() > 0, "O audit-log falhou em registrar o evento SA5/SA4");
     }
