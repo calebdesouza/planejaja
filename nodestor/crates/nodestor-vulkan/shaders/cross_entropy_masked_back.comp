@@ -1,0 +1,54 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuffer {
+    float logits[];
+};
+
+layout(set = 0, binding = 1) buffer GradLogitsBuffer {
+    float grad_logits[];
+};
+
+layout(push_constant) uniform Constants {
+    uint vocab_size;
+    uint target_token_id;
+    float loss_grad_scale;
+} pc;
+
+shared float max_logit;
+shared float sum_exp;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    // 1. Achar o max logit (subgroup_max ou memory barrier simple)
+    // Para simplificar no POC mantemos um passe linear na thread zero
+    if (gl_LocalInvocationID.x == 0) {
+        float m = -1e20;
+        for (uint i = 0; i < pc.vocab_size; ++i) {
+            m = max(m, logits[i]);
+        }
+        max_logit = m;
+        
+        float s = 0.0;
+        for (uint i = 0; i < pc.vocab_size; ++i) {
+            s += exp(logits[i] - max_logit);
+        }
+        sum_exp = s;
+    }
+    
+    barrier();
+    
+    if (idx < pc.vocab_size) {
+        float prob = exp(logits[idx] - max_logit) / sum_exp;
+        
+        // Derivada de Cross Entropy (Softmax)
+        float grad = prob;
+        if (idx == pc.target_token_id) {
+            grad = prob - 1.0;
+        }
+        
+        // Multiplica pelo fator da Loss superior (ex: DPO gradient term)
+        grad_logits[idx] = grad * pc.loss_grad_scale;
+    }
+}

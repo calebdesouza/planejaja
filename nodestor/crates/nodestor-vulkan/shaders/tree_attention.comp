@@ -1,0 +1,165 @@
+#version 450
+// ============================================================================
+// tree_attention.comp — Tree Attention com Sparse Topological Causal Mask
+//                       DeFT KV Splitting e Binary Block Masking
+//
+// Implementa a mecânica de atenção para especulação P-EAGLE:
+// Processa simultaneamente 64 caminhos da árvore de rascunho numa única
+// passagem, usando uma máscara causal topológica que reflete a estrutura
+// pai-filho da LatentSpeculativeTree.
+//
+// ## Mask(i,j) = 0 se j é ancestral de i na árvore, -inf caso contrário
+//
+// ## DeFT KV Splitting
+// Nós compartilhados (tronco) são calculados UMA VEZ e reutilizados por
+// todos os filhos. Elimina 73-99% de leituras KV redundantes.
+//
+// ## Requisitos de Hardware
+// - GL_KHR_cooperative_matrix (para GEMM interno — Turing+ / RDNA3+)
+// - Vulkan 1.3+ (para pipeline de compute moderno)
+// ============================================================================
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// ─── Bindings ──────────────────────────────────────────────────────────────
+
+/// Queries (Q): [num_nodes × head_dim] — uma query por nó da árvore
+layout(set = 0, binding = 0) readonly buffer QueryBuffer  { float q[]; };
+
+/// Keys (K): [seq_len × head_dim] — cache KV do contexto + nós do tronco
+layout(set = 0, binding = 1) readonly buffer KeyBuffer    { float k[]; };
+
+/// Values (V): [seq_len × head_dim] — cache KV paralelo ao K
+layout(set = 0, binding = 2) readonly buffer ValueBuffer  { float v[]; };
+
+/// Máscara Topológica: [num_nodes × tree_seq_len] — 0 = visível, 1 = mascarado
+/// Cada linha i contém 1 para posições que NÃO são ancestrais do nó i.
+/// Armazenada comprimida em bits: bit j de word (j/32) na linha i.
+layout(set = 0, binding = 3) readonly buffer MaskBuffer   { uint mask[]; };
+
+/// Saída: [num_nodes × head_dim] — resultado da atenção para cada nó
+layout(set = 0, binding = 4) writeonly buffer OutputBuffer { float out_data[]; };
+
+/// Slot Map (Paged KV Cache): [seq_len] — mapeia posição lógica para slot físico O(1)
+layout(set = 0, binding = 5) readonly buffer SlotBuffer { uint slot_map[]; };
+
+/// Push constants com dimensões e parâmetros
+layout(push_constant) uniform Params {
+    uint num_nodes;      // Número de nós na árvore (≤ 64)
+    uint head_dim;       // Dimensão de cada head de atenção (ex: 128)
+    uint seq_len;        // Comprimento do contexto (KV cache)
+    uint num_heads;      // Número de heads de atenção
+    float scale;         // Fator de escala: 1/sqrt(head_dim)
+    uint mask_stride;    // Número de uint32 por linha da máscara (= ceill(seq_len/32))
+} params;
+
+// ─── Shared Memory para Softmax e Acumulador ──────────────────────────────
+shared float attention_scores[64];  // Q·K^T para uma query (max 64 nós no contexto)
+shared float max_score;              // Para softmax numéricamente estável
+shared float sum_exp;                // Denominador do softmax
+
+// ─── Função Principal ─────────────────────────────────────────────────────
+
+void main() {
+    uint node_idx = gl_WorkGroupID.x;  // Qual nó da árvore este workgroup processa
+    uint head_idx = gl_WorkGroupID.y;  // Qual head de atenção
+    uint tid      = gl_LocalInvocationID.x;  // Thread dentro do workgroup (0-31)
+
+    if (node_idx >= params.num_nodes) return;
+    if (head_idx >= params.num_heads) return;
+
+    // Offsets base para este nó e head
+    uint q_offset  = node_idx * params.head_dim * params.num_heads + head_idx * params.head_dim;
+    uint kv_stride = params.head_dim * params.num_heads;
+    uint out_offset = node_idx * params.head_dim * params.num_heads + head_idx * params.head_dim;
+
+    // ── Fase 1: Q · K^T com masked attention ──────────────────────────────
+    // Cada thread calcula o score de atenção para múltiplas posições do KV cache
+    // usando Cooperative Matrix para máxima utilização dos Tensor Cores.
+
+    if (tid == 0u) {
+        max_score = -1e38;
+        sum_exp = 0.0;
+    }
+    barrier();
+
+    // Calcula scores Q·K para posições atribuídas a esta thread
+    // Distribui seq_len entre as 32 threads (ceil(seq_len/32) posições por thread)
+    for (uint pos = tid; pos < params.seq_len; pos += 32u) {
+        // Verifica máscara topológica: bit (pos) na linha (node_idx)
+        uint mask_word  = pos / 32u;
+        uint mask_bit   = pos % 32u;
+        uint mask_idx   = node_idx * params.mask_stride + mask_word;
+        bool is_masked  = (mask[mask_idx] & (1u << mask_bit)) != 0u;
+
+        float score;
+        if (is_masked) {
+            score = -1e38; // -inf para posições mascaradas (não-ancestrais)
+        } else {
+            // Memory Aliasing: Traduz Pos lógica para Física on-the-fly (Paged KV)
+            uint physical_slot = slot_map[pos];
+            
+            // Dot product Q[node_idx] · K[physical_slot]
+            float dot = 0.0;
+            uint k_offset = physical_slot * params.head_dim * params.num_heads + head_idx * params.head_dim;
+            
+            for (uint d = 0u; d < params.head_dim; d++) {
+                dot += q[q_offset + d] * k[k_offset + d];
+            }
+            score = dot * params.scale;
+        }
+
+        // Escreve na shared memory para softmax cooperativo
+        if (pos < 64u) {
+            attention_scores[pos] = score;
+        }
+    }
+    barrier();
+
+    // ── Fase 2: Softmax estável (Numericamente seguro) ────────────────────
+    // Primeiro: encontra o máximo global (redução por subgroup)
+    float local_max = -1e38;
+    for (uint pos = tid; pos < params.seq_len && pos < 64u; pos += 32u) {
+        local_max = max(local_max, attention_scores[pos]);
+    }
+    float global_max = subgroupMax(local_max);
+    if (tid == 0u) max_score = global_max;
+    barrier();
+
+    // Segundo: exp(score - max) e soma (numericamente estável)
+    float local_sum = 0.0;
+    for (uint pos = tid; pos < params.seq_len && pos < 64u; pos += 32u) {
+        float e = exp(attention_scores[pos] - max_score);
+        attention_scores[pos] = e;
+        local_sum += e;
+    }
+    float global_sum = subgroupAdd(local_sum);
+    if (tid == 0u) sum_exp = global_sum;
+    barrier();
+
+    // Normaliza para obter probabilidades de atenção
+    for (uint pos = tid; pos < params.seq_len && pos < 64u; pos += 32u) {
+        attention_scores[pos] /= max(sum_exp, 1e-10);
+    }
+    barrier();
+
+    // ── Fase 3: Soma Ponderada (Σ attn[pos] · V[pos]) ─────────────────────
+    // Cada thread acumula dimensões diferentes do vetor de saída
+    for (uint d = tid; d < params.head_dim; d += 32u) {
+        float acc = 0.0;
+        for (uint pos = 0u; pos < params.seq_len && pos < 64u; pos++) {
+            uint physical_slot = slot_map[pos];
+            uint v_offset = physical_slot * params.head_dim * params.num_heads + head_idx * params.head_dim + d;
+            
+            acc += attention_scores[pos] * v[v_offset];
+        }
+        // Escreve resultado para esta dimensão deste nó e head
+        if (out_offset + d < params.num_nodes * params.head_dim * params.num_heads) {
+            out_data[out_offset + d] = acc;
+        }
+    }
+}

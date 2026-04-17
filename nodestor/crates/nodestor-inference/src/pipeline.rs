@@ -92,7 +92,7 @@ pub struct InferencePipeline {
     pub vector_db: VectorSearch,
     pub kv_paginator: KVCachePaginator,
     /// Ferramenta externa de PROBES (ELK/CoT/RAISE) — injetável sem depência circular.
-    pub probes_tool: Option<Box<dyn ProbesTool>>,
+    pub probes_tool: Option<std::sync::Mutex<Box<dyn ProbesTool>>>,
 }
 
 impl InferencePipeline {
@@ -139,7 +139,7 @@ impl InferencePipeline {
     /// Injeta um sistema externo de inspeção (ELK/CoT/RAISE) via trait object.
     /// Permite uso do DAVI sem dependência circular.
     pub fn with_probes_tool(mut self, tool: Box<dyn ProbesTool>) -> Self {
-        self.probes_tool = Some(tool);
+        self.probes_tool = Some(std::sync::Mutex::new(tool));
         self
     }
 
@@ -160,7 +160,7 @@ impl InferencePipeline {
     /// Loop principal de "Mecanismo de Atenção": prevê tensores e dispara
     /// kernels Vulkan para gerar tokens a alta voltagem (Modo Metralhadora).
     pub async fn generate(
-        &mut self,
+        &self,
         prompt: &str,
         max_tokens: usize,
     ) -> Result<(String, GenerationStats), NodeStorError> {
@@ -302,17 +302,19 @@ impl InferencePipeline {
                 let _ = latent_features; // Disponível para inspectors externos
 
                 // 2. Ferramenta externa (ELK+CoT+RAISE via DAVI) se injetada
-                if let Some(ref mut tool) = self.probes_tool {
-                    let (is_safe, maybe_alert) = tool.inspect(&embed_data, step);
-                    if let Some(alert) = maybe_alert {
-                        warn!("{}", alert);
-                        probes_alerts.push(alert);
-                    }
-                    if !is_safe {
-                        let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa (ELK/CoT/RAISE)", step);
-                        warn!("{}", block_msg);
-                        probes_alerts.push(block_msg);
-                        break; // Interrompe geração segura
+                if let Some(ref tool_mutex) = self.probes_tool {
+                    if let Ok(mut tool) = tool_mutex.lock() {
+                        let (is_safe, maybe_alert) = tool.inspect(&embed_data, step);
+                        if let Some(alert) = maybe_alert {
+                            warn!("{}", alert);
+                            probes_alerts.push(alert);
+                        }
+                        if !is_safe {
+                            let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa (ELK/CoT/RAISE)", step);
+                            warn!("{}", block_msg);
+                            probes_alerts.push(block_msg);
+                            break; // Interrompe geração segura
+                        }
                     }
                 }
             }

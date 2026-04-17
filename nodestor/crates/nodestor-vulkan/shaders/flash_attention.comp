@@ -1,0 +1,135 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer K { float k[]; };
+layout(std430, set = 0, binding = 2) readonly buffer V { float v[]; };
+layout(std430, set = 0, binding = 3) buffer Out_Attn { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint is_causal;
+} pc;
+
+const uint TILE_Q = 32;
+const uint TILE_KV = 32;
+const uint MAX_HEAD_DIM = 128; // Suporte a GGUFs modernos
+
+shared float sh_Q[TILE_Q][MAX_HEAD_DIM];
+shared float sh_K[TILE_KV][MAX_HEAD_DIM];
+shared float sh_V[TILE_KV][MAX_HEAD_DIM];
+
+void main() {
+    uint trow = gl_LocalInvocationID.x; // Thread idx (0-31)
+    uint q_base = gl_WorkGroupID.x * TILE_Q; // Base seq index para Q tile
+    
+    uint row = q_base + trow;
+    
+    uint head_d = min(pc.head_dim, MAX_HEAD_DIM);
+    
+    // 1. Carregar Q tile para HBM -> SRAM (Apenas uma vez para este workgroup!)
+    if (row < pc.seq_len) {
+        for(uint d = 0; d < head_d; d++) {
+            sh_Q[trow][d] = q[row * pc.head_dim + d];
+        }
+    }
+    barrier();
+
+    // Registradores do Online Softmax para esta Query Row
+    float m_i = -1e38; // Max global corrente
+    float l_i = 0.0;   // Soma exponencial corrente
+    float o_i[MAX_HEAD_DIM]; // Acumulador final
+    for(uint d = 0; d < MAX_HEAD_DIM; d++) o_i[d] = 0.0;
+
+    uint num_kv_tiles = (pc.seq_len + TILE_KV - 1) / TILE_KV;
+
+    for (uint kv_step = 0; kv_step < num_kv_tiles; kv_step++) {
+        uint kv_base = kv_step * TILE_KV;
+        
+        // 2. Carregar K e V tile na SRAM
+        uint kv_row = kv_base + trow;
+        if (kv_row < pc.seq_len) {
+            for(uint d = 0; d < head_d; d++) {
+                sh_K[trow][d] = k[kv_row * pc.head_dim + d];
+                sh_V[trow][d] = v[kv_row * pc.head_dim + d];
+            }
+        }
+        barrier();
+
+        if (row < pc.seq_len) {
+            float s_ij[TILE_KV];
+            float max_s = -1e38;
+            
+            // 3. MatMul in-register S = Q · K^T
+            for (uint j = 0; j < TILE_KV; j++) {
+                uint valid_kv = kv_base + j;
+                if (valid_kv < pc.seq_len) {
+                    float dot = 0.0;
+                    for (uint d = 0; d < head_d; d++) {
+                        dot += sh_Q[trow][d] * sh_K[j][d];
+                    }
+                    float val = dot * pc.scale;
+                    
+                    // Máscara Causal: proíbe tokens de preverem o futuro
+                    if (pc.is_causal == 1u && row < valid_kv) {
+                        val = -1e38;
+                    }
+                    
+                    s_ij[j] = val;
+                    if (val > max_s) {
+                        max_s = val;
+                    }
+                } else {
+                    s_ij[j] = -1e38;
+                }
+            }
+
+            // 4. Mecânica FlashAttention: Atualização de Max e Exp
+            float m_new = max(m_i, max_s);
+            float exp_diff = exp(m_i - m_new);
+            
+            float sum_p = 0.0;
+            float p_ij[TILE_KV];
+            for (uint j = 0; j < TILE_KV; j++) {
+                uint valid_kv = kv_base + j;
+                if (valid_kv < pc.seq_len) {
+                    p_ij[j] = exp(s_ij[j] - m_new);
+                    if (pc.is_causal == 1u && row < valid_kv) p_ij[j] = 0.0; // clamp absoluto
+                    sum_p += p_ij[j];
+                } else {
+                    p_ij[j] = 0.0;
+                }
+            }
+            
+            float l_new = (exp_diff * l_i) + sum_p;
+
+            // 5. Atualização do Acumulador O_i
+            for (uint d = 0; d < head_d; d++) {
+                // Recupera soma bruta antiga reescalonada para o novo máximo
+                float old_unnormalized = o_i[d] * l_i * exp_diff;
+                
+                // Soma nova de P_j * V_j   
+                float acc_v = 0.0;
+                for (uint j = 0; j < TILE_KV; j++) {
+                    acc_v += p_ij[j] * sh_V[j][d]; 
+                }
+                
+                // Grava normalizado. Na próxima tile, será extraído como bruto novamente pela termologia l_i
+                o_i[d] = (old_unnormalized + acc_v) / max(l_new, 1e-10);
+            }
+            
+            m_i = m_new;
+            l_i = l_new;
+        }
+        barrier(); // Sincroniza workgroup antes da próxima tile KV!
+    }
+
+    // 6. Escrever Output
+    if (row < pc.seq_len) {
+        for(uint d = 0; d < head_d; d++) {
+            out_data[row * pc.head_dim + d] = o_i[d];
+        }
+    }
+}

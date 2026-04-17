@@ -9,6 +9,10 @@ mod safetensors;
 pub use gguf::GgufParser;
 pub use safetensors::SafetensorsParser;
 
+pub mod nsz_format;
+pub mod nsz_encoder;
+pub mod nsz_decoder;
+
 use nodestor_core::{ModelParser, NodeStorError};
 
 /// Seleciona automaticamente o parser correto baseado na extensão do arquivo.

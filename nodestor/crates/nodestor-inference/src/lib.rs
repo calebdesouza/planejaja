@@ -52,6 +52,9 @@ pub mod dequant;
 pub mod paged_attention;
 pub mod radix_cache;
 
+// --- Lossless Compression Mechanics ---
+pub mod entropy_analyzer;
+
 
 #[cfg(test)]
 mod tests {

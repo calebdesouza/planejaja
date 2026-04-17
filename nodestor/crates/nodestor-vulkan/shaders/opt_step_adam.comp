@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(set = 0, binding = 0) buffer Weights {
+    float w[];
+};
+
+layout(set = 0, binding = 1) buffer Gradients {
+    float grad[];
+};
+
+layout(set = 0, binding = 2) buffer Moment1 {
+    float m1[];
+};
+
+layout(set = 0, binding = 3) buffer Moment2 {
+    float m2[];
+};
+
+layout(push_constant) uniform Constants {
+    uint tensor_size;
+    float learning_rate;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float step_scale1; // 1.0 / (1.0 - beta1^t)
+    float step_scale2; // 1.0 / (1.0 - beta2^t)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tensor_size) return;
+
+    float g = grad[idx];
+    
+    // Weight Decay
+    w[idx] = w[idx] * (1.0 - pc.learning_rate * pc.weight_decay);
+
+    // Update moments
+    float mt = pc.beta1 * m1[idx] + (1.0 - pc.beta1) * g;
+    float vt = pc.beta2 * m2[idx] + (1.0 - pc.beta2) * (g * g);
+
+    m1[idx] = mt;
+    m2[idx] = vt;
+
+    // Bias correction
+    float m_hat = mt * pc.step_scale1;
+    float v_hat = vt * pc.step_scale2;
+
+    // Update weight
+    w[idx] -= pc.learning_rate * m_hat / (sqrt(v_hat) + pc.eps);
+    
+    // Clear gradient for next pass
+    grad[idx] = 0.0;
+}

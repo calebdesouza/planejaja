@@ -1,0 +1,27 @@
+[package]
+name = "nodestor-mega-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Este crate só existe para a suíte de integração
+# Não publique no crates.io
+
+[[test]]
+name = "mega_test"
+path = "../tests/mega_test.rs"
+
+[dependencies]
+nodestor-core      = { path = "../crates/nodestor-core" }
+nodestor-formats   = { path = "../crates/nodestor-formats" }
+nodestor-scanner   = { path = "../crates/nodestor-scanner" }
+nodestor-transport = { path = "../crates/nodestor-transport" }
+nodestor-vulkan    = { path = "../crates/nodestor-vulkan" }
+nodestor-metadata  = { path = "../crates/nodestor-metadata" }
+nodestor-inference = { path = "../crates/nodestor-inference" }
+byteorder.workspace = true
+tokio.workspace     = true
+
+[dev-dependencies]
+byteorder.workspace = true
+tokio.workspace     = true

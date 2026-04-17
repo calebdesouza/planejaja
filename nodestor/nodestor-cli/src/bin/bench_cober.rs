@@ -9,8 +9,8 @@
 //! - Stats: aceitação, speedup, hit rates
 
 use nodestor_inference::{
-    cober::{CoberEngine, CoberConfig, EmbeddingQuantLevel},
-    candidate_engine::{CandidateEngine, CandidateConfig},
+    cober::CoberEngine,
+    candidate_engine::CandidateEngine,
     caches::{ExpertLruCache, FeatureCache},
     vram_budget::{VramBudget, InferenceMode},
 };
@@ -202,7 +202,7 @@ fn main() {
             } else {
                 misses += 1;
                 // Simular carregamento do SSD (cria dados simulados)
-                let data = crate::nodestor_inference::caches::ExpertData {
+                let data = nodestor_inference::caches::ExpertData {
                     weights: vec![0u8; 64 * 1024], // 64KB simulado
                     size_bytes: 64 * 1024,
                     hit_count: 0,

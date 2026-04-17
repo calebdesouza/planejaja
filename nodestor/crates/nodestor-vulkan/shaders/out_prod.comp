@@ -1,0 +1,38 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(set = 0, binding = 0) readonly buffer VectorU {
+    float u[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VectorV {
+    float v[];
+};
+
+layout(set = 0, binding = 2) buffer MatrixOut {
+    float m[];
+};
+
+layout(push_constant) uniform Constants {
+    uint M; // Tamanho de U
+    uint N; // Tamanho de V
+    float scale;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row < pc.M && col < pc.N) {
+        float val = u[row] * v[col] * pc.scale;
+        
+        // Utiliza operation add na global memory
+        uint idx = row * pc.N + col;
+        
+        // Atomic fetch_add exige inteiros no SPIR-V basico,
+        // entao para floating point em matrizes que sofrem acessos concorrentes 
+        // ou aplicamos float atomic flag, ou garantimos localizacao unica via topologia de index
+        // Como M x N é mapeado 1-pra-1 com gl_GlobalInvocationID.xy sem colisao neste escopo, add direto:
+        m[idx] += val;
+    }
+}

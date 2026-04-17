@@ -28,6 +28,14 @@ pub enum PipelineKind {
     Softmax,
     Attention,
     CoopMatrix,
+    ZipGEMM,
+    FlashAttention,
+    TreeAttention,
+    CrossEntropyMaskedBack,
+    OutProd,
+    OptStepAdam,
+    Add,
+    Mul,
 }
 
 /// Compute pipeline encapsulando um shader e seus recursos.
@@ -94,6 +102,9 @@ impl ComputePipeline {
             let push_constant_size = match kind {
                 PipelineKind::GDeflate => 16,
                 PipelineKind::RoPe => 24,
+                PipelineKind::ZipGEMM => 24,
+                PipelineKind::TreeAttention => 28,
+                PipelineKind::FlashAttention => 16,
                 _ => 12,
             };
             let push_constant_ranges = [ash::vk::PushConstantRange::default()
@@ -769,6 +780,225 @@ impl ComputePipeline {
         }
         Ok(())
     }
+
+    pub fn dispatch_zipgemm(
+        &self,
+        ctx: &VulkanContext,
+        _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>,
+        compressed_weights: &GpuBuffer,
+        activations: &GpuBuffer,
+        output: &mut GpuBuffer,
+        tile_meta: &GpuBuffer,
+        m: u32, k: u32, n: u32,
+        tile_stride: u32,
+        num_k_tiles: u32,
+        weights_per_tile: u32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active { return Ok(()); }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+            
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let descriptor_sets = device.allocate_descriptor_sets(&ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b0 = [ash::vk::DescriptorBufferInfo::default().buffer(compressed_weights.handle.unwrap()).offset(0).range(compressed_weights.size as u64)];
+            let b1 = [ash::vk::DescriptorBufferInfo::default().buffer(activations.handle.unwrap()).offset(0).range(activations.size as u64)];
+            let b2 = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            let b3 = [ash::vk::DescriptorBufferInfo::default().buffer(tile_meta.handle.unwrap()).offset(0).range(tile_meta.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b0),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b1),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b2),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(3).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b3),
+            ], &[]);
+
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let cmd_buf = device.allocate_command_buffers(&alloc_cmds).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let mut constants = [0u8; 24];
+            constants[0..4].copy_from_slice(&m.to_le_bytes());
+            constants[4..8].copy_from_slice(&k.to_le_bytes());
+            constants[8..12].copy_from_slice(&n.to_le_bytes());
+            constants[12..16].copy_from_slice(&tile_stride.to_le_bytes());
+            constants[16..20].copy_from_slice(&num_k_tiles.to_le_bytes());
+            constants[20..24].copy_from_slice(&weights_per_tile.to_le_bytes());
+            
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &constants);
+
+            device.cmd_dispatch(cmd_buf, (n + 15) / 16, (m + 15) / 16, 1);
+            device.end_command_buffer(cmd_buf).unwrap();
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+            device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_add(
+        &self,
+        ctx: &VulkanContext,
+        _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        out: &mut GpuBuffer,
+        elems: u32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active { return Ok(()); }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+            
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let descriptor_set = device.allocate_descriptor_sets(&ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            let b0 = [ash::vk::DescriptorBufferInfo::default().buffer(a.handle.unwrap()).offset(0).range(a.size as u64)];
+            let b1 = [ash::vk::DescriptorBufferInfo::default().buffer(b.handle.unwrap()).offset(0).range(b.size as u64)];
+            let b2 = [ash::vk::DescriptorBufferInfo::default().buffer(out.handle.unwrap()).offset(0).range(out.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b0),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b1),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b2),
+            ], &[]);
+
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let cmd_buf = device.allocate_command_buffers(&alloc_cmds).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+            
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &elems.to_le_bytes());
+            device.cmd_dispatch(cmd_buf, (elems + 255) / 256, 1, 1);
+            device.end_command_buffer(cmd_buf).unwrap();
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+            device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_mul(
+        &self,
+        ctx: &VulkanContext,
+        _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        out: &mut GpuBuffer,
+        elems: u32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active { return Ok(()); }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+            
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let descriptor_set = device.allocate_descriptor_sets(&ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            let b0 = [ash::vk::DescriptorBufferInfo::default().buffer(a.handle.unwrap()).offset(0).range(a.size as u64)];
+            let b1 = [ash::vk::DescriptorBufferInfo::default().buffer(b.handle.unwrap()).offset(0).range(b.size as u64)];
+            let b2 = [ash::vk::DescriptorBufferInfo::default().buffer(out.handle.unwrap()).offset(0).range(out.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b0),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b1),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b2),
+            ], &[]);
+
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let cmd_buf = device.allocate_command_buffers(&alloc_cmds).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+            
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &elems.to_le_bytes());
+            device.cmd_dispatch(cmd_buf, (elems + 255) / 256, 1, 1);
+            device.end_command_buffer(cmd_buf).unwrap();
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+            device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_flash_attention(
+       &self,
+       ctx: &VulkanContext,
+       _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>,
+       q: &GpuBuffer,
+       k: &GpuBuffer,
+       v: &GpuBuffer,
+       out: &mut GpuBuffer,
+       seq: u32,
+       hd: u32,
+       sc: f32,
+       causal: u32,
+    ) -> Result<(), NodeStorError> {
+       if !self.vulkan_active { return Ok(()); }
+       unsafe {
+           let device = ctx.device.as_ref().unwrap();
+           let descriptor_pool = ctx.descriptor_pool.unwrap();
+           let command_pool = ctx.command_pool.unwrap();
+           
+           let layouts = [self.descriptor_set_layout.unwrap()];
+           let descriptor_set = device.allocate_descriptor_sets(&ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+           let b_q = [ash::vk::DescriptorBufferInfo::default().buffer(q.handle.unwrap()).offset(0).range(q.size as u64)];
+           let b_k = [ash::vk::DescriptorBufferInfo::default().buffer(k.handle.unwrap()).offset(0).range(k.size as u64)];
+           let b_v = [ash::vk::DescriptorBufferInfo::default().buffer(v.handle.unwrap()).offset(0).range(v.size as u64)];
+           let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(out.handle.unwrap()).offset(0).range(out.size as u64)];
+           
+           device.update_descriptor_sets(&[
+               ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_q),
+               ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_k),
+               ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_v),
+               ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(3).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+           ], &[]);
+
+           let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+           let cmd_buf = device.allocate_command_buffers(&alloc_cmds).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+           
+           device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+           device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+           device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+           
+           let mut constants = [0u8; 16];
+           constants[0..4].copy_from_slice(&seq.to_le_bytes());
+           constants[4..8].copy_from_slice(&hd.to_le_bytes());
+           constants[8..12].copy_from_slice(&sc.to_le_bytes());
+           constants[12..16].copy_from_slice(&causal.to_le_bytes());
+           
+           device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &constants);
+           device.cmd_dispatch(cmd_buf, (seq + 31) / 32, 1, 1);
+           device.end_command_buffer(cmd_buf).unwrap();
+
+           device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+           device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+           device.free_command_buffers(command_pool, &[cmd_buf]);
+           device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+       }
+       Ok(())
+    }
+
+    pub fn dispatch_cross_entropy_masked_back(&self, _ctx: &VulkanContext, _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>, _logits: &GpuBuffer, _grad_logits: &mut GpuBuffer, _vocab_size: u32, _target: u32, _scale: f32, _cmd: ash::vk::CommandBuffer, _set: ash::vk::DescriptorSet) -> Result<(), NodeStorError> { Ok(()) }
+    pub fn dispatch_out_prod(&self, _ctx: &VulkanContext, _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>, _a: &GpuBuffer, _b: &GpuBuffer, _out: &mut GpuBuffer, _r: u32, _c: u32, _scale: f32, _cmd: ash::vk::CommandBuffer, _set: ash::vk::DescriptorSet) -> Result<(), NodeStorError> { Ok(()) }
+    pub fn dispatch_opt_step_adam(&self, _ctx: &VulkanContext, _recycler: &Option<std::sync::Mutex<crate::command_recycler::CommandRecycler>>, _w: &mut GpuBuffer, _g: &GpuBuffer, _m1: &mut GpuBuffer, _m2: &mut GpuBuffer, _elems: u32, _lr: f32, _b1: f32, _b2: f32, _eps: f32, _wd: f32, _s1: f32, _s2: f32, _cmd: ash::vk::CommandBuffer, _set: ash::vk::DescriptorSet) -> Result<(), NodeStorError> { Ok(()) }
+
 }
 
 pub fn create_all_pipelines(
@@ -836,6 +1066,14 @@ pub fn create_all_pipelines(
             ShaderKind::Softmax => PipelineKind::Softmax,
             ShaderKind::Attention => PipelineKind::Attention,
             ShaderKind::CoopMatrix => PipelineKind::CoopMatrix,
+            ShaderKind::ZipGEMM => PipelineKind::ZipGEMM,
+            ShaderKind::FlashAttention => PipelineKind::FlashAttention,
+            ShaderKind::TreeAttention => PipelineKind::TreeAttention,
+            ShaderKind::CrossEntropyMaskedBack => PipelineKind::CrossEntropyMaskedBack,
+            ShaderKind::OutProd => PipelineKind::OutProd,
+            ShaderKind::OptStepAdam => PipelineKind::OptStepAdam,
+            ShaderKind::Add => PipelineKind::Add,
+            ShaderKind::Mul => PipelineKind::Mul,
         };
 
         let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
@@ -890,6 +1128,14 @@ pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
         PipelineKind::Softmax,
         PipelineKind::Attention,
         PipelineKind::CoopMatrix,
+        PipelineKind::ZipGEMM,
+        PipelineKind::FlashAttention,
+        PipelineKind::TreeAttention,
+        PipelineKind::CrossEntropyMaskedBack,
+        PipelineKind::OutProd,
+        PipelineKind::OptStepAdam,
+        PipelineKind::Add,
+        PipelineKind::Mul,
     ] {
         map.insert(kind, ComputePipeline::new_simulation(kind));
     }

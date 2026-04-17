@@ -1,0 +1,252 @@
+#version 450
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZipGEMM — Fused Decompress + Matrix Multiply (Load-Compressed, Compute-Decompressed)
+//
+// O paradigma central: pesos comprimidos via TCA-TBE são lidos da VRAM,
+// descomprimidos on-the-fly nos registradores locais de cada thread,
+// e multiplicados pelas ativações de entrada. O peso descomprimido NUNCA
+// toca a memória global — ele nasce e morre no registrador.
+//
+// Compatible with: AMD GCN/RDNA, NVIDIA Kepler+, Intel Arc, Qualcomm Adreno
+// Wavefront: 32 (NVIDIA) or 64 (AMD) — ambos suportados via local_size_x = 16
+// ═══════════════════════════════════════════════════════════════════════════════
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Push Constants: parâmetros da multiplicação e do tile comprimido
+layout(push_constant) uniform PushConstants {
+    uint M;               // Linhas da ativação (seq_len)
+    uint K;               // Dimensão interna (hidden_size) — descomprimida
+    uint N;               // Colunas do output
+    uint tile_stride;     // Bytes por tile TCA-TBE comprimido
+    uint num_k_tiles;     // Número de tiles na dimensão K
+    uint weights_per_tile;// Pesos por tile (tipicamente 512)
+} pc;
+
+// Buffer 0: Pesos comprimidos no formato TCA-TBE (lidos da VRAM)
+layout(set = 0, binding = 0) readonly buffer CompressedWeights {
+    uint compressed_data[];
+};
+
+// Buffer 1: Ativações de entrada (FP32, não comprimidas)
+layout(set = 0, binding = 1) readonly buffer Activations {
+    float activations[];  // M × K
+};
+
+// Buffer 2: Output (FP32)
+layout(set = 0, binding = 2) buffer Output {
+    float output_data[];  // M × N
+};
+
+// Buffer 3: Tile metadata (modal exponents, offsets)
+layout(set = 0, binding = 3) readonly buffer TileMetadata {
+    // Para cada tile: [modal_exp (u8), num_residuals (u16), num_near (u16), bitmap_offset, ...]
+    uint tile_meta[];
+};
+
+// ─── Shared Memory para Tiled GEMM ─────────────────────────────────────────
+const uint TILE_SIZE = 16;
+shared float As[TILE_SIZE][TILE_SIZE]; // Tile de ativações
+shared float Bs[TILE_SIZE][TILE_SIZE]; // Tile de pesos (descomprimidos on-the-fly)
+
+// ─── Decompressão Branch-Free FP32 ─────────────────────────────────────────
+//
+// Reconstrói um peso FP32 a partir do formato TCA-TBE comprimido.
+// Toda a lógica usa operações bitwise — ZERO branches condicionais.
+//
+// Parâmetros:
+//   weight_idx:   índice do peso dentro do tile (0..511)
+//   tile_base:    offset em u32s do início deste tile no compressed_data
+//   modal_exp:    expoente modal deste tile
+//   bitmap_match_offset: offset dos bitmaps de match no tile
+//   bitmap_near_offset:  offset dos bitmaps de near no tile
+//   near_delta_offset:   offset dos deltas near
+//   residual_offset:     offset dos expoentes residuais
+//   mantissa_offset:     offset das mantissas
+//   sign_offset:         offset dos sinais
+//
+float decompress_weight_fp32(
+    uint weight_idx,
+    uint tile_base,
+    uint modal_exp
+) {
+    // ═══ ETAPA 1: Ler bitmaps (branch-free) ═══
+    //
+    // Cada bitmap é TILE_SIZE bits = 64 bytes = 16 uint32s
+    // Para um tile de 512 pesos:
+    //   bitmap_match: tile_base + 2 (após header de 8 bytes = 2 uint32s)
+    //   bitmap_near:  tile_base + 2 + 16
+
+    uint bm_word_idx = weight_idx / 32;
+    uint bm_bit_pos  = weight_idx % 32;
+
+    uint bitmap_match_word = compressed_data[tile_base + 2 + bm_word_idx];
+    uint bitmap_near_word  = compressed_data[tile_base + 2 + 16 + bm_word_idx];
+
+    uint is_match = (bitmap_match_word >> bm_bit_pos) & 1u;
+    uint is_near  = (bitmap_near_word  >> bm_bit_pos) & 1u;
+    uint is_residual = (1u - is_match) * (1u - is_near);
+
+    // ═══ ETAPA 2: Reconstruir expoente (branch-free) ═══
+    //
+    // Se is_match=1:    exp = modal_exp
+    // Se is_near=1:     exp = modal_exp ± 1 (lido do delta stream)
+    // Se is_residual=1: exp = valor completo do residual stream
+    //
+    // Implementação: exp = modal * is_match + near_val * is_near + residual * is_residual
+
+    // Near delta: contamos quantos nears vieram antes deste peso
+    // (popcount dos bits antes de nós no bitmap near)
+    uint near_count_before = 0u;
+    // Contar nears em words anteriores
+    for (uint w = 0; w < bm_word_idx; w++) {
+        near_count_before += bitCount(compressed_data[tile_base + 2 + 16 + w]);
+    }
+    // Contar nears na word atual antes do nosso bit
+    if (bm_bit_pos > 0u) {
+        uint mask_before = (1u << bm_bit_pos) - 1u;
+        near_count_before += bitCount(bitmap_near_word & mask_before);
+    }
+
+    // O stream de near deltas começa após os dois bitmaps (2 + 16 + 16 = 34 uint32s)
+    // Cada delta é 1 bit, packed em uint32s
+    uint near_delta_base = tile_base + 2 + 16 + 16;
+    uint near_delta_word = near_count_before / 32;
+    uint near_delta_bit  = near_count_before % 32;
+    uint delta_packed = compressed_data[near_delta_base + near_delta_word];
+    uint delta_val = (delta_packed >> near_delta_bit) & 1u;
+    // delta_val: 0 = modal-1, 1 = modal+1
+    uint near_exp = modal_exp - 1u + delta_val * 2u;
+
+    // Residual: contamos quantos residuais vieram antes
+    uint residual_count_before = 0u;
+    for (uint w = 0; w < bm_word_idx; w++) {
+        uint match_w = compressed_data[tile_base + 2 + w];
+        uint near_w  = compressed_data[tile_base + 2 + 16 + w];
+        residual_count_before += bitCount(~(match_w | near_w));
+    }
+    if (bm_bit_pos > 0u) {
+        uint mask_before = (1u << bm_bit_pos) - 1u;
+        uint combined = bitmap_match_word | bitmap_near_word;
+        residual_count_before += bitCount((~combined) & mask_before);
+    }
+
+    // Calcular offset do stream de residuais (após near deltas)
+    // Precisamos saber quantos near deltas totais existem para pular
+    uint total_nears = 0u;
+    for (uint w = 0; w < 16; w++) {
+        total_nears += bitCount(compressed_data[tile_base + 2 + 16 + w]);
+    }
+    uint near_delta_words = (total_nears + 31u) / 32u;
+    uint residual_base = near_delta_base + near_delta_words;
+
+    // Ler expoente residual (1 byte = packed em uint32s, 4 por word)
+    uint res_word = residual_count_before / 4u;
+    uint res_byte = residual_count_before % 4u;
+    uint residual_packed = compressed_data[residual_base + res_word];
+    uint residual_exp = (residual_packed >> (res_byte * 8u)) & 0xFFu;
+
+    // Branch-free selection
+    uint final_exp = modal_exp * is_match
+                   + near_exp * is_near
+                   + residual_exp * is_residual;
+
+    // ═══ ETAPA 3: Ler mantissa (verbatim, 23 bits para FP32) ═══
+    // Calcular offset das mantissas (após residuais)
+    uint total_residuals_raw = compressed_data[tile_base]; // le do header
+    uint total_residuals = (total_residuals_raw >> 8) & 0xFFFFu;
+    uint residual_bytes = total_residuals; // 1 byte por expoente residual
+    uint residual_words = (residual_bytes + 3u) / 4u;
+    uint mantissa_base = residual_base + residual_words;
+
+    // Cada mantissa FP32 = 23 bits = 3 bytes → packed
+    uint m_byte_base = weight_idx * 3u;
+    uint m_word0 = m_byte_base / 4u;
+    uint m_shift0 = (m_byte_base % 4u) * 8u;
+
+    uint mw0 = compressed_data[mantissa_base + m_word0];
+    uint mw1 = compressed_data[mantissa_base + m_word0 + 1u];
+
+    // Extrair 24 bits a partir do m_shift0
+    uint mantissa_raw;
+    if (m_shift0 <= 8u) {
+        mantissa_raw = (mw0 >> m_shift0) & 0x7FFFFFu;
+    } else {
+        mantissa_raw = ((mw0 >> m_shift0) | (mw1 << (32u - m_shift0))) & 0x7FFFFFu;
+    }
+
+    // ═══ ETAPA 4: Ler sinal (1 bit packed) ═══
+    uint total_mantissa_bytes = pc.weights_per_tile * 3u;
+    uint mantissa_words = (total_mantissa_bytes + 3u) / 4u;
+    uint sign_base = mantissa_base + mantissa_words;
+
+    uint sign_word_idx = weight_idx / 32u;
+    uint sign_bit_pos  = weight_idx % 32u;
+    uint sign_packed = compressed_data[sign_base + sign_word_idx];
+    uint sign_bit = (sign_packed >> sign_bit_pos) & 1u;
+
+    // ═══ ETAPA 5: Reconstruir FP32 ═══
+    // FP32: sinal(1) | expoente(8) | mantissa(23)
+    uint fp32_bits = (sign_bit << 31u) | ((final_exp & 0xFFu) << 23u) | (mantissa_raw & 0x7FFFFFu);
+    return uintBitsToFloat(fp32_bits);
+}
+
+// ═══ MAIN: Tiled GEMM com Descompressão Fundida ═══════════════════════════
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+
+    uint numTiles = (pc.K + TILE_SIZE - 1u) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        // ─── Carregar ativações em shared memory (padrão) ───
+        uint tiledColA = t * TILE_SIZE + localCol;
+        if (row < pc.M && tiledColA < pc.K) {
+            As[localRow][localCol] = activations[row * pc.K + tiledColA];
+        } else {
+            As[localRow][localCol] = 0.0;
+        }
+
+        // ─── Descomprimir pesos TCA-TBE on-the-fly para shared memory ───
+        uint tiledRowB = t * TILE_SIZE + localRow;
+        if (tiledRowB < pc.K && col < pc.N) {
+            // Encontrar qual tile TCA-TBE contém este peso
+            uint weight_linear_idx = tiledRowB * pc.N + col;
+            uint nsz_tile_idx = weight_linear_idx / pc.weights_per_tile;
+            uint weight_in_tile = weight_linear_idx % pc.weights_per_tile;
+
+            // Calcular base do tile no buffer comprimido
+            uint tile_base = nsz_tile_idx * (pc.tile_stride / 4u);
+
+            // Ler modal exponent do header do tile
+            uint header_word = compressed_data[tile_base];
+            uint modal_exp = header_word & 0xFFu;
+
+            // Descomprimir peso — branch-free, no registrador local
+            Bs[localRow][localCol] = decompress_weight_fp32(
+                weight_in_tile, tile_base, modal_exp
+            );
+        } else {
+            Bs[localRow][localCol] = 0.0;
+        }
+
+        barrier(); // Sincronizar shared memory
+
+        // ─── Multiplicação tiled (idêntica ao matmul.comp) ───
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += As[localRow][k] * Bs[k][localCol];
+        }
+
+        barrier();
+    }
+
+    // Gravar resultado
+    if (row < pc.M && col < pc.N) {
+        output_data[row * pc.N + col] = sum;
+    }
+}

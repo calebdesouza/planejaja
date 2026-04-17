@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform Params {
+    uint total_elements;  // hidden_size (ou seq_len * hidden_size)
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_elements) return;
+    c[idx] = a[idx] + b[idx];
+}

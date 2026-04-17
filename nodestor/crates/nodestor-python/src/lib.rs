@@ -15,24 +15,6 @@ struct NodeStorBuffer {
     data: Vec<u8>, // Em um caso real, isso seria um mapeamento de memória
 }
 
-#[pymethods]
-impl NodeStorBuffer {
-    // Implementação simplificada do Buffer Protocol via PyO3
-    // Nota: Em PyO3 0.21+, usamos slots ou manual implementations para tp_as_buffer
-    fn __getbuffer__(&self, view: pyo3::ffi::Py_buffer, flags: std::os::raw::c_int) -> PyResult<()> {
-        unsafe {
-            pyo3::ffi::PyBuffer_FillInfo(
-                view,
-                std::ptr::null_mut(),
-                self.data.as_ptr() as *mut std::os::raw::c_void,
-                self.data.len() as pyo3::ffi::Py_ssize_t,
-                1, // read-only
-                flags,
-            );
-        }
-        Ok(())
-    }
-}
 
 #[pymethods]
 impl NodeStorEngine {

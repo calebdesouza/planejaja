@@ -33,8 +33,16 @@ pub enum ShaderKind {
     Softmax,
     /// Cooperative Matrix (via GL_KHR_cooperative_matrix) — Tensor Core nativo.
     /// Carregado apenas se hardware suportar; fallback transparente para Matmul.
-    CoopMatrix,
     Attention,
+    CoopMatrix,
+    ZipGEMM,
+    FlashAttention,
+    TreeAttention,
+    CrossEntropyMaskedBack,
+    OutProd,
+    OptStepAdam,
+    Add,
+    Mul,
 }
 
 impl ShaderKind {
@@ -56,6 +64,14 @@ impl ShaderKind {
             Self::Softmax => "softmax",
             Self::Attention => "attention",
             Self::CoopMatrix => "matmul_coop",
+            Self::ZipGEMM => "zipgemm",
+            Self::FlashAttention => "flash_attention",
+            Self::TreeAttention => "tree_attention",
+            Self::CrossEntropyMaskedBack => "cross_entropy_masked_back",
+            Self::OutProd => "out_prod",
+            Self::OptStepAdam => "opt_step_adam",
+            Self::Add => "add",
+            Self::Mul => "mul",
         }
     }
 
@@ -76,7 +92,11 @@ impl ShaderKind {
             ShaderKind::SiLu,
             ShaderKind::Softmax,
             ShaderKind::Attention,
-            // CoopMatrix NO está em `all()` — carregado separadamente.
+            ShaderKind::ZipGEMM,
+            ShaderKind::FlashAttention,
+            ShaderKind::Add,
+            ShaderKind::Mul,
+            // CoopMatrix e TreeAttention NÃO estão em `all()` — carregados separadamente via load_shader_by_kind devido a extensões não suportadas por Naga
         ]
     }
 }
@@ -138,14 +158,18 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::SiLu => include_bytes!(concat!(env!("OUT_DIR"), "/silu.spv")).to_vec(),
         ShaderKind::Softmax => include_bytes!(concat!(env!("OUT_DIR"), "/softmax.spv")).to_vec(),
         ShaderKind::Attention => include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")).to_vec(),
-        ShaderKind::CoopMatrix => {
-            // CoopMatrix compilado condicionalmente: se o arquivo .spv não existir
-            // (hardware/driver não suporta), retorna fallback vazio que será
-            // rejeitado pelo driver de forma graciosa.
-            //
-            // Em runtime, `load_shader_by_kind(CoopMatrix)` retorna None se não compilado.
+        ShaderKind::ZipGEMM => include_bytes!(concat!(env!("OUT_DIR"), "/zipgemm.spv")).to_vec(),
+        ShaderKind::FlashAttention => include_bytes!(concat!(env!("OUT_DIR"), "/flash_attention.spv")).to_vec(),
+        ShaderKind::CrossEntropyMaskedBack => include_bytes!(concat!(env!("OUT_DIR"), "/cross_entropy_masked_back.spv")).to_vec(),
+        ShaderKind::OutProd => include_bytes!(concat!(env!("OUT_DIR"), "/out_prod.spv")).to_vec(),
+        ShaderKind::OptStepAdam => include_bytes!(concat!(env!("OUT_DIR"), "/opt_step_adam.spv")).to_vec(),
+        ShaderKind::Add => include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")).to_vec(),
+        ShaderKind::Mul => include_bytes!(concat!(env!("OUT_DIR"), "/mul.spv")).to_vec(),
+        ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
+            // Shaders compilados condicionalmente: se o arquivo .spv não existir
+            // (hardware/driver não suporta ou precisa de glslc), retorna fallback vazio
             return Err(VulkanError::InvalidShader(
-                "CoopMatrix shader carregado via load_shader_by_kind, não load_shader".into()
+                format!("{} shader carregado via load_shader_by_kind, não load_shader", kind.name())
             ));
         }
     };
@@ -173,12 +197,11 @@ pub fn load_all_shaders() -> Vec<ShaderSpirv> {
 /// Tenta carregar um shader opcional (como CoopMatrix) que pode não estar compilado.
 /// Retorna `None` se o shader não estiver disponível (sem panic, sem erro).
 pub fn load_shader_by_kind(kind: ShaderKind) -> Option<Vec<u8>> {
-    // Para CoopMatrix: verifica se o .spv foi gerado pelo build.rs
-    // (depende de glslc/glslangValidator suportarem GL_KHR_cooperative_matrix)
+    // Para CoopMatrix/TreeAttention: verifica se o .spv foi gerado pelo build.rs
+    // (depende de glslc/glslangValidator suportarem GL_KHR_cooperative_matrix ou outras extensões)
     match kind {
-        ShaderKind::CoopMatrix => {
+        ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
             // Em builds onde o shader foi compilado com sucesso:
-            // let spv = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_coop.spv"));
             // return Some(spv.to_vec());
             //
             // Por ora: retorna None — shader .comp existe mas requer hardware especial.
