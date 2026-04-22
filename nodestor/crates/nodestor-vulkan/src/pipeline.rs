@@ -36,6 +36,8 @@ pub enum PipelineKind {
     OptStepAdam,
     Add,
     Mul,
+    TurboQuantAttention,
+    MoERouting,
 }
 
 /// Compute pipeline encapsulando um shader e seus recursos.
@@ -82,7 +84,7 @@ impl ComputePipeline {
                 .map_err(|e: ash::vk::Result| VulkanError::InvalidShader(e.to_string()))?;
 
             let bindings = match kind {
-                PipelineKind::Matmul | PipelineKind::CosineSim | PipelineKind::MatmulQ4 | PipelineKind::MatmulTensorCore | PipelineKind::RmsNorm | PipelineKind::RoPe | PipelineKind::SiLu | PipelineKind::Softmax | PipelineKind::Attention => vec![
+                PipelineKind::Matmul | PipelineKind::CosineSim | PipelineKind::MatmulQ4 | PipelineKind::MatmulTensorCore | PipelineKind::RmsNorm | PipelineKind::RoPe | PipelineKind::SiLu | PipelineKind::Softmax | PipelineKind::Attention | PipelineKind::TurboQuantAttention | PipelineKind::MoERouting => vec![
                     ash::vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
                     ash::vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
                     ash::vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(ash::vk::ShaderStageFlags::COMPUTE),
@@ -104,7 +106,7 @@ impl ComputePipeline {
                 PipelineKind::RoPe => 24,
                 PipelineKind::ZipGEMM => 24,
                 PipelineKind::TreeAttention => 28,
-                PipelineKind::FlashAttention => 16,
+                PipelineKind::FlashAttention | PipelineKind::TurboQuantAttention | PipelineKind::MoERouting => 16,
                 _ => 12,
             };
             let push_constant_ranges = [ash::vk::PushConstantRange::default()
@@ -781,6 +783,63 @@ impl ComputePipeline {
         Ok(())
     }
 
+    pub fn dispatch_turbo_quant_attention(
+        &self,
+        ctx: &VulkanContext,
+        q: &GpuBuffer,
+        k: &GpuBuffer,
+        v: &GpuBuffer,
+        out_attn: &mut GpuBuffer,
+        seq_len: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active { return Ok(()); }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+            
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let descriptor_set = device.allocate_descriptor_sets(&ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            let b_q = [ash::vk::DescriptorBufferInfo::default().buffer(q.handle.unwrap()).offset(0).range(q.size as u64)];
+            let b_k = [ash::vk::DescriptorBufferInfo::default().buffer(k.handle.unwrap()).offset(0).range(k.size as u64)];
+            let b_v = [ash::vk::DescriptorBufferInfo::default().buffer(v.handle.unwrap()).offset(0).range(v.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(out_attn.handle.unwrap()).offset(0).range(out_attn.size as u64)];
+            
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_q),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_k),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_v),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(3).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let cmd_buf = device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).unwrap()[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+            
+            let mut constants = [0u8; 16];
+            constants[0..4].copy_from_slice(&seq_len.to_le_bytes());
+            constants[4..8].copy_from_slice(&head_dim.to_le_bytes());
+            constants[8..12].copy_from_slice(&scale.to_le_bytes());
+            // O pad de 4 bytes finais já é 0u8 pela inicialização.
+            
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &constants);
+
+            device.cmd_dispatch(cmd_buf, 1, seq_len, 1);
+            device.end_command_buffer(cmd_buf).unwrap();
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+            device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+        }
+        Ok(())
+    }
+
     pub fn dispatch_zipgemm(
         &self,
         ctx: &VulkanContext,
@@ -834,6 +893,90 @@ impl ComputePipeline {
             device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &constants);
 
             device.cmd_dispatch(cmd_buf, (n + 15) / 16, (m + 15) / 16, 1);
+            device.end_command_buffer(cmd_buf).unwrap();
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
+            device.queue_wait_idle(ctx.queue.unwrap()).unwrap();
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).unwrap();
+        }
+        Ok(())
+    }
+
+    /// Despacha o kernel de roteamento MoE (Mixture of Experts).
+    /// Calcula os top_k experts para cada token na sequência usando os pesos gate comprimidos.
+    pub fn dispatch_moe_routing(
+        &self,
+        ctx: &VulkanContext,
+        input: &GpuBuffer,
+        gate_weights: &GpuBuffer,
+        topk_indices: &mut GpuBuffer,
+        topk_scores: &mut GpuBuffer,
+        seq_len: u32,
+        hidden_dim: u32,
+        num_experts: u32,
+        top_k: u32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            // Modo simulação: seleciona experts 0..top_k deterministicamente
+            let total = (seq_len * top_k) as usize;
+            for i in 0..total {
+                let idx_bytes = ((i % num_experts as usize) as u32).to_le_bytes();
+                let score_bytes = (0.25f32).to_le_bytes();
+                let offset = i * 4;
+                if offset + 4 <= topk_indices.size {
+                    topk_indices.as_mut_bytes()[offset..offset+4].copy_from_slice(&idx_bytes);
+                }
+                if offset + 4 <= topk_scores.size {
+                    topk_scores.as_mut_bytes()[offset..offset+4].copy_from_slice(&score_bytes);
+                }
+            }
+            return Ok(());
+        }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let descriptor_set = device.allocate_descriptor_sets(
+                &ash::vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts)
+            ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            let b0 = [ash::vk::DescriptorBufferInfo::default().buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b1 = [ash::vk::DescriptorBufferInfo::default().buffer(gate_weights.handle.unwrap()).offset(0).range(gate_weights.size as u64)];
+            let b2 = [ash::vk::DescriptorBufferInfo::default().buffer(topk_indices.handle.unwrap()).offset(0).range(topk_indices.size as u64)];
+            let b3 = [ash::vk::DescriptorBufferInfo::default().buffer(topk_scores.handle.unwrap()).offset(0).range(topk_scores.size as u64)];
+
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b0),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b1),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b2),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(3).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b3),
+            ], &[]);
+
+            let cmd_buf = device.allocate_command_buffers(
+                &ash::vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(ash::vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1)
+            ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).unwrap();
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+
+            let mut constants = [0u8; 16];
+            constants[0..4].copy_from_slice(&seq_len.to_le_bytes());
+            constants[4..8].copy_from_slice(&hidden_dim.to_le_bytes());
+            constants[8..12].copy_from_slice(&num_experts.to_le_bytes());
+            constants[12..16].copy_from_slice(&top_k.to_le_bytes());
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, &constants);
+
+            // Um workgroup por token — cada thread processa um expert
+            device.cmd_dispatch(cmd_buf, seq_len, 1, 1);
             device.end_command_buffer(cmd_buf).unwrap();
 
             device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).unwrap();
@@ -1074,6 +1217,8 @@ pub fn create_all_pipelines(
             ShaderKind::OptStepAdam => PipelineKind::OptStepAdam,
             ShaderKind::Add => PipelineKind::Add,
             ShaderKind::Mul => PipelineKind::Mul,
+            ShaderKind::TurboQuantAttention => PipelineKind::TurboQuantAttention,
+            ShaderKind::MoERouting => PipelineKind::MoERouting,
         };
 
         let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
@@ -1139,6 +1284,9 @@ pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
     ] {
         map.insert(kind, ComputePipeline::new_simulation(kind));
     }
+    // Pipelines V3 — adicionados explicitamente na lista de simulação
+    map.insert(PipelineKind::TurboQuantAttention, ComputePipeline::new_simulation(PipelineKind::TurboQuantAttention));
+    map.insert(PipelineKind::MoERouting, ComputePipeline::new_simulation(PipelineKind::MoERouting));
     map
 }
 

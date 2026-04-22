@@ -400,6 +400,56 @@ impl GpuBuffer {
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     }
+
+    /// Copia os bytes de outro GpuBuffer para este.
+    /// Em modo simulação (RAM), faz cópia direta dos dados.
+    /// Em modo Vulkan real, utiliza o `mapped_ptr` se disponível.
+    pub fn copy_from(&mut self, src: &GpuBuffer) -> Result<(), NodeStorError> {
+        if !src.data.is_empty() {
+            let len = src.data.len().min(self.size);
+            if self.data.len() < len {
+                self.data.resize(len, 0);
+            }
+            self.data[..len].copy_from_slice(&src.data[..len]);
+            return Ok(());
+        }
+        // Modo Vulkan: usa mapped_ptr se disponível
+        if let (Some(dst_ptr), Some(src_alloc)) = (self.mapped_ptr, src.allocation.as_ref()) {
+            if let Some(src_ptr) = src_alloc.mapped_ptr() {
+                let len = src.size.min(self.size);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr.as_ptr() as *const u8, dst_ptr.as_ptr(), len);
+                }
+                return Ok(());
+            }
+        }
+        Err(NodeStorError::VulkanError("copy_from: buffers sem dados acessíveis".into()))
+    }
+
+    /// Copia os bytes deste GpuBuffer para outro.
+    pub fn copy_into(&self, dst: &mut GpuBuffer) -> Result<(), NodeStorError> {
+        dst.copy_from(self)
+    }
+
+    /// Retorna os dados como `Vec<f32>`.
+    /// Em modo simulação, usa `self.data`. Em modo Vulkan, faz readback via mapped_ptr.
+    /// Usado principalmente para fallbacks CPU no operator_registry.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        if !self.data.is_empty() {
+            let len = self.data.len() / 4;
+            let ptr = self.data.as_ptr() as *const f32;
+            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+        } else if let Some(alloc) = &self.allocation {
+            if let Some(ptr) = alloc.mapped_ptr() {
+                let len = self.size / 4;
+                unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, len) }.to_vec()
+            } else {
+                vec![0.0f32; self.size / 4]
+            }
+        } else {
+            vec![0.0f32; self.size / 4]
+        }
+    }
 }
 
 impl Drop for GpuBuffer {

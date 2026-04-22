@@ -1,0 +1,107 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// TurboQuant 3.5-bit KV Cache Attention Shader
+// Fusão matemática: Dequantização lloyd-max + Scaled Dot-Product + Softmax + V-weighted sum
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+struct TurboQuantBlock {
+    uvec4 bitstream;      // 16 bytes: 32 elementos × 4 bits packed
+    uint  centroids[4];  // 8 centroides FP16 packados em 4 uint32s (packHalf2x16)
+    uint  qjl_scale_fwht_sign; // packHalf2x16(qjl_scale, fwht_sign)
+    uint  pad1;
+    uint  pad2;
+    uint  pad3;
+};
+
+layout(std430, binding = 0) readonly buffer QBuffer    { float q[]; };
+layout(std430, binding = 1) readonly buffer KBuffer    { TurboQuantBlock k_blocks[]; };
+layout(std430, binding = 2) readonly buffer VBuffer    { TurboQuantBlock v_blocks[]; };
+layout(std430, binding = 3) writeonly buffer OutBuffer { float out_attn[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint pad;
+} pc;
+
+shared float shared_scores[32];
+shared float shared_v[32];
+
+// Dequantiza um elemento de 4 bits usando os centroides lloyd-max do bloco.
+// Os centroides são 8 valores FP16 packed em 4 uint32s (packHalf2x16).
+float dequant_lloyd_max(uint nibble, const uint centroids[4]) {
+    // Índice de 4 bits → centroide correspondente
+    uint word_idx = nibble / 2u;
+    uint half_sel = nibble % 2u;
+    // Cada uint contém 2 FP16: descomprime o par usando unpackHalf2x16
+    vec2 pair = unpackHalf2x16(centroids[word_idx]);
+    return (half_sel == 0u) ? pair.x : pair.y;
+}
+
+// Lê o nibble de índice 'elem_idx' do bitstream de 128 bits (uvec4)
+uint extract_nibble(uvec4 bitstream, uint elem_idx) {
+    uint word_idx  = elem_idx / 8u;          // qual uint no uvec4
+    uint bit_start = (elem_idx % 8u) * 4u;  // bit de início dentro do uint
+    return (bitstream[word_idx] >> bit_start) & 0x0Fu;
+}
+
+void main() {
+    uint tx  = gl_LocalInvocationID.x;  // lane 0..31
+    uint wg  = gl_WorkGroupID.x;        // índice da cabeça (head)
+
+    if (wg >= pc.seq_len) return;
+
+    // ── Calcular QK^T para cada posição de contexto ─────────────────────────────
+    // Cada thread (tx) carrega um elemento de q e itera sobre todos os blocos K.
+    float q_elem = q[wg * pc.head_dim + tx];
+
+    // Percorre todos os tokens de contexto (blocos K)
+    float max_score = -3.4028235e+38; // -FLT_MAX para numericamente estável softmax
+    float sum_exp   = 0.0;
+    float attn_out  = 0.0;
+
+    uint num_k_blocks = (pc.seq_len * pc.head_dim + 31u) / 32u;
+
+    for (uint b = 0; b < num_k_blocks; b++) {
+        TurboQuantBlock kb = k_blocks[b];
+        TurboQuantBlock vb = v_blocks[b];
+
+        // Dequantiza o elemento 'tx' do bloco K
+        uint nibble_k = extract_nibble(kb.bitstream, tx);
+        float k_elem  = dequant_lloyd_max(nibble_k, kb.centroids);
+
+        // Aplica scale QJL (fator de correção da compressão estocástica)
+        vec2 qjl_fwht = unpackHalf2x16(kb.qjl_scale_fwht_sign);
+        float qjl_scale = qjl_fwht.x;
+        k_elem *= qjl_scale;
+
+        // Produto escalar parcial deste elemento via Subgroup Reduction
+        float dot = q_elem * k_elem * pc.scale;
+        float block_score = subgroupAdd(dot); // redução de warp → score escalar
+
+        // Dequantiza o elemento 'tx' do bloco V
+        uint nibble_v = extract_nibble(vb.bitstream, tx);
+        float v_elem  = dequant_lloyd_max(nibble_v, vb.centroids);
+
+        // Numericamente-estável: max running update
+        float new_max = max(max_score, block_score);
+        sum_exp  = sum_exp * exp(max_score - new_max) + exp(block_score - new_max);
+        attn_out = attn_out * exp(max_score - new_max) + exp(block_score - new_max) * v_elem;
+        max_score = new_max;
+    }
+
+    // Normaliza pelo sum_exp (equivalente à divisão pelo denominador do Softmax)
+    if (sum_exp > 0.0) {
+        attn_out /= sum_exp;
+    }
+
+    // Escreve o elemento tx da saída de atenção para esta cabeça
+    if (tx < pc.head_dim) {
+        out_attn[wg * pc.head_dim + tx] = attn_out;
+    }
+}

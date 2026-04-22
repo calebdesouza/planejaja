@@ -21,7 +21,7 @@ fn main() {
                 // O shader é carregado opcionalmente em runtime via `load_shader_by_kind(CoopMatrix)`.
                 // Quando glslc/glslangValidator estiver disponível, compilar manualmente e ativar
                 // a linha em `load_shader_by_kind` para incluir o .spv no binário.
-                if name == "matmul_coop" || name == "tree_attention" {
+                if name == "matmul_coop" || name == "tree_attention" || name == "turbo_quant_attention" || name == "moe_routing" {
                     println!("cargo:info={} shader excluído da compilação Naga (requer glslc + driver moderno)", name);
                     continue;
                 }

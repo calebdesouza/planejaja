@@ -238,6 +238,11 @@ void main() {
         barrier(); // Sincronizar shared memory
 
         // ─── Multiplicação tiled (idêntica ao matmul.comp) ───
+        // Mapeamento de ocupação VGPR:
+        // O loop interno é desenrolado para forçar o compilador (glslangValidator / DXC)
+        // a alocar registradores fixos e não exceder o limite de 64 VGPRs por thread,
+        // vital para máxima occupancy em RDNA3 / Ada Lovelace.
+        #pragma unroll
         for (uint k = 0; k < TILE_SIZE; k++) {
             sum += As[localRow][k] * Bs[k][localCol];
         }

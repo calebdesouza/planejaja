@@ -1,0 +1,145 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// MoE Routing Shader — RaBitQ 1-bit Gate Projection + Top-K Selection
+//
+// Implementação real:
+// 1. Cada thread calcula o produto escalar entre input_x e a coluna 'expert'
+//    dos gate_weights usando aritmética de 1-bit (XNOR + popcount).
+// 2. Subgroup Reduction agrega o dot product de cada expert.
+// 3. Top-K determinístico por selection sort local (top_k tipicamente ≤ 8).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    float input_x[]; // [seq_len * hidden_dim]
+};
+
+layout(std430, binding = 1) readonly buffer GateWeightsBuffer {
+    // Pesos do gate comprimidos em RaBitQ 1-bit:
+    // Para cada expert e, o vetor de pesos tem hidden_dim bits packed em uint32s.
+    // Offset do expert e: e * ceil(hidden_dim / 32) uint32s.
+    uint gate_weights_1bit[];
+};
+
+layout(std430, binding = 2) writeonly buffer TopKIndicesBuffer {
+    uint out_topk_indices[]; // [seq_len * top_k]
+};
+
+layout(std430, binding = 3) writeonly buffer TopKScoresBuffer {
+    float out_topk_scores[]; // [seq_len * top_k]
+};
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_dim;
+    uint num_experts;
+    uint top_k;
+} pc;
+
+// Número máximo de experts suportados para o sort local (Mixtral: 8, DeepSeek: 64)
+#define MAX_EXPERTS 64
+
+shared float expert_scores[MAX_EXPERTS];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;  // lane 0..31
+    uint token_idx = gl_WorkGroupID.x; // qual token da sequência
+
+    if (token_idx >= pc.seq_len) return;
+
+    // Inicializa scores compartilhados
+    if (tx < pc.num_experts) {
+        expert_scores[tx] = 0.0;
+    }
+    barrier();
+
+    // ── Passo 1: Calcular dot product 1-bit para cada expert ────────────────────
+    // Cada lane processa (hidden_dim / 32) palavras da coluna do expert.
+    // O produto interno 1-bit é implementado como popcount(XNOR(a, b)) normalizado.
+    uint words_per_expert = (pc.hidden_dim + 31u) / 32u;
+
+    // Input do token: índice base no buffer float
+    uint input_base = token_idx * pc.hidden_dim;
+
+    for (uint expert_id = 0u; expert_id < pc.num_experts; expert_id++) {
+        uint gate_base = expert_id * words_per_expert;
+
+        uint popcount_sum = 0u;
+        // Cada thread trata 1 palavra de 32 bits (32 elementos do vetor)
+        for (uint w = tx; w < words_per_expert; w += 32u) {
+            // Quantiza os 32 floats do input em 1 bit (sinal do valor)
+            uint input_bits = 0u;
+            for (uint bit = 0u; bit < 32u; bit++) {
+                uint elem_idx = w * 32u + bit;
+                if (elem_idx < pc.hidden_dim) {
+                    float val = input_x[input_base + elem_idx];
+                    if (val >= 0.0) {
+                        input_bits |= (1u << bit);
+                    }
+                }
+            }
+
+            uint gate_bits = gate_weights_1bit[gate_base + w];
+            // XNOR = NOT (input XOR gate) → coincidência de sinais
+            uint xnor_result = ~(input_bits ^ gate_bits);
+            // Popcount: conta bits 1 (concordâncias entre input e gate)
+            popcount_sum += bitCount(xnor_result);
+        }
+
+        // Redução de subgroup: soma os parciais de todas as lanes
+        uint total_pop = subgroupAdd(popcount_sum);
+
+        // Normaliza para [-1, 1]: (2 * popcount / hidden_dim) - 1
+        float score = (2.0 * float(total_pop) / float(pc.hidden_dim)) - 1.0;
+
+        // Apenas lane 0 escreve no shared memory para evitar race conditions
+        if (tx == 0u) {
+            expert_scores[expert_id] = score;
+        }
+    }
+
+    barrier(); // Todos os experts calculados antes do sort
+
+    // ── Passo 2: Selection Sort Top-K (executado apenas por tx < top_k) ─────────
+    if (tx < pc.top_k && pc.num_experts > 0u) {
+        // Marca de experts já selecionados (bitmap de 64 bits via 2 uint32)
+        uint selected_lo = 0u;
+        uint selected_hi = 0u;
+
+        uint base_out = token_idx * pc.top_k;
+
+        for (uint k = 0u; k < pc.top_k; k++) {
+            // Encontra o expert com maior score não-selecionado
+            float best_score = -1e30;
+            uint  best_idx   = 0u;
+
+            for (uint e = 0u; e < pc.num_experts && e < uint(MAX_EXPERTS); e++) {
+                // Verifica se já foi selecionado
+                bool already = (e < 32u) ?
+                    bool((selected_lo >> e) & 1u) :
+                    bool((selected_hi >> (e - 32u)) & 1u);
+
+                if (!already && expert_scores[e] > best_score) {
+                    best_score = expert_scores[e];
+                    best_idx   = e;
+                }
+            }
+
+            // Apenas a lane tx == k escreve o resultado
+            if (tx == k) {
+                out_topk_indices[base_out + k] = best_idx;
+                out_topk_scores [base_out + k] = best_score;
+            }
+
+            // Marca expert como selecionado no bitmap compartilhado de tx=0
+            // (como só tx<top_k chega aqui e k aumenta sequencialmente, não há race)
+            if (best_idx < 32u) {
+                selected_lo |= (1u << best_idx);
+            } else {
+                selected_hi |= (1u << (best_idx - 32u));
+            }
+        }
+    }
+}

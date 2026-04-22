@@ -35,6 +35,8 @@ pub enum ModelArchitecture {
         head_dim: u32,
         vocab_size: u32,
         rope_base: f32,
+        is_moe: bool,
+        num_experts: u32,
     },
     /// Família BERT: `LayerNorm + GELU + Absolute Position + Bidirecional`
     /// Exemplos: BERT, RoBERTa, DistilBERT
@@ -202,6 +204,13 @@ impl GraphInterpreter {
             let (hidden_dim, num_heads, num_kv_heads, intermediate_size) =
                 Self::extract_llama_dims(metadata);
 
+            let is_moe = tensor_names.iter().any(|n| n.contains("ffn_gate_exps") || n.contains("ffn_gate_inp"));
+            let num_experts = if is_moe {
+                Self::try_u32_from_extra(&metadata.extra, &["llama.expert_count", "model.num_local_experts"]).unwrap_or(8)
+            } else {
+                0
+            };
+
             return Ok(ModelArchitecture::Llama {
                 num_layers,
                 hidden_dim,
@@ -211,6 +220,8 @@ impl GraphInterpreter {
                 head_dim: if num_heads > 0 { hidden_dim / num_heads } else { 64 },
                 vocab_size: Self::extract_vocab_size(metadata),
                 rope_base: 10000.0,
+                is_moe,
+                num_experts,
             });
         }
 
@@ -280,10 +291,10 @@ impl GraphInterpreter {
         match arch {
             ModelArchitecture::Llama {
                 num_layers, hidden_dim, num_heads, num_kv_heads,
-                intermediate_size, head_dim, vocab_size, rope_base,
+                intermediate_size, head_dim, vocab_size, rope_base, is_moe, num_experts,
             } => Ok(Self::build_llama_plan(
                 *num_layers, *hidden_dim, *num_heads, *num_kv_heads,
-                *intermediate_size, *head_dim, *vocab_size, *rope_base,
+                *intermediate_size, *head_dim, *vocab_size, *rope_base, *is_moe, *num_experts,
             )),
 
             ModelArchitecture::Bert {
@@ -300,7 +311,7 @@ impl GraphInterpreter {
 
             ModelArchitecture::Unknown { estimated_layers, .. } => {
                 // Melhor esforço: usa Llama-like com defaults conservadores
-                Ok(Self::build_llama_plan(*estimated_layers, 4096, 32, 32, 11008, 128, 32000, 10000.0))
+                Ok(Self::build_llama_plan(*estimated_layers, 4096, 32, 32, 11008, 128, 32000, 10000.0, false, 0))
             }
         }
     }
@@ -309,6 +320,7 @@ impl GraphInterpreter {
     fn build_llama_plan(
         num_layers: u32, hidden_dim: u32, num_heads: u32, num_kv_heads: u32,
         intermediate_size: u32, head_dim: u32, vocab_size: u32, rope_base: f32,
+        is_moe: bool, num_experts: u32,
     ) -> Vec<TensorOp> {
         let mut ops = Vec::new();
 
@@ -334,10 +346,15 @@ impl GraphInterpreter {
 
             // FFN sublayer (SwiGLU = gate_proj × up_proj → SiLU → down_proj)
             ops.push(TensorOp::RmsNorm { hidden_size: hidden_dim, eps: 1e-5 });
-            ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });
-            ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });
-            ops.push(TensorOp::Activation { kind: ActivationKind::SiLU, elements: intermediate_size });
-            ops.push(TensorOp::Matmul { m: 1, k: intermediate_size, n: hidden_dim, quantized: false });
+            if is_moe {
+                // Ao invés do FFN denso, despacha a operação de roteamento MoE (RaBitQ 1-bit logic)
+                ops.push(TensorOp::MoERouting { num_experts, top_k: 2 });
+            } else {
+                ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });
+                ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });
+                ops.push(TensorOp::Activation { kind: ActivationKind::SiLU, elements: intermediate_size });
+                ops.push(TensorOp::Matmul { m: 1, k: intermediate_size, n: hidden_dim, quantized: false });
+            }
             ops.push(TensorOp::ResidualAdd { elements: hidden_dim });
         }
 

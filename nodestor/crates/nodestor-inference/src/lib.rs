@@ -48,6 +48,12 @@ pub mod refusal_mapper;
 // --- K-Quants: Dequantização Universal (Crítico para modelos 70B+) ---
 pub mod dequant;
 
+// --- GraphInterpreter: Detecção automática de arquitetura do modelo ---
+pub mod graph_interpreter;
+
+// --- WeightStore: Cache de tensores carregados do GGUF ---
+pub mod weight_store;
+
 // --- PagedAttention + RadixAttention: Multi-usuário eficiente ---
 pub mod paged_attention;
 pub mod radix_cache;

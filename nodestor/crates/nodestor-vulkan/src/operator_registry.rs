@@ -95,6 +95,11 @@ pub enum TensorOp {
         num_candidates: u32,
         dim: u32,
     },
+    /// Roteamento Mixture of Experts (RaBitQ 1-bit)
+    MoERouting {
+        num_experts: u32,
+        top_k: u32,
+    },
 }
 
 impl TensorOp {
@@ -115,6 +120,7 @@ impl TensorOp {
             TensorOp::MeanPool { .. }     => "MeanPool",
             TensorOp::ResidualAdd { .. }  => "ResidualAdd",
             TensorOp::CosineSim { .. }    => "CosineSim",
+            TensorOp::MoERouting { .. }   => "MoERouting",
         }
     }
 
@@ -345,6 +351,36 @@ impl OperatorRegistry {
                         )?;
                     }
                     tracing::trace!("CosineSim: {} candidates dim={}", num_candidates, dim);
+                }
+                TensorOp::MoERouting { num_experts, top_k } => {
+                    if let (Some(input_x), Some(gate_weights)) =
+                        (buffers.get("current_x"), buffers.get("gate_weights"))
+                    {
+                        let pipeline = self.engine.pipelines
+                            .get(&crate::pipeline::PipelineKind::MoERouting)
+                            .ok_or_else(|| nodestor_core::NodeStorError::VulkanError("Pipeline MoERouting não disponível".into()))?;
+
+                        let mut topk_indices = self.engine.ctx.alloc_gpu_buffer((*top_k * 4) as usize)
+                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
+                        let mut topk_scores = self.engine.ctx.alloc_gpu_buffer((*top_k * 4) as usize)
+                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
+
+                        pipeline.dispatch_moe_routing(
+                            &self.engine.ctx,
+                            input_x,
+                            gate_weights,
+                            &mut topk_indices,
+                            &mut topk_scores,
+                            1, // seq_len = 1 (decodificação causal)
+                            current_hidden_size,
+                            *num_experts,
+                            *top_k,
+                        ).map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
+
+                        tracing::trace!("MoERouting: {} experts, top_k={} — dispatch OK", num_experts, top_k);
+                    } else {
+                        tracing::warn!("MoERouting: buffers 'current_x' ou 'gate_weights' não encontrados no contexto");
+                    }
                 }
             }
             ops_executed += 1;

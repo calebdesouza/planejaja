@@ -7,6 +7,7 @@ pub mod transformer;
 pub mod command_recycler;
 pub mod triple_buffer;
 pub mod external_memory;
+pub mod operator_registry;
 
 pub use buffer::{GpuBuffer, GpuBufferUsage};
 pub use error::VulkanError;
@@ -120,6 +121,35 @@ impl VulkanEngine {
         Ok(output)
     }
 
+    /// Executa Fused Decompress (TCA-TBE) + Matmul (ZipGEMM) na VRAM.
+    pub fn zipgemm(
+        &self,
+        compressed_weights: &GpuBuffer,
+        activations: &GpuBuffer,
+        tile_meta: &GpuBuffer,
+        m: u32, k: u32, n: u32,
+        tile_stride: u32,
+        num_k_tiles: u32,
+        weights_per_tile: u32,
+    ) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::ZipGEMM)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline ZipGEMM not available".into()))?;
+        let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;
+        
+        // Passa None para o recycler no stub atual
+        pipeline.dispatch_zipgemm(
+            &self.ctx,
+            &None,
+            compressed_weights,
+            activations,
+            &mut output,
+            tile_meta,
+            m, k, n,
+            tile_stride, num_k_tiles, weights_per_tile
+        )?;
+        Ok(output)
+    }
+
     pub fn rmsnorm(&self, input: &GpuBuffer, weight: &GpuBuffer, seq_len: u32, hidden_size: u32, eps: f32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::RmsNorm).ok_or_else(|| NodeStorError::VulkanError("RmsNorm missing".into()))?;
         let mut output = self.ctx.alloc_gpu_buffer((seq_len * hidden_size * 4) as usize)?;
@@ -149,6 +179,33 @@ impl VulkanEngine {
         let mut out_attn = self.ctx.alloc_gpu_buffer((seq_len * head_dim * 4) as usize)?;
         pipeline.dispatch_attention(&self.ctx, q, k, v, &mut out_attn, seq_len, head_dim, scale)?;
         Ok(out_attn)
+    }
+
+    pub fn turbo_quant_attention(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, seq_len: u32, head_dim: u32, scale: f32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::TurboQuantAttention).ok_or_else(|| NodeStorError::VulkanError("TurboQuantAttention missing".into()))?;
+        let mut out_attn = self.ctx.alloc_gpu_buffer((seq_len * head_dim * 4) as usize)?;
+        pipeline.dispatch_turbo_quant_attention(&self.ctx, q, k, v, &mut out_attn, seq_len, head_dim, scale)?;
+        Ok(out_attn)
+    }
+
+    /// Soma elementwise: `out[i] = a[i] + b[i]`.
+    /// Usado para residual connections entre camadas Transformer.
+    pub fn add(&self, a: &GpuBuffer, b: &GpuBuffer, elements: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::Add)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline Add not available".into()))?;
+        let mut out = self.ctx.alloc_gpu_buffer((elements * 4) as usize)?;
+        pipeline.dispatch_add(&self.ctx, &None, a, b, &mut out, elements)?;
+        Ok(out)
+    }
+
+    /// Multiplicação elementwise: `out[i] = a[i] * b[i]`.
+    /// Usado para SwiGLU: `SiLU(gate) * up_proj`.
+    pub fn mul(&self, a: &GpuBuffer, b: &GpuBuffer, elements: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::Mul)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline Mul not available".into()))?;
+        let mut out = self.ctx.alloc_gpu_buffer((elements * 4) as usize)?;
+        pipeline.dispatch_mul(&self.ctx, &None, a, b, &mut out, elements)?;
+        Ok(out)
     }
 
     pub fn alloc_buffer(&self, size_bytes: usize) -> Result<GpuBuffer, NodeStorError> {

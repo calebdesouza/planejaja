@@ -4122,6 +4122,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "futures",
+ "memmap2",
  "nodestor-core",
  "nodestor-formats",
  "nodestor-metadata",
@@ -4130,6 +4131,7 @@ dependencies = [
  "nodestor-transport",
  "nodestor-vulkan",
  "rand 0.8.5",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers",

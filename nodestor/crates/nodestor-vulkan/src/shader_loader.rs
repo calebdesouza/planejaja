@@ -43,6 +43,8 @@ pub enum ShaderKind {
     OptStepAdam,
     Add,
     Mul,
+    TurboQuantAttention,
+    MoERouting,
 }
 
 impl ShaderKind {
@@ -72,6 +74,8 @@ impl ShaderKind {
             Self::OptStepAdam => "opt_step_adam",
             Self::Add => "add",
             Self::Mul => "mul",
+            Self::TurboQuantAttention => "turbo_quant_attention",
+            Self::MoERouting => "moe_routing",
         }
     }
 
@@ -94,8 +98,13 @@ impl ShaderKind {
             ShaderKind::Attention,
             ShaderKind::ZipGEMM,
             ShaderKind::FlashAttention,
+            ShaderKind::CrossEntropyMaskedBack,
+            ShaderKind::OutProd,
+            ShaderKind::OptStepAdam,
             ShaderKind::Add,
             ShaderKind::Mul,
+            ShaderKind::TurboQuantAttention,
+            ShaderKind::MoERouting,
             // CoopMatrix e TreeAttention NÃO estão em `all()` — carregados separadamente via load_shader_by_kind devido a extensões não suportadas por Naga
         ]
     }
@@ -165,7 +174,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::OptStepAdam => include_bytes!(concat!(env!("OUT_DIR"), "/opt_step_adam.spv")).to_vec(),
         ShaderKind::Add => include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")).to_vec(),
         ShaderKind::Mul => include_bytes!(concat!(env!("OUT_DIR"), "/mul.spv")).to_vec(),
-        ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
+        ShaderKind::TurboQuantAttention | ShaderKind::MoERouting | ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
             // Shaders compilados condicionalmente: se o arquivo .spv não existir
             // (hardware/driver não suporta ou precisa de glslc), retorna fallback vazio
             return Err(VulkanError::InvalidShader(
@@ -200,7 +209,7 @@ pub fn load_shader_by_kind(kind: ShaderKind) -> Option<Vec<u8>> {
     // Para CoopMatrix/TreeAttention: verifica se o .spv foi gerado pelo build.rs
     // (depende de glslc/glslangValidator suportarem GL_KHR_cooperative_matrix ou outras extensões)
     match kind {
-        ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
+        ShaderKind::CoopMatrix | ShaderKind::TreeAttention | ShaderKind::TurboQuantAttention | ShaderKind::MoERouting => {
             // Em builds onde o shader foi compilado com sucesso:
             // return Some(spv.to_vec());
             //

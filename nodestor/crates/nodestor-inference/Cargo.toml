@@ -19,6 +19,8 @@ nodestor-transport = { path = "../nodestor-transport" }
 nodestor-vulkan = { path = "../nodestor-vulkan" }
 tokenizers = "0.19.1"
 rand = "0.8"
+serde_json = { workspace = true }
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = { workspace = true }

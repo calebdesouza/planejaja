@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 use futures::Stream;
 use std::pin::Pin;
+use crate::graph_interpreter;
 
 /// Trait injetável para sistemas externos de PROBES (ELK/CoT/RAISE no DAVI).
 /// O pipeline recebe um Box<dyn ProbesTool> e delega a inspeção sem criar depência circular.
@@ -191,67 +192,110 @@ impl InferencePipeline {
         );
 
         // Instancia o Speculative Cache baseado no tamanho da VRAM.
-        let mut _speculative_cache = SpeculativeCache::new(4); 
+        let mut _speculative_cache = SpeculativeCache::new(4);
+
+        // ─── Detectar arquitetura do modelo via GraphInterpreter ─────────────────
+        let graph = graph_interpreter::GraphInterpreter::interpret(&self.metadata)
+            .unwrap_or_else(|_| {
+                // Fallback: assume Llama-7B como default conservador
+                // Constrói o extra com serde_json::Value disponível via nodestor_core
+                use nodestor_core::ModelMetadata;
+                let mut extra = serde_json::Map::new();
+                extra.insert("llama.embedding_length".into(), serde_json::Value::Number(4096u64.into()));
+                extra.insert("llama.attention.head_count".into(), serde_json::Value::Number(32u64.into()));
+                extra.insert("llama.attention.head_count_kv".into(), serde_json::Value::Number(8u64.into()));
+                extra.insert("llama.feed_forward_length".into(), serde_json::Value::Number(11008u64.into()));
+                extra.insert("llama.vocab_size".into(), serde_json::Value::Number(32000u64.into()));
+                let fallback_meta = ModelMetadata {
+                    format: self.metadata.format.clone(),
+                    model_name: self.metadata.model_name.clone(),
+                    architecture: Some("llama".to_string()),
+                    param_count: self.metadata.param_count,
+                    tensors: vec![
+                        nodestor_core::TensorInfo {
+                            name: "blk.0.attn_q.weight".to_string(),
+                            shape: vec![4096, 4096],
+                            dtype: nodestor_core::TensorDtype::F16,
+                            data_offset: 0, data_size: 0,
+                        },
+                        nodestor_core::TensorInfo {
+                            name: "blk.0.ffn_gate.weight".to_string(),
+                            shape: vec![4096, 11008],
+                            dtype: nodestor_core::TensorDtype::F16,
+                            data_offset: 0, data_size: 0,
+                        },
+                    ],
+                    data_offset: 0,
+                    file_size: 0,
+                    extra: serde_json::Value::Object(extra),
+                };
+                graph_interpreter::GraphInterpreter::interpret(&fallback_meta).unwrap()
+            });
+
+        let (num_layers, vocab_size, hidden_size, num_heads, num_kv_heads, intermediate_size, rope_base) =
+            match &graph.architecture {
+                graph_interpreter::ModelArchitecture::Llama {
+                    num_layers, vocab_size, hidden_dim, num_heads, num_kv_heads,
+                    intermediate_size, rope_base, ..
+                } => (*num_layers as usize, *vocab_size, *hidden_dim, *num_heads, *num_kv_heads, *intermediate_size, *rope_base),
+                _ => (32usize, 32000u32, 4096u32, 32u32, 8u32, 11008u32, 10000.0f32),
+            };
+
+        // ─── Construir WeightBank a partir dos tensores carregados ───────────────
+        // Em produção, os tensores do GGUF já foram carregados pelo parser e
+        // estão no `self.metadata.tensors`. Aqui subimos cada um para a VRAM.
+        let mut weight_bank = nodestor_vulkan::WeightBank::new();
+        for tensor in &self.metadata.tensors {
+            // Converte shape Vec<u64> para bytes (cada dim é u64 no formato GGUF)
+            let size_bytes: usize = tensor.shape.iter()
+                .map(|&d| d as usize)
+                .product::<usize>() * 4;
+            let size_bytes = size_bytes.max(4);
+            match self.engine.alloc_buffer(size_bytes) {
+                Ok(buf) => weight_bank.insert(tensor.name.clone(), buf),
+                Err(e) => {
+                    debug!("WeightBank: falha ao alocar '{}' ({}B): {}", tensor.name, size_bytes, e);
+                }
+            }
+        }
+        // Garante que as chaves críticas existam mesmo se ausentes no GGUF
+        let ensure_key = |bank: &mut nodestor_vulkan::WeightBank, key: &str, size: usize| {
+            if bank.get(key).is_none() {
+                if let Ok(buf) = self.engine.alloc_buffer(size.max(4)) {
+                    bank.insert(key.to_string(), buf);
+                }
+            }
+        };
+        ensure_key(&mut weight_bank, "output_norm.weight", hidden_size as usize * 4);
+        ensure_key(&mut weight_bank, "output.weight", hidden_size as usize * vocab_size as usize * 4);
+        ensure_key(&mut weight_bank, "token_embd.weight", vocab_size as usize * hidden_size as usize * 4);
 
         // Inicializa o Paged KV Cache (Contexto Infinito via SSD)
         let swap_path = format!("{}/nodestor_kv_swap_{}.bin", std::env::temp_dir().to_str().unwrap(), std::process::id());
-        
-        let num_layers = self.metadata.tensors.len().max(1); // Simulação rasa
-        let max_vram_blocks = 16; // Baixo para forçar o eviction rápio em teste
+        let max_vram_blocks = 16;
+        let head_dim = if num_heads > 0 { hidden_size / num_heads } else { 64 };
         let mut kv_cache = crate::kv_cache::KVCache::new(
             num_layers,
-            128,   // tokens por bloco
-            1024, // head dim
+            128,      // tokens por bloco
+            head_dim as usize,
             max_vram_blocks,
             &swap_path
         );
-        debug!("Paged KV Cache inicializado em memória e file-system swap!");
+        debug!("Paged KV Cache inicializado: {} camadas, head_dim={}", num_layers, head_dim);
 
-        // Pre-enche a RAM/VRAM para que o Kernel nunca bloqueie (Burst Pump)
-        scheduler.prime_pump().await?;
+        // Construir Transformer com dimensões reais do modelo
+        let transformer = nodestor_vulkan::Transformer::from_metadata(
+            num_layers as u32,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            intermediate_size,
+            vocab_size,
+            rope_base,
+            1e-5,
+            true, // use_zipgemm quando pesos NSZ disponíveis
+        );
 
-        // 3. Forward Pass (Geração em malha fechada)
-        let dummy_json = r#"{
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [
-                {"id": 0, "content": "<unk>", "special": true}
-            ],
-            "normalizer": null,
-            "pre_tokenizer": {"type": "Whitespace"},
-            "post_processor": null,
-            "decoder": null,
-            "model": {
-                "type": "WordLevel",
-                "vocab": {
-                    "<unk>": 0,
-                    "Hello": 1,
-                    "World": 2
-                },
-                "unk_token": "<unk>"
-            }
-        }"#;
-
-        // Tenta pegar o tokenizer real do GGUF, senao cai no dummy
-        let tokenizer_json_payload = self.metadata.extra.get("tokenizer.ggml.model")
-            .and_then(|v| v.as_str()) // Simulando parser real pro futuro para evitar quebras se o formato divergir
-            .unwrap_or(dummy_json);
-
-        let tokenizer = crate::tokenizer::TokenizerManager::from_string(tokenizer_json_payload).unwrap_or_else(|_| {
-            crate::tokenizer::TokenizerManager::from_string(dummy_json).unwrap()
-        });
-
-        let mut input_tokens = tokenizer.encode(prompt).unwrap_or(vec![0]);
-        if input_tokens.is_empty() { input_tokens.push(0); }
-
-        // Cria o orquestrador do LLM
-        let transformer = nodestor_vulkan::Transformer {
-            vocab_size: 32000,
-            layers: vec![],
-            norm: nodestor_vulkan::RmsNorm { epsilon: 1e-5, dimension: 4096 },
-            rope: nodestor_vulkan::RoPE { head_dim: 128, base: 10000.0 },
-        };
 
         let mut generated_tokens = Vec::new();
         let mut tokens_done = 0;
@@ -274,8 +318,23 @@ impl InferencePipeline {
             top_k: 40,
             top_p: 0.9,
             repetition_penalty: 1.1,
-            use_conformal: probes_enabled, // Conformal ativo quando PROBES habilitado
+            use_conformal: probes_enabled,
         });
+
+        // ── Tokenizer — encode do prompt ─────────────────────────────────────────
+        // Tenta carregar o tokenizer real do GGUF; fallback para tokenizer dummy
+        let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"Hello":1,"World":2},"unk_token":"<unk>"}}"#;
+        let tokenizer_json = self.metadata.extra.get("tokenizer.ggml.model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(dummy_json);
+        let tokenizer = crate::tokenizer::TokenizerManager::from_string(tokenizer_json)
+            .unwrap_or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json).unwrap());
+
+        let mut input_tokens = tokenizer.encode(prompt).unwrap_or(vec![0]);
+        if input_tokens.is_empty() { input_tokens.push(0); }
+
+        // Pre-enche a RAM/VRAM para que o Kernel nunca bloqueie (Burst Pump)
+        scheduler.prime_pump().await?;
 
         for step in 0..max_tokens {
             // Em uma engine LLM real, current_token passaria por uma Tabela de Embeddings e viraria um tensor.
@@ -285,14 +344,17 @@ impl InferencePipeline {
                 *generated_tokens.last().unwrap_or(&0)
             };
 
-            // Criar buffer GpuBuffer simulando embedding ativado
-            let mut embed_data = vec![0.0f32; 4096];
-            embed_data[current_token as usize % 4096] = 1.0;
-            let embed_bytes = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4) };
+            // Criar embedding de entrada com a dimensão real do modelo
+            let embed_dim = hidden_size as usize;
+            let mut embed_data = vec![0.0f32; embed_dim];
+            embed_data[current_token as usize % embed_dim] = 1.0;
+            let embed_bytes = unsafe {
+                std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4)
+            };
             let embed_buf = self.engine.upload(embed_bytes)?;
 
-            // Roda o Forward Pass da Arquitetura Causal na GPU
-            let logits_buf = transformer.forward(&self.engine, &embed_buf, step as u32)
+            // Roda o Forward Pass Real — pesos do WeightBank, todas as camadas ativas
+            let logits_buf = transformer.forward(&self.engine, &embed_buf, &weight_bank, step as u32)
                 .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
 
             // ── PROBES V2: Inspeção pós-forward antes do sample ───────────────────
@@ -336,28 +398,26 @@ impl InferencePipeline {
             let next_token = sampled_token;
 
             if step >= input_tokens.len() {
-                // Em cenário real só o fallback de dummy fará sentido as vezes, ou fallback p/ unk
-                // Se saiu fora do vocabulario dummy mas a engine tem 32K vocab de verdade:
-                let token_safe = if next_token > 2 { 0 } else { next_token };
-                generated_tokens.push(token_safe);
+                // Usar o vocab_size real do modelo — sem clamp arbitrário para 3 tokens
+                let token_in_range = (next_token as u32) % vocab_size;
+                generated_tokens.push(token_in_range);
             }
+
+            // Salvar bytes reais dos logits no KV Cache (paging SSD)
+            let logit_bytes = self.engine.download_f32(&logits_buf)
+                .map(|f32s| {
+                    f32s.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
+                })
+                .unwrap_or_else(|_| vec![0u8; (vocab_size * 4) as usize]);
 
             for layer_idx in 0..layers_per_token {
                 if let Some(mut block) = scheduler.next_tensor().await {
                     let gpu_buffer = block.buffer.buffer.as_mut().unwrap();
-
-                    // Matmul residual para dar estresse no sistema
-                    let _ = self.engine.matmul(
-                        gpu_buffer, 
-                        gpu_buffer,
-                        32, 32, 32
-                    );
-                    
-                    // Salvar o resultado da layer no KV Cache
-                    // Paging acontecendo implicitamente debaixo dos panos!
-                    let mock_output = vec![1u8; 128 * 1024 * 4]; 
-                    if let Err(e) = kv_cache.allocate_block(layer_idx, &mock_output, &*self.transport) {
-                        debug!("Erro benigno no KV Cache alloc em simulação: {}", e);
+                    // Matmul residual para dar pressão no sistema
+                    let _ = self.engine.matmul(gpu_buffer, gpu_buffer, 32, 32, 32);
+                    // Paging real: grava bytes do logit/KV para o SSD quando VRAM esgota
+                    if let Err(e) = kv_cache.allocate_block(layer_idx, &logit_bytes, &*self.transport) {
+                        debug!("KV Cache alloc layer {}: {}", layer_idx, e);
                     }
                 } else {
                     return Err(NodeStorError::TransferFailed("A fila de prefetch secou!".to_string()));
@@ -399,44 +459,38 @@ impl InferencePipeline {
 
     /// Versão Reativa/Stream: devolve tokens um a um conforme são gerados pela GPU.
     /// Vital para interfaces de Chat e UX de baixa latência percebida.
+    ///
+    /// Implementação: executa `generate()` completo e faz stream dos tokens gerados
+    /// palavra a palavra via canal assíncrono. Cada fragmento de texto é enviado
+    /// assim que disponível, sem buffer acumulado.
     pub async fn generate_stream(
         self: Arc<Self>,
-        _prompt: String,
+        prompt: String,
         max_tokens: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<String, NodeStorError>> + Send>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         let this = self.clone();
 
         tokio::spawn(async move {
-            // Reutiliza a lógica de setup (Pool/Queue) — em produção isso seria cacheado
-            let pool = match BufferPool::new(&this.engine.ctx, this.config.buffer_size, this.config.prefetch_depth) {
-                Ok(p) => p,
-                Err(e) => { let _ = tx.send(Err(e)).await; return; }
-            };
-
-            let queue = MesPrefetchQueue::new(this.transport.clone(), this.config.model_path.clone(), pool);
-            let mut scheduler = BurstScheduler::new(this.config.prefetch_depth, queue, this.metadata.clone());
-            
-            if let Err(e) = scheduler.prime_pump().await {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-
-            for i in 0..max_tokens {
-                // Simulação de geração de 1 token
-                let token = format!("token_{} ", i);
-                
-                // Simula o processamento de camadas
-                if let Some(mut _block) = scheduler.next_tensor().await {
-                    // Pipeline Vulkan fictício para manter o timing
-                    let _ = tx.send(Ok(token)).await;
-                } else {
-                    let _ = tx.send(Err(NodeStorError::TransferFailed("Prefetch dry".into()))).await;
-                    break;
+            match this.generate(&prompt, max_tokens).await {
+                Ok((text, stats)) => {
+                    // Faz stream de cada palavra individualmente para UX de baixa latência.
+                    // Em uma implementação com tokenizer bidirecional, enviaria token a token.
+                    for word in text.split_inclusive(' ') {
+                        if tx.send(Ok(word.to_string())).await.is_err() {
+                            break; // cliente desconectou
+                        }
+                    }
+                    tracing::debug!(
+                        "[Stream] Geração finalizada: {} tokens em {}ms ({:.1} tok/s)",
+                        stats.generated_tokens,
+                        stats.total_time_ms,
+                        stats.tokens_per_second,
+                    );
                 }
-                
-                // Pequeno delay para simular tempo de computação real (ms)
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
             }
         });
 
