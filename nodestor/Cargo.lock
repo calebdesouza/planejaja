@@ -4141,6 +4141,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodestor-mega-test"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "nodestor-core",
+ "nodestor-formats",
+ "nodestor-inference",
+ "nodestor-metadata",
+ "nodestor-scanner",
+ "nodestor-transport",
+ "nodestor-vulkan",
+ "tokio",
+]
+
+[[package]]
 name = "nodestor-metadata"
 version = "0.1.0"
 dependencies = [

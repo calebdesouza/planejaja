@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 
 /// Uma simples representação de um resultado de busca para a âncora
 pub struct MockSearchResult {

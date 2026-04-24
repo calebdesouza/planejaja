@@ -565,7 +565,7 @@ impl AdaptivePipeline {
     pub fn verify_all_templates(&self) -> Result<(), Vec<SpecValidationError>> {
         let mut errors = Vec::new();
 
-        for (name, template) in &self.templates {
+        for (_name, template) in &self.templates {
             for spec in &template.spec_constants {
                 if let Err(e) = spec.validate() {
                     errors.push(e);
@@ -784,7 +784,7 @@ impl VirtualVram {
         &mut self,
         tier: MemoryTier,
         needed: u64,
-        current_epoch: u64,
+        _current_epoch: u64,
     ) -> Result<(), VramPageError> {
         // Colecta candidatos LRU neste tier
         let mut candidates: Vec<(u64, u64, u64)> = self.page_table.iter()

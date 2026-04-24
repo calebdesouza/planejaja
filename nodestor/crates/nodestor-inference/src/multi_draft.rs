@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 
 /// NodeStor COBER v2 - Subsistema 11: Multi-Draft Paralelo
 /// ("Explosão de Caminhos" / Navegador de Grafos de Possibilidades)

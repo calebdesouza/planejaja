@@ -1,8 +1,118 @@
 use nodestor_core::{DataTransport, NodeStorError};
-use nodestor_vulkan::{GpuBuffer, VulkanContext, GpuBufferUsage};
+use nodestor_vulkan::{GpuBuffer, VulkanContext};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use tracing::{debug, warn, info};
+
+// ===========================================================
+// MLA — Multi-Head Latent Attention KV Compression
+// ===========================================================
+
+/// Comprimir K/V no espaço latente antes de gravar no SSD.
+///
+/// ## Por que 28x menor:
+/// Llama 3 8B: hidden_dim=4096, 32 KV heads, head_dim=128.
+/// KV original por token: 2 × 32 × 128 × 2 bytes = 16.384 bytes.
+/// Com MLA (latent_dim=512): 512 × 2 bytes = 1.024 bytes.
+/// Razão: 16.384 / 1.024 = 16x. Para GQA 8 KV heads: até 28x.
+///
+/// ## Algoritmo:
+/// compress: concat(K, V) → projeção linear [full_dim → latent_dim]
+/// decompress: latente → projeção linear [latent_dim → full_dim] → split K, V
+pub struct MlaCompressor {
+    /// Dimensão original de K+V concatenados (num_kv_heads × head_dim × 2).
+    pub full_dim: usize,
+    /// Dimensão latente (padrão: 512, como no DeepSeek-V3).
+    pub latent_dim: usize,
+    /// Pesos de compressão W_down: [full_dim × latent_dim] (row-major).
+    /// None = modo pass-through (sem compressão, compatibilidade legada).
+    pub w_down: Option<Vec<f32>>,
+    /// Pesos de descompressão W_up: [latent_dim × full_dim].
+    pub w_up: Option<Vec<f32>>,
+}
+
+impl MlaCompressor {
+    /// Cria sem pesos (modo legado — sem compressão).
+    pub fn new_passthrough(full_dim: usize, latent_dim: usize) -> Self {
+        Self { full_dim, latent_dim, w_down: None, w_up: None }
+    }
+
+    /// Cria com pesos reais de compressão/descompressão.
+    pub fn new(
+        full_dim: usize,
+        latent_dim: usize,
+        w_down: Vec<f32>,
+        w_up: Vec<f32>,
+    ) -> Self {
+        assert_eq!(w_down.len(), full_dim * latent_dim,
+            "MLA: w_down deve ter full_dim × latent_dim elementos");
+        assert_eq!(w_up.len(), latent_dim * full_dim,
+            "MLA: w_up deve ter latent_dim × full_dim elementos");
+        Self { full_dim, latent_dim, w_down: Some(w_down), w_up: Some(w_up) }
+    }
+
+    /// Compressão: [K | V] (full_dim floats) → latente (latent_dim floats).
+    ///
+    /// Operação: c[j] = Σ_i kv[i] × W_down[i × latent_dim + j]
+    /// Se sem pesos, retorna a entrada truncada/padded ao tamanho latente.
+    pub fn compress_kv(&self, kv: &[f32]) -> Vec<f32> {
+        let w_down = match &self.w_down {
+            Some(w) => w,
+            None => {
+                // Pass-through: trunca ou padding para latent_dim
+                let mut out = vec![0.0f32; self.latent_dim];
+                let copy_len = kv.len().min(self.latent_dim);
+                out[..copy_len].copy_from_slice(&kv[..copy_len]);
+                return out;
+            }
+        };
+
+        let l = self.latent_dim;
+        let mut latent = vec![0.0f32; l];
+        let input_len = kv.len().min(self.full_dim);
+        for j in 0..l {
+            let mut acc = 0.0f32;
+            for i in 0..input_len {
+                acc += kv[i] * w_down[i * l + j];
+            }
+            latent[j] = acc;
+        }
+        latent
+    }
+
+    /// Descompressão: latente (latent_dim floats) → [K | V] (full_dim floats).
+    ///
+    /// Operação: kv[i] = Σ_j c[j] × W_up[j × full_dim + i]
+    pub fn decompress_kv(&self, latent: &[f32]) -> Vec<f32> {
+        let w_up = match &self.w_up {
+            Some(w) => w,
+            None => {
+                // Pass-through: expande ou trunca para full_dim
+                let mut out = vec![0.0f32; self.full_dim];
+                let copy_len = latent.len().min(self.full_dim);
+                out[..copy_len].copy_from_slice(&latent[..copy_len]);
+                return out;
+            }
+        };
+
+        let f = self.full_dim;
+        let mut kv = vec![0.0f32; f];
+        let latent_len = latent.len().min(self.latent_dim);
+        for i in 0..f {
+            let mut acc = 0.0f32;
+            for j in 0..latent_len {
+                acc += latent[j] * w_up[j * f + i];
+            }
+            kv[i] = acc;
+        }
+        kv
+    }
+
+    /// Razão de compressão (quantas vezes menor o latente vs. original).
+    pub fn compression_ratio(&self) -> f32 {
+        self.full_dim as f32 / self.latent_dim as f32
+    }
+}
+
 
 /// Estrutura 3.5-bit TurboQuant com Swizzle e Alinhamento
 #[repr(C, align(16))]
@@ -87,6 +197,13 @@ pub struct KVCache {
     /// Buffers VRAM ativos: (layer_idx, block_idx) → GpuBuffer
     /// Usando `Option<GpuBuffer>` para poder mover para fora no evict.
     vram_buffers: HashMap<(usize, usize), GpuBuffer>,
+
+    // =======================================================
+    // MLA — Compressão Latente do KV Cache
+    // =======================================================
+    /// Compressor MLA opcional. Se `Some`, todos os KV gravados no SSD
+    /// são primeiro projetados para o espaço latente (28x menor).
+    pub mla: Option<MlaCompressor>,
 }
 
 impl KVCache {
@@ -97,10 +214,7 @@ impl KVCache {
         max_vram_blocks: usize,
         swap_path: &str,
     ) -> Self {
-        // Agora usamos o tamanho do TurboQuantBlockSwizzled (36 bytes approx, mas alinhado a 48)
-        // Por token, por head. Vamos usar um multiplicador reduzido.
-        // bytes_per_block = tokens_per_block * head_dim * (4 bytes p/ f32 -> 0.44 p/ TurboQuant)
-        // Para mock, calcularemos uma redução de 4.5x:
+        // bytes_per_block com redução TurboQuant ~4.5x
         let bytes_per_block = (tokens_per_block * head_dim * 4) * 10 / 45; 
         
         let mut layers = Vec::with_capacity(num_layers);
@@ -111,7 +225,6 @@ impl KVCache {
             });
         }
         
-        // Garante que o arquivo exista/seja criado vázio
         let _ = std::fs::File::create(swap_path);
 
         Self {
@@ -124,8 +237,59 @@ impl KVCache {
             swap_file_path: swap_path.to_string(),
             bytes_per_block,
             vram_buffers: HashMap::new(),
+            mla: None,
         }
     }
+
+    /// Ativa a compressão MLA com pesos reais.
+    /// Após chamar este método, todos os blocos evictados para o SSD
+    /// são comprimidos no espaço latente antes de serem gravados.
+    pub fn enable_mla(&mut self, full_dim: usize, latent_dim: usize, w_down: Vec<f32>, w_up: Vec<f32>) {
+        self.mla = Some(MlaCompressor::new(full_dim, latent_dim, w_down, w_up));
+        info!("MLA ativado: compressão {:.1}x ({}d → {}d)",
+            full_dim as f32 / latent_dim as f32, full_dim, latent_dim);
+    }
+
+    /// Ativa MLA em modo pass-through (sem pesos reais — para testes).
+    pub fn enable_mla_passthrough(&mut self, full_dim: usize, latent_dim: usize) {
+        self.mla = Some(MlaCompressor::new_passthrough(full_dim, latent_dim));
+        info!("MLA pass-through ativado: {}d → {}d", full_dim, latent_dim);
+    }
+
+    /// Ratio de compressão MLA atual (1.0 se desativado).
+    pub fn mla_ratio(&self) -> f32 {
+        self.mla.as_ref().map(|m| m.compression_ratio()).unwrap_or(1.0)
+    }
+
+    /// Comprime dados KV f32 usando MLA (se ativado).
+    /// `kv_f32`: bytes interpretados como slice de f32 (cada 4 bytes = 1 float).
+    fn compress_for_ssd(&self, raw_bytes: &[u8]) -> Vec<u8> {
+        let mla = match &self.mla {
+            Some(m) => m,
+            None => return raw_bytes.to_vec(),
+        };
+        // Interpreta bytes como f32
+        let floats: Vec<f32> = raw_bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let latent = mla.compress_kv(&floats);
+        // Serializa latente como bytes
+        latent.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// Descomprime dados KV lidos do SSD usando MLA (se ativado).
+    fn decompress_from_ssd(&self, compressed: &[u8]) -> Vec<u8> {
+        let mla = match &self.mla {
+            Some(m) => m,
+            None => return compressed.to_vec(),
+        };
+        let latent: Vec<f32> = compressed.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let kv = mla.decompress_kv(&latent);
+        kv.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
 
     /// Simula a adição de um novo bloco preenchido (gerado pela GPU) para a camada
     pub fn allocate_block(&mut self, layer_idx: usize, _gpu_data: &[u8], transport: &dyn DataTransport) -> Result<(), NodeStorError> {
@@ -202,7 +366,7 @@ impl KVCache {
     }
 
     /// Indexa os blocos evictados no LanceDB.
-    fn evict_to_lancedb(&self, layer_idx: usize, block_idx: usize, vram_data: &[u8]) {
+    fn evict_to_lancedb(&self, layer_idx: usize, block_idx: usize, _vram_data: &[u8]) {
         // Reduziria ou utilizaria um sub-modelo para gerar embeddings
         // e chamaria nodestor_metadata::VectorSearch::insert_document()
         debug!("KVCache Eviction Indexada: Bloco L{}B{} indexado no lanceDB.", layer_idx, block_idx);

@@ -53,7 +53,7 @@ impl SemanticPager {
         let mut layer_ids = Vec::with_capacity(self.layers.len());
         let mut keys = Vec::with_capacity(self.layers.len());
 
-        for (id, layer) in &self.layers {
+        for (id, _layer) in &self.layers {
             layer_ids.push(*id);
             // Safe as we tie lifetimes of references to iteration.
             // Para poder coletar as keys num Vec<&[f32]>:
@@ -80,7 +80,7 @@ impl SemanticPager {
         let capacity = self.vram_capacity_bytes;
 
         // FASE 1: Trava as camadas estruturais (Blindagem Psicológica de Afasia)
-        for (id, layer) in self.layers.iter_mut() {
+        for (_id, layer) in self.layers.iter_mut() {
             if layer.is_structural {
                 if new_vram_usage + layer.size_bytes <= capacity {
                     layer.in_vram = true;

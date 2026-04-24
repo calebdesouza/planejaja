@@ -83,7 +83,7 @@ pub fn dequant_q5k_avx2(raw: &[u8], variant: Q5KVariant) -> Vec<f32> {
 /// compatível com todas as CPUs AVX2 (sem AVX-512 BF16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dequant_q4k_avx2_inner(raw: &[u8], variant: Q4KVariant) -> Vec<f32> {
+unsafe fn dequant_q4k_avx2_inner(raw: &[u8], _variant: Q4KVariant) -> Vec<f32> {
     use std::arch::x86_64::*;
 
     const BLOCK_SIZE: usize = 144;
@@ -124,7 +124,7 @@ unsafe fn dequant_q4k_avx2_inner(raw: &[u8], variant: Q4KVariant) -> Vec<f32> {
                 let nibs  = _mm256_and_si256(i32s, mask);     // & 0x0F (nibble baixo)
                 let floats = _mm256_cvtepi32_ps(nibs);        // i32 → f32
                 // peso = scale0 * q - min0
-                let result = _mm256_fmadd_ps(scale0_v, floats, _mm256_sub_ps(
+                let _result = _mm256_fmadd_ps(scale0_v, floats, _mm256_sub_ps(
                     _mm256_setzero_ps(), min0_v,
                 ));
                 // Simula corretamente: result = scale0_v * floats - min0_v

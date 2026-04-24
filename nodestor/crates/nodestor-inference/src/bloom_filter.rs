@@ -53,7 +53,7 @@ impl TokenBloomFilter {
         let mut indices = Vec::with_capacity(self.num_hashes);
         for i in 0..self.num_hashes {
             // (h1 + i * h2) % size_bits
-            let mut combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+            let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
             let idx = (combined % (self.size_bits as u64)) as usize;
             indices.push(idx);
         }

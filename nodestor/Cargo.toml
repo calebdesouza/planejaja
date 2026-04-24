@@ -13,7 +13,7 @@ members = [
     "crates/nodestor-davi",
     "crates/nodestor-fabric",
     "nodestor-cli",
-    "nodestor-server", "crates/nodestor-gdeflate",
+    "nodestor-server", "crates/nodestor-gdeflate", "nodestor-integration-tests",
 ]
 
 [workspace.package]

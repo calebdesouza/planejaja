@@ -193,7 +193,7 @@ impl IgnoranceDetector {
         // Em produÃ§Ã£o: usar decoder do SAE para mapear de volta ao espaÃ§o latente
         features.iter()
             .enumerate()
-            .filter_map(|(i, &v)| if v > 0.0 { Some(v) } else { None })
+            .filter_map(|(_i, &v)| if v > 0.0 { Some(v) } else { None })
             .take(64)
             .collect()
     }

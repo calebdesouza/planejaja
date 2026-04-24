@@ -374,6 +374,7 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                 let descriptor_pool = device.create_descriptor_pool(&descriptor_pool_info, None)
                     .map_err(|e| VulkanError::DeviceCreation(e.to_string()))?;
 
+
                 let driver_ver = format!("{}.{}.{}",
                     (props.driver_version >> 22) & 0x3FF,
                     (props.driver_version >> 14) & 0xFF,

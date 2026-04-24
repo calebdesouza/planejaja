@@ -121,3 +121,6 @@ mod tests {
             stats.generated_tokens, stats.tokens_per_second);
     }
 }
+
+pub mod latent_drafter;
+pub mod prod_empirical_test;

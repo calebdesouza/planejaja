@@ -174,7 +174,7 @@ pub fn analyze_fp32_tensor(weights: &[f32]) -> EntropyReport {
 
     // Mantissa de FP32 = 23 bits, mas a entropia efetiva é tipicamente menor.
     // Para simplicidade conservadora, assumimos mantissa quase-densa.
-    let h_mantissa = 23.0f32.min(h_exp * 3.2); // Heurística: mantiça escalada
+    let _h_mantissa = 23.0f32.min(h_exp * 3.2); // Heurística: mantiça escalada
 
     // Na prática para compressão lossless, mantissa deve ser preservada intacta.
     // Usamos 23.0 para FP32 como valor real.

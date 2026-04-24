@@ -1,10 +1,3 @@
-/// COBER Neural Engine — Orçamento de VRAM Inteligente.
-///
-/// Detecta a VRAM **livre** em runtime (via Vulkan Budget Extension),
-/// não a VRAM total. Considera o que o SO, driver e DWM já consumiram.
-/// Calcula o teto do NodeStor e os budgets por modo de inferência.
-
-use nodestor_core::NodeStorError;
 
 /// Modo de inferência detectado automaticamente pelo LayerGraph.
 #[derive(Debug, Clone, PartialEq)]

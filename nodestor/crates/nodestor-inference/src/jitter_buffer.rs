@@ -18,7 +18,6 @@
 use crate::cross_modal::{ModalityType, ModalDraft};
 use crate::semantic_attention;
 use std::collections::HashMap;
-use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. TIPOS FUNDAMENTAIS

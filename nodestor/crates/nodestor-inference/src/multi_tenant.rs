@@ -92,7 +92,7 @@ impl MultiTenantScheduler {
     /// Aloca páginas físicas para todas as requests na fila (Continuous Batching)
     pub fn schedule_next_batch(&mut self) -> Vec<SessionId> {
         let mut active_sessions = Vec::new();
-        let mut to_process = self.queue.len();
+        let to_process = self.queue.len();
 
         for _ in 0..to_process {
             if let Some(mut req) = self.queue.pop_front() {
