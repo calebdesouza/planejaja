@@ -39,7 +39,7 @@ pub use rocm_backend::{RocmTransport, detect_rocm_gpus, RocmGpuInfo};
 pub use sycl_backend::{IntelSyclTransport, detect_amx, detect_intel_gpus, AmxCapabilities, IntelGpuInfo};
 
 use nodestor_core::{DataTransport, HardwareProfile, TransportBackend, GpuVendor};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Cria o melhor transporte disponível para este `HardwareProfile`.
 ///

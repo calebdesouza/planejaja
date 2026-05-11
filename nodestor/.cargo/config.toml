@@ -5,6 +5,5 @@
 # O MSVC toolchain (stable-x86_64-pc-windows-msvc) está instalado
 # via rustup e é o linker recomendado para desenvolvimento no Windows.
 
-[build]
-# Usa o target MSVC explicitamente para este workspace
-target = "x86_64-pc-windows-msvc"
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

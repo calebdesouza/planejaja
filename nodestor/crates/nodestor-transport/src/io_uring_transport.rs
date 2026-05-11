@@ -13,12 +13,13 @@
 //! ser executadas via DMA direto sem envolver a CPU.
 
 use nodestor_core::{DataTransport, NodeStorError, TransferRequest, TransferResult, TransportBackend};
+use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{debug, info};
 
 /// Transport io_uring com submission queue real para Linux.
 pub struct IoUringTransport {
-    ring: io_uring::IoUring,
+    ring: Mutex<io_uring::IoUring>,
     /// Kernel version para saber se DMABUF está disponível
     supports_dmabuf: bool,
 }
@@ -44,7 +45,7 @@ impl IoUringTransport {
             supports_dmabuf
         );
 
-        Ok(Self { ring, supports_dmabuf })
+        Ok(Self { ring: Mutex::new(ring), supports_dmabuf })
     }
 
     /// Submete uma SQE de leitura e aguarda a CQE correspondente.
@@ -75,9 +76,13 @@ impl IoUringTransport {
         .build()
         .user_data(0x42); // tag para identificar esta operação
 
+        let mut ring = self.ring.lock().map_err(|_| {
+            NodeStorError::TransferFailed("io_uring mutex poisoned".to_string())
+        })?;
+
         // Submete ao ring
         {
-            let mut sq = self.ring.submission();
+            let mut sq = ring.submission();
             // SAFETY: o buffer `buf` vive durante todo o submit+await
             unsafe { sq.push(&read_e) }.map_err(|e| {
                 NodeStorError::TransferFailed(format!("io_uring push SQE: {}", e))
@@ -85,12 +90,11 @@ impl IoUringTransport {
         }
 
         // Submete e aguarda 1 completion
-        self.ring
-            .submit_and_wait(1)
+        ring.submit_and_wait(1)
             .map_err(|e| NodeStorError::TransferFailed(format!("io_uring submit_and_wait: {}", e)))?;
 
         // Lê o resultado da CQE
-        let mut cq = self.ring.completion();
+        let mut cq = ring.completion();
         let cqe = cq.next().ok_or_else(|| {
             NodeStorError::TransferFailed("io_uring: nenhuma CQE disponível".to_string())
         })?;
@@ -134,9 +138,13 @@ impl IoUringTransport {
             .map(|r| vec![0u8; r.size])
             .collect();
 
+        let mut ring = self.ring.lock().map_err(|_| {
+            NodeStorError::TransferFailed("io_uring mutex poisoned".to_string())
+        })?;
+
         // Submete todas as SQEs de uma vez
         {
-            let mut sq = self.ring.submission();
+            let mut sq = ring.submission();
             for (i, (req, buf)) in requests.iter().zip(buffers.iter_mut()).enumerate() {
                 let read_e = io_uring::opcode::Read::new(
                     io_uring::types::Fd(fd),
@@ -155,13 +163,12 @@ impl IoUringTransport {
         }
 
         // Uma única syscall para todo o lote
-        self.ring
-            .submit_and_wait(requests.len())
+        ring.submit_and_wait(requests.len())
             .map_err(|e| NodeStorError::TransferFailed(format!("io_uring batch submit: {}", e)))?;
 
         // Coleta resultados (podem chegar fora de ordem — ordenamos por user_data)
         let mut results: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
-        let mut cq = self.ring.completion();
+        let mut cq = ring.completion();
         for cqe in cq.by_ref() {
             let idx = cqe.user_data() as usize;
             let bytes = cqe.result().max(0) as usize;
@@ -280,7 +287,7 @@ impl DataTransport for IoUringTransport {
         for i in 0..num_chunks {
             let offset = (i * request.chunk_size) as u64;
             let size = (request.total_size - (i * request.chunk_size)).min(request.chunk_size);
-            
+
             let req = nodestor_core::TransferRequest {
                 file_offset: request.file_offset + offset,
                 size,

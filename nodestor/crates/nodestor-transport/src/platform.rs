@@ -117,16 +117,26 @@ impl PlatformIOCapabilities {
 
     #[cfg(target_os = "linux")]
     fn probe_io_uring() -> bool {
-        // io_uring_setup com parâmetros mínimos — se retornar ENOSYS, não está disponível
-        use std::io::ErrorKind;
-        // Tentativa segura: apenas verifica se a syscall existe
-        // io_uring_setup(0, params) retorna EINVAL ou fd, não ENOSYS se disponível
-        let params: libc::io_uring_params = unsafe { std::mem::zeroed() };
+        // io_uring_params é uma struct do kernel não exposta pelo libc — definimos manualmente
+        #[repr(C)]
+        struct IoUringParams {
+            sq_entries: u32,
+            cq_entries: u32,
+            flags: u32,
+            sq_thread_cpu: u32,
+            sq_thread_idle: u32,
+            features: u32,
+            wq_fd: u32,
+            resv: [u32; 3],
+            sq_off: [u8; 40],
+            cq_off: [u8; 40],
+        }
+        let params: IoUringParams = unsafe { std::mem::zeroed() };
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_setup,
                 0u32,
-                &params as *const libc::io_uring_params,
+                &params as *const IoUringParams,
             )
         };
         // ENOSYS = syscall não existe. Qualquer outro erro = uring disponível mas args inválidos

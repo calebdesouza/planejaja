@@ -15,7 +15,7 @@
 
 use nodestor_core::{DataTransport, NodeStorError, TransferRequest, TransferResult, TransportBackend};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Transporte Win32 com I/O assíncrono e bypass de cache do SO.
 ///
@@ -105,13 +105,18 @@ impl DataTransport for Win32OverlappedTransport {
         (0..num_chunks).into_par_iter().for_each(|i| {
             let offset = (i * request.chunk_size) as u64;
             let size = (request.total_size - (i * request.chunk_size)).min(request.chunk_size);
-            
-            let start = Instant::now();
-            if let Ok(result) = win32_overlapped_read(&request.file_path, &TransferRequest {
+            let req = TransferRequest {
                 file_offset: request.file_offset + offset,
                 size,
                 compressed: request.compression != nodestor_core::CompressionHint::None,
-            }, start) {
+            };
+            let start = Instant::now();
+            #[cfg(target_os = "windows")]
+            if let Ok(result) = win32_overlapped_read(&request.file_path, &req, start) {
+                callback(result);
+            }
+            #[cfg(not(target_os = "windows"))]
+            if let Ok(result) = pread_fallback_read(&request.file_path, &req, start) {
                 callback(result);
             }
         });
