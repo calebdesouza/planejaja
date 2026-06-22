@@ -77,8 +77,10 @@ fn scan() -> PyResult<String> {
     Ok(format!("{:?}", profile))
 }
 
+/// Módulo de extensão nativo. Exposto ao Python como `nodestor._nodestor`;
+/// o pacote Python `nodestor` (CLI + UX) o envolve.
 #[pymodule]
-fn nodestor(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _nodestor(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_class::<NodeStorEngine>()?;
     Ok(())

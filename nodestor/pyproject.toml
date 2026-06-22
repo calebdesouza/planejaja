@@ -5,13 +5,34 @@ build-backend = "maturin"
 [project]
 name = "nodestor"
 version = "0.1.0"
-description = "NodeStor — High-performance AI Engine with Vulkan & DMA"
+description = "NodeStor — soberania de IA local: rode qualquer modelo open-weight, em qualquer máquina, com streaming SSD→GPU."
+readme = "README.md"
 requires-python = ">=3.10"
-authors = [{name = "NodeStor Team"}]
-license = {text = "MIT"}
-dependencies = []
+authors = [{ name = "NodeStor Team" }]
+license = { text = "MIT" }
+keywords = ["llm", "inference", "vulkan", "rag", "local-ai", "speculative-decoding"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# A CLI usa `rich` quando disponível e cai num fallback ANSI puro caso contrário,
+# garantindo cores e boa UX em qualquer terminal/máquina.
+dependencies = ["rich>=13.0"]
+
+[project.urls]
+Homepage = "https://github.com/nodestor/nodestor"
+
+# `pip install nodestor` passa a expor o comando `nodestor` no terminal.
+[project.scripts]
+nodestor = "nodestor.cli:main"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 manifest-path = "crates/nodestor-python/Cargo.toml"
-module-name = "nodestor"
+# Extensão nativa instalada como submódulo; o pacote Python `nodestor` a envolve.
+module-name = "nodestor._nodestor"
+# Código Python (pacote + CLI) vive em ./python ao lado da extensão Rust.
+python-source = "python"
