@@ -95,21 +95,22 @@ impl HnswIndex {
     }
 
     /// Busca os `top_k` vizinhos mais próximos de `query`.
+    ///
+    /// Implementação EXATA (cosine brute-force) sobre o `query` real — correta por
+    /// construção. Para RAG local (milhares de chunks) é instantânea. O grafo HNSW
+    /// permanece construído para acelerar a busca aproximada (ANN) em coleções de
+    /// milhões de itens numa evolução futura; aqui a correção prevalece sobre a
+    /// aproximação. (Antes, a seleção de candidatos ignorava o `query` e usava o
+    /// nó 0 como pseudo-consulta — bug corrigido.)
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        if self.nodes.is_empty() { return vec![]; }
+        if self.nodes.is_empty() || top_k == 0 { return vec![]; }
 
-        let ep = self.entry_point.unwrap_or(0);
-        let candidates = self.search_layer(self.nodes.len(), ep, self.ef_construction.max(top_k));
-
-        candidates.into_iter()
-            .take(top_k)
-            .filter_map(|(idx, _)| {
-                self.nodes.get(idx).map(|n| {
-                    let score = cosine_similarity(query, &n.embedding);
-                    (n.id.clone(), score)
-                })
-            })
-            .collect()
+        let mut scored: Vec<(String, f32)> = self.nodes.iter()
+            .map(|n| (n.id.clone(), cosine_similarity(query, &n.embedding)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        scored
     }
 
     /// Busca com beam search aproximada na camada 0.

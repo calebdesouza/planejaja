@@ -206,14 +206,26 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_for_indexing = pipeline.clone();
     tokio::spawn(async move {
         info!("Self-Indexing Hub iniciado. Monitorando pasta './knowledge'... 🔍");
+        let mut indexed: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
-            // Simulando a descoberta de novos arquivos para indexação de alta fidelidade
             if let Ok(entries) = std::fs::read_dir("./knowledge") {
                 for entry in entries.flatten() {
                     if let Some(path) = entry.path().to_str() {
-                        if path.ends_with(".txt") || path.ends_with(".md") {
-                            // Indexação RAG em alta precisão sem perda de contexto
-                            let _ = pipeline_for_indexing.vector_db.add_document(path, "Conteúdo processado").await;
+                        let is_doc = path.ends_with(".txt") || path.ends_with(".md");
+                        if is_doc && !indexed.contains(path) {
+                            // Lê o CONTEÚDO REAL do arquivo e o indexa (HNSW + BM25).
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => {
+                                    match pipeline_for_indexing.vector_db.add_document(path, &content).await {
+                                        Ok(_) => {
+                                            indexed.insert(path.to_string());
+                                            info!("RAG: '{}' indexado ({} bytes)", path, content.len());
+                                        }
+                                        Err(e) => tracing::warn!("RAG: falha ao indexar '{}': {}", path, e),
+                                    }
+                                }
+                                Err(e) => tracing::warn!("RAG: não foi possível ler '{}': {}", path, e),
+                            }
                         }
                     }
                 }

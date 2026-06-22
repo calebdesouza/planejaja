@@ -2,9 +2,11 @@
 //!
 //! ## Status
 //! - [x] Estrutura do crate
-//! - [ ] `indexer.rs` — indexação de offsets de tensores
-//! - [ ] `search.rs` — busca vetorial (DiskANN/HNSW)
+//! - [x] `indexer.rs` — indexação de offsets de tensores
+//! - [x] `search.rs` — interface RAG (VectorSearch) sobre o VectorStore nativo
+//! - [x] `vector_store.rs` — banco vetorial híbrido (HNSW + BM25 + RRF), Rust puro
 //! - [ ] `quantization.rs` — Binary quantization (1TB → MBs na RAM)
 
 pub mod indexer;
 pub mod search;
+pub mod vector_store;

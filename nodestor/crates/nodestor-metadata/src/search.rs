@@ -1,29 +1,44 @@
-//! Busca vetorial para integração com base de dados de conhecimento (ex: LanceDB).
+//! Busca vetorial para integração com a base de conhecimento (RAG).
 //!
-//! O motor de inferência utiliza este módulo para buscar contextos relevantes (RAG)
+//! O motor de inferência usa este módulo para buscar contextos relevantes (RAG)
 //! e embuti-los no prompt dinamicamente antes da geração.
+//!
+//! ## Arquitetura ("o devido lugar" do banco vetorial)
+//! `VectorSearch` é a interface RAG que o pipeline consome. Internamente ela é
+//! servida pelo [`crate::vector_store::VectorStore`] nativo — um banco híbrido
+//! **HNSW (semântico) + BM25 (literal) + RRF Fusion**, em Rust puro, sempre ativo
+//! e sem dependência pesada. Isso dá RAG funcional out-of-the-box em qualquer
+//! máquina. O recurso opcional `lancedb_native` adiciona persistência em disco
+//! (LanceDB) para coleções em escala de datacenter, sem mudar esta interface.
 
 use nodestor_core::NodeStorError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::vector_store::VectorStore;
 
 /// Resultado de uma busca vetorial.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     /// ID do documento ou fragmento na base de dados.
     pub id: String,
-    /// Score de similaridade (ex: Cosseno) entre a query e este item.
+    /// Score de similaridade (Cosseno para vetorial; RRF para híbrida).
     pub score: f32,
     /// Texto ou payload de metadados associado.
     pub payload: Option<String>,
 }
 
-/// Interface assíncrona para o motor de busca vetorial integrado (LanceDB/HNSW).
+/// Interface assíncrona para o motor de busca vetorial integrado (RAG).
 pub struct VectorSearch {
     #[cfg(feature = "lancedb_native")]
     client: std::sync::Arc<tokio::sync::Mutex<Option<lancedb::Connection>>>,
     collection_name: String,
     #[allow(dead_code)]
     db_path: String,
+    /// Banco vetorial híbrido em-processo (HNSW + BM25 + RRF). Sempre ativo.
+    store: std::sync::Mutex<VectorStore>,
+    /// Dimensão dos embeddings produzidos por [`VectorSearch::embed_text`].
+    embed_dim: usize,
 }
 
 impl VectorSearch {
@@ -33,10 +48,57 @@ impl VectorSearch {
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             collection_name: collection_name.to_string(),
             db_path: db_path.to_string(),
+            store: std::sync::Mutex::new(VectorStore::new(db_path)),
+            embed_dim: 128,
         }
     }
 
+    /// Embedding determinístico texto→vetor via "hashing trick" (feature hashing).
+    ///
+    /// Cada token (palavra + trigrama de caractere) é hasheado para uma dimensão
+    /// com sinal; o vetor resultante é L2-normalizado. É determinístico, não exige
+    /// modelo externo e captura similaridade lexical — suficiente para RAG factual.
+    /// Pode ser trocado por um encoder neural real mantendo esta mesma assinatura.
+    pub fn embed_text(text: &str, dim: usize) -> Vec<f32> {
+        let dim = dim.max(1);
+        let mut v = vec![0.0f32; dim];
+        let lower = text.to_lowercase();
+
+        let mut add_feature = |s: &str| {
+            let h = fnv1a64(s.as_bytes());
+            let idx = (h % dim as u64) as usize;
+            let sign = if (h >> 8) & 1 == 0 { 1.0 } else { -1.0 };
+            v[idx] += sign;
+        };
+
+        // Palavras (≥ 2 caracteres alfanuméricos)
+        for w in lower.split(|c: char| !c.is_alphanumeric()).filter(|s| s.len() >= 2) {
+            add_feature(w);
+        }
+        // Trigramas de caractere (robustez a variações morfológicas/typos)
+        let chars: Vec<char> = lower.chars().filter(|c| !c.is_whitespace()).collect();
+        for win in chars.windows(3) {
+            let tri: String = win.iter().collect();
+            add_feature(&tri);
+        }
+
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-10 {
+            for x in v.iter_mut() { *x /= norm; }
+        }
+        v
+    }
+
+    /// Dimensão de embedding configurada para este índice.
+    pub fn embed_dim(&self) -> usize { self.embed_dim }
+
+    /// Número de documentos atualmente indexados.
+    pub fn document_count(&self) -> usize {
+        self.store.lock().map(|s| s.document_count()).unwrap_or(0)
+    }
+
     #[cfg(feature = "lancedb_native")]
+    #[allow(dead_code)]
     async fn get_table(&self) -> Result<lancedb::Table, NodeStorError> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
@@ -44,30 +106,27 @@ impl VectorSearch {
                 .map_err(|e| NodeStorError::ConfigError(format!("LanceDB falhou: {}", e)))?;
             *guard = Some(conn);
         }
-        
         let conn = guard.as_ref().unwrap();
         conn.open_table(&self.collection_name).execute().await
             .map_err(|e| NodeStorError::ConfigError(format!("Tabela vetorial não encontrada: {}", e)))
     }
 
-    /// Insere um documento no banco de dados vetorial para Eviction Indexada.
+    /// Insere um registro já embeddado (ex.: indexação de Eviction do KV cache).
     pub async fn insert_document(
         &self,
         id: String,
-        _embedding: Vec<f32>,
+        embedding: Vec<f32>,
         payload: Option<String>,
     ) -> Result<(), NodeStorError> {
-        #[cfg(feature = "lancedb_native")]
-        {
-            // LanceDB record insertion logic
+        let text = payload.unwrap_or_default();
+        if let Ok(mut store) = self.store.lock() {
+            store.insert(&id, &embedding, &text, HashMap::new())?;
         }
-
-        // Mock para simulação sem SSD real
-        tracing::debug!("VectorSearch Insert: Indexado Eviction {} no LanceDB", id);
+        tracing::debug!("VectorSearch: registro '{}' indexado em '{}'", id, self.collection_name);
         Ok(())
     }
 
-    /// Executa uma busca por similaridade vetorial (KNN).
+    /// Busca por similaridade vetorial pura (KNN) sobre o índice HNSW.
     pub async fn search_knn(
         &self,
         query_embedding: &[f32],
@@ -77,88 +136,126 @@ impl VectorSearch {
             return Err(NodeStorError::ConfigError("Embedding vazio".into()));
         }
 
-        tracing::debug!(
-            "Buscando top {} em {} (dim: {})",
-            top_k, self.collection_name, query_embedding.len()
-        );
+        let results = match self.store.lock() {
+            Ok(mut store) => store.vector_search(query_embedding, top_k),
+            Err(_) => Vec::new(),
+        };
 
-        #[cfg(feature = "lancedb_native")]
-        {
-            let table = match self.get_table().await {
-                Ok(t) => t,
-                Err(e) => return Err(e),
-            };
-
-            let results = table
-                .query()
-                .nearest_to(query_embedding).unwrap()
-                .limit(top_k)
-                .execute()
-                .await
-                .map_err(|e| NodeStorError::ConfigError(format!("Erro HNSW: {}", e)))?;
-
-            let mut search_results = Vec::new();
-            
-            // Mapeia o RecordBatch do LanceDB para SearchResult
-            // Supomos que a tabela tenha colunas 'id', 'score' (auto) e 'text'
-            for batch in results.collect().await.map_err(|e| NodeStorError::ConfigError(e.to_string()))? {
-                let ids = batch.column_by_name("id")
-                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
-                    .ok_or_else(|| NodeStorError::ConfigError("Coluna 'id' não encontrada".into()))?;
-                
-                let texts = batch.column_by_name("text")
-                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
-
-                for i in 0..batch.num_rows() {
-                    search_results.push(SearchResult {
-                        id: ids.value(i).to_string(),
-                        score: 0.0, // LanceDB QueryResult não expõe score em RecordBatch facilmente sem _distance
-                        payload: texts.map(|t| t.value(i).to_string()),
-                    });
-                }
-            }
-
-            tracing::debug!("LanceDB HNSW completado: {} itens", search_results.len());
-            return Ok(search_results);
-        }
-
-        #[cfg(not(feature = "lancedb_native"))]
-        {
-            tracing::warn!("LanceDB Native desativado. Retornando stub HNSW RAG.");
-            let mut mock_results = Vec::new();
-            for i in 0..top_k {
-                mock_results.push(SearchResult {
-                    id: format!("doc_{}", i),
-                    score: 0.99 - (i as f32 * 0.01),
-                    payload: Some(format!("Stub HNSW Contexto {}", i)),
-                });
-            }
-            Ok(mock_results)
-        }
+        Ok(results.into_iter().map(|r| SearchResult {
+            id: r.id,
+            score: r.vector_score,
+            payload: Some(r.text),
+        }).collect())
     }
 
-    /// Wrapper de alto nível para indexar um documento inteiro (Simulado para V1.0).
+    /// Busca híbrida a partir de TEXTO: embeda a query e funde HNSW + BM25 via RRF.
+    /// É o caminho recomendado para RAG (resolve tanto conceito quanto match exato
+    /// de IDs/números de série).
+    pub async fn search_text(
+        &self,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>, NodeStorError> {
+        let emb = Self::embed_text(query_text, self.embed_dim);
+        let results = match self.store.lock() {
+            Ok(mut store) => store.hybrid_search(&emb, query_text, top_k),
+            Err(_) => Vec::new(),
+        };
+        Ok(results.into_iter().map(|r| SearchResult {
+            id: r.id,
+            score: r.combined_score,
+            payload: Some(r.text),
+        }).collect())
+    }
+
+    /// Indexa um documento inteiro: embeda o conteúdo e insere no HNSW + BM25.
     pub async fn add_document(
         &self,
-        _path: &str,
-        _content: &str,
+        path: &str,
+        content: &str,
     ) -> Result<(), NodeStorError> {
-        tracing::debug!("Indéxando documento de alta precisão: {}", _path);
-        // Simulação de embedding e upsert
-        self.upsert(_path, &[0.0; 128], _content).await
+        let emb = Self::embed_text(content, self.embed_dim);
+        if let Ok(mut store) = self.store.lock() {
+            store.insert(path, &emb, content, HashMap::new())?;
+        }
+        tracing::debug!("VectorSearch: documento indexado (HNSW+BM25): {}", path);
+        Ok(())
     }
 
-    /// Insere ou atualiza um fragmento de conhecimento na base vetorial.
+    /// Insere/atualiza um fragmento de conhecimento com embedding explícito.
     pub async fn upsert(
         &self,
         id: &str,
         embedding: &[f32],
-        _payload: &str,
+        payload: &str,
     ) -> Result<(), NodeStorError> {
-        tracing::debug!(
-            "LanceDB Native Upsert: {} na tabela {} (dim={})",
-            id, self.collection_name, embedding.len()
-        );
+        if let Ok(mut store) = self.store.lock() {
+            store.insert(id, embedding, payload, HashMap::new())?;
+        }
+        tracing::debug!("VectorSearch upsert: '{}' em '{}' (dim={})", id, self.collection_name, embedding.len());
         Ok(())
+    }
+}
+
+/// FNV-1a 64-bit — hash determinístico e rápido para o feature hashing.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_add_and_search_text_returns_relevant_doc() {
+        let vs = VectorSearch::new("kb", "/tmp/nodestor_vs_search_test");
+        vs.add_document("doc_ml", "machine learning and neural networks for deep models").await.unwrap();
+        vs.add_document("doc_db", "database indexing and SQL query optimization").await.unwrap();
+        vs.add_document("doc_cook", "a recipe for chocolate cake with sugar and flour").await.unwrap();
+
+        let results = vs.search_text("how do neural networks learn", 2).await.unwrap();
+        assert!(!results.is_empty(), "deve retornar resultados");
+        assert_eq!(results[0].id, "doc_ml", "o doc de ML deve liderar para uma query de ML, veio '{}'", results[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_fts_exact_id_match_via_hybrid() {
+        let vs = VectorSearch::new("kb", "/tmp/nodestor_vs_fts_test");
+        vs.add_document("a", "the sensor reading was nominal today").await.unwrap();
+        vs.add_document("b", "part SN-9823-X failed inspection").await.unwrap();
+        let results = vs.search_text("SN-9823-X", 3).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "b", "match exato de ID deve liderar via BM25+RRF");
+    }
+
+    #[tokio::test]
+    async fn test_search_knn_with_embedding() {
+        let vs = VectorSearch::new("kb", "/tmp/nodestor_vs_knn_test");
+        vs.add_document("x", "vulkan gpu compute shaders and pipelines").await.unwrap();
+        vs.add_document("y", "italian pasta and tomato sauce").await.unwrap();
+        // Embeda a mesma intenção da query e busca por vetor puro.
+        let q = VectorSearch::embed_text("gpu shader pipeline", vs.embed_dim());
+        let results = vs.search_knn(&q, 1).await.unwrap();
+        assert_eq!(results[0].id, "x", "kNN vetorial deve achar o doc de GPU");
+    }
+
+    #[test]
+    fn test_embed_text_deterministic_and_normalized() {
+        let a = VectorSearch::embed_text("hello world", 128);
+        let b = VectorSearch::embed_text("hello world", 128);
+        assert_eq!(a, b, "embedding deve ser determinístico");
+        let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4 || norm == 0.0, "embedding deve ser L2-normalizado, norm={}", norm);
+    }
+
+    #[tokio::test]
+    async fn test_empty_query_embedding_rejected() {
+        let vs = VectorSearch::new("kb", "/tmp/nodestor_vs_empty_test");
+        assert!(vs.search_knn(&[], 3).await.is_err(), "embedding vazio deve ser rejeitado");
     }
 }

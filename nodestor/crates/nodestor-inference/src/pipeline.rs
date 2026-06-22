@@ -178,9 +178,10 @@ impl InferencePipeline {
     ) -> Result<(String, GenerationStats), NodeStorError> {
         let start_time = Instant::now();
         
-        // 0. Busca RAG (LanceDB Lookup) — Opcional dependendo do prompt
-        let _context = self.vector_db.search_knn(&[0.0; 128], 3).await?;
-        debug!("RAG Context carregado: {} itens", _context.len());
+        // 0. Busca RAG (híbrida HNSW + BM25 + RRF): embeda o PROMPT real e
+        //    recupera os fragmentos de conhecimento mais relevantes do VectorStore.
+        let rag_context = self.vector_db.search_text(prompt, 3).await.unwrap_or_default();
+        debug!("RAG: {} fragmentos relevantes recuperados para o prompt", rag_context.len());
 
         // 1. Inicializa o subsistema de memória L3 (Double/Triple VRAM Buffering)
         let pool = BufferPool::new(
