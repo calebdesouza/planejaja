@@ -13,6 +13,10 @@ pub mod nsz_format;
 pub mod nsz_encoder;
 pub mod nsz_decoder;
 
+// --- LFSR Seed Engine: Compressão Fractal (Fase 2 Quântico-Latente) ---
+pub mod lfsr_engine;
+pub mod bitnet_codec;
+
 use nodestor_core::{ModelParser, NodeStorError};
 
 /// Seleciona automaticamente o parser correto baseado na extensão do arquivo.

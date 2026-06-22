@@ -33,6 +33,9 @@ pub enum NodeStorError {
     #[error("Erro de configuração: {0}")]
     ConfigError(String),
 
+    #[error("Erro de inferência: {0}")]
+    InferenceError(String),
+
     #[error("Timeout após {ms}ms")]
     Timeout { ms: u64 },
 }

@@ -37,8 +37,14 @@ pub struct VulkanEngine {
 
 impl VulkanEngine {
     pub fn new(profile: &HardwareProfile) -> Result<Self, NodeStorError> {
-        let gpu = profile.primary_gpu();
-        let ctx = VulkanContext::new(gpu).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        // "Rodar em qualquer máquina": sem GPU física no perfil, não tocamos a FFI
+        // real do Vulkan (que faria access-violation num ambiente headless/CPU-only).
+        // Caímos graciosamente no caminho de simulação RAM-backed.
+        let gpu = match profile.primary_gpu() {
+            Some(g) => g,
+            None => return Ok(Self::new_simulation()),
+        };
+        let ctx = VulkanContext::new(Some(gpu)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let pipelines = pipeline::create_all_pipelines(&ctx).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         Ok(Self { ctx, pipelines })
     }
@@ -46,16 +52,9 @@ impl VulkanEngine {
     /// Cria um VulkanEngine em modo de simulação (sem GPU real).
     /// Usado em benchmarks, testes e ambientes headless (CI/CD, Docker).
     pub fn new_simulation() -> Self {
-        // VulkanContext::new(None) retorna simulação automaticamente se Vulkan falhar.
-        let ctx = match VulkanContext::new(None) {
-            Ok(c) => c,
-            Err(_) => {
-                // Última linha de defesa: contexto totalmente sem Vulkan
-                // Isso não pode falhar — é pura RAM do processo.
-                VulkanContext::new(None)
-                    .expect("VulkanContext::new always returns Ok (simulation fallback is internal)")
-            }
-        };
+        // Simulação FORÇADA: vai direto ao contexto CPU/RAM, sem TENTAR Vulkan real
+        // (o que poderia access-violation em máquinas headless/loader quebrado).
+        let ctx = VulkanContext::simulation();
         let pipelines = pipeline::create_simulation_pipelines();
         Self { ctx, pipelines }
     }
@@ -114,6 +113,21 @@ impl VulkanEngine {
     }
 
 
+    pub fn fused_layernorm_gelu(
+        &self,
+        input: &GpuBuffer,
+        gamma: &GpuBuffer,
+        beta: &GpuBuffer,
+        hidden_dim: u32,
+        eps: f32,
+    ) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::FusedLayerNormGelu)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline FusedLayerNormGelu not available".into()))?;
+        let mut output = self.ctx.alloc_gpu_buffer(input.size)?;
+        pipeline.dispatch_fused_layernorm_gelu(&self.ctx, input, gamma, beta, &mut output, hidden_dim, eps)?;
+        Ok(output)
+    }
+
     pub fn matmul(&self, a: &GpuBuffer, b: &GpuBuffer, m: u32, k: u32, n: u32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::Matmul).ok_or_else(|| NodeStorError::VulkanError("Pipeline Matmul not available".into()))?;
         let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;
@@ -150,6 +164,25 @@ impl VulkanEngine {
         Ok(output)
     }
 
+    pub fn matmul_ternary(&self, a: &GpuBuffer, b_packed: &GpuBuffer, m: u32, k: u32, n: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::MatmulTernary)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline MatmulTernary not available".into()))?;
+        let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;
+        pipeline.dispatch_matmul_ternary(&self.ctx, a, b_packed, &mut output, m, k, n)?;
+        Ok(output)
+    }
+
+    pub fn mamba_selective_scan(
+        &self, u: &GpuBuffer, delta: &GpuBuffer, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
+        state: &GpuBuffer, seq_len: u32, d_inner: u32, d_state: u32
+    ) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::MambaSelectiveScan)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline MambaSelectiveScan not available".into()))?;
+        let mut y = self.ctx.alloc_gpu_buffer((seq_len * d_inner * 4) as usize)?;
+        pipeline.dispatch_mamba_selective_scan(&self.ctx, u, delta, a, b, c, state, &mut y, seq_len, d_inner, d_state)?;
+        Ok(y)
+    }
+
     pub fn rmsnorm(&self, input: &GpuBuffer, weight: &GpuBuffer, seq_len: u32, hidden_size: u32, eps: f32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::RmsNorm).ok_or_else(|| NodeStorError::VulkanError("RmsNorm missing".into()))?;
         let mut output = self.ctx.alloc_gpu_buffer((seq_len * hidden_size * 4) as usize)?;
@@ -176,14 +209,22 @@ impl VulkanEngine {
 
     pub fn attention(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, seq_len: u32, head_dim: u32, scale: f32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::Attention).ok_or_else(|| NodeStorError::VulkanError("Attention missing".into()))?;
-        let mut out_attn = self.ctx.alloc_gpu_buffer((seq_len * head_dim * 4) as usize)?;
+        // A saída de atenção multi-head tem o MESMO formato do Q projetado
+        // ([seq_len, num_heads, head_dim] = n_q elementos), não apenas `head_dim`.
+        // Dimensionar por `q.size` evita truncar para 1 head (OOB no matmul de
+        // output projection no caminho simulação, e leitura de lixo no GPU).
+        let mut out_attn = self.ctx.alloc_gpu_buffer(q.size)?;
         pipeline.dispatch_attention(&self.ctx, q, k, v, &mut out_attn, seq_len, head_dim, scale)?;
         Ok(out_attn)
     }
 
     pub fn turbo_quant_attention(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, seq_len: u32, head_dim: u32, scale: f32) -> Result<GpuBuffer, NodeStorError> {
         let pipeline = self.pipelines.get(&PipelineKind::TurboQuantAttention).ok_or_else(|| NodeStorError::VulkanError("TurboQuantAttention missing".into()))?;
-        let mut out_attn = self.ctx.alloc_gpu_buffer((seq_len * head_dim * 4) as usize)?;
+        // A saída de atenção multi-head tem o MESMO formato do Q projetado
+        // ([seq_len, num_heads, head_dim] = n_q elementos), não apenas `head_dim`.
+        // Dimensionar por `q.size` evita truncar para 1 head (OOB no matmul de
+        // output projection no caminho simulação, e leitura de lixo no GPU).
+        let mut out_attn = self.ctx.alloc_gpu_buffer(q.size)?;
         pipeline.dispatch_turbo_quant_attention(&self.ctx, q, k, v, &mut out_attn, seq_len, head_dim, scale)?;
         Ok(out_attn)
     }

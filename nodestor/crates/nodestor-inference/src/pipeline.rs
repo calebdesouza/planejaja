@@ -94,6 +94,8 @@ pub struct InferencePipeline {
     pub kv_paginator: KVCachePaginator,
     /// Ferramenta externa de PROBES (ELK/CoT/RAISE) — injetável sem depência circular.
     pub probes_tool: Option<std::sync::Mutex<Box<dyn ProbesTool>>>,
+    /// Escalonador de Batching Contínuo
+    pub scheduler: std::sync::Mutex<crate::multi_tenant::MultiTenantScheduler>,
 }
 
 impl InferencePipeline {
@@ -128,6 +130,7 @@ impl InferencePipeline {
             vector_db,
             kv_paginator,
             probes_tool: None,
+            scheduler: std::sync::Mutex::new(crate::multi_tenant::MultiTenantScheduler::new(1024, 128)),
         })
     }
 
@@ -158,12 +161,20 @@ impl InferencePipeline {
         Ok(vec![0u8; 1024])
     }
 
+    /// Submete uma requisição ao escalonador de Continuous Batching.
+    pub fn submit_request(&self, request: crate::multi_tenant::InferenceRequest) {
+        if let Ok(mut sched) = self.scheduler.lock() {
+            sched.submit_request(request);
+        }
+    }
+
     /// Loop principal de "Mecanismo de Atenção": prevê tensores e dispara
     /// kernels Vulkan para gerar tokens a alta voltagem (Modo Metralhadora).
     pub async fn generate(
         &self,
         prompt: &str,
         max_tokens: usize,
+        tx: Option<tokio::sync::mpsc::Sender<Result<String, NodeStorError>>>,
     ) -> Result<(String, GenerationStats), NodeStorError> {
         let start_time = Instant::now();
         
@@ -311,6 +322,9 @@ impl InferencePipeline {
             self.probes_config.sae_dict_size,
             self.probes_config.sae_threshold,
         );
+
+        // MCTS Engine local: busca deliberativa profunda (Princípio 2)
+        let mut _mcts_engine = crate::mcts_engine::MctsEngine::new(1.414); // Cp = sqrt(2)
         // ─────────────────────────────────────────────────────────────────────────
 
         let mut sampler = crate::sampler::Sampler::new(crate::sampler::SamplerConfig {
@@ -336,86 +350,110 @@ impl InferencePipeline {
         // Pre-enche a RAM/VRAM para que o Kernel nunca bloqueie (Burst Pump)
         scheduler.prime_pump().await?;
 
-        for step in 0..max_tokens {
-            // Em uma engine LLM real, current_token passaria por uma Tabela de Embeddings e viraria um tensor.
+        let mut cober = crate::cober::CoberEngine::new_dense(crate::vram_budget::VramBudget::estimate(4 * 1024 * 1024 * 1024));
+        let mut drafter = crate::latent_drafter::LatentDrafter::new(hidden_size as usize, 0.9);
+        let cheby = nodestor_vulkan::transformer::ChebyshevSoftmax::default();
+
+        let mut step = 0;
+        while step < max_tokens {
             let current_token = if step < input_tokens.len() {
                 input_tokens[step]
             } else {
                 *generated_tokens.last().unwrap_or(&0)
             };
 
-            // Criar embedding de entrada com a dimensão real do modelo
+            // Criar embedding de entrada
             let embed_dim = hidden_size as usize;
             let mut embed_data = vec![0.0f32; embed_dim];
             embed_data[current_token as usize % embed_dim] = 1.0;
-            let embed_bytes = unsafe {
-                std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4)
-            };
+            let embed_bytes = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4) };
             let embed_buf = self.engine.upload(embed_bytes)?;
 
-            // Roda o Forward Pass Real — pesos do WeightBank, todas as camadas ativas
+            // Forward pass (mestre) do token atual (ou token draft base)
             let logits_buf = transformer.forward(&self.engine, &embed_buf, &weight_bank, step as u32)
                 .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
 
-            // ── PROBES V2: Inspeção pós-forward antes do sample ───────────────────
             if probes_enabled {
-                // 1. RAIO-X (SAE local): decompõe hidden_state em features legíveis
                 let latent_features = probes_sae.encode(&embed_data);
-                let _ = latent_features; // Disponível para inspectors externos
-
-                // 2. Ferramenta externa (ELK+CoT+RAISE via DAVI) se injetada
                 if let Some(ref tool_mutex) = self.probes_tool {
                     if let Ok(mut tool) = tool_mutex.lock() {
                         let (is_safe, maybe_alert) = tool.inspect(&embed_data, step);
                         if let Some(alert) = maybe_alert {
                             warn!("{}", alert);
-                            probes_alerts.push(alert);
+                            probes_alerts.push(alert.clone());
                         }
                         if !is_safe {
-                            let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa (ELK/CoT/RAISE)", step);
+                            let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa", step);
                             warn!("{}", block_msg);
                             probes_alerts.push(block_msg);
-                            break; // Interrompe geração segura
+                            break;
                         }
                     }
                 }
             }
-            // ─────────────────────────────────────────────────────────────────────
 
-            // Download logits e sample com garantia Conformal
             let mut logits = self.engine.download_f32(&logits_buf)?;
-            let (sampled_token, conformal_set) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+            let current_probs = cheby.softmax(&logits);
+            let entropy = crate::cober::CoberEngine::compute_entropy(&current_probs);
 
-            // Verifica incerteza conformal — rejeita tokens de alta entropia
-            if let Some(ref cs) = conformal_set {
-                if !cs.is_reliable {
-                    conformal_rejections += 1;
-                    debug!("[PROBES/CONFORMAL] Step {}: token rejeitado por alta incerteza (entropy={:.3})", step, cs.entropy);
+            // Se for prompt/prefill, não usa spec, apenas autoregressivo
+            let accepted_round = if step < input_tokens.len() {
+                let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
+                    .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+                vec![(sampled_token as u32) % vocab_size]
+            } else {
+                // Modo decoding: Especulação Ativa
+                if entropy > 2.0 {
+                    // MCTS Engine (Busca Profunda)
+                    let best_token = _mcts_engine.simulate(64, &drafter, &embed_data, 5);
+                    vec![best_token % vocab_size]
+                } else {
+                    // COBER Engine (Lossless)
+                    let (tree_k, _) = cober.easd_compute_tree_params(&current_probs);
+                    let mut indexed_probs: Vec<(usize, f32)> = current_probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    let draft_tokens: Vec<u32> = indexed_probs.iter().take(tree_k).map(|(i, _)| *i as u32).collect();
+
+                    if draft_tokens.is_empty() {
+                        let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
+                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+                        vec![(sampled_token as u32) % vocab_size]
+                    } else {
+                        // Batch forward
+                        let master_logits = transformer.forward_batch(&self.engine, &draft_tokens, &weight_bank, step as u32 + 1)
+                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
+                        let draft_probs = vec![current_probs.clone(); draft_tokens.len()];
+                        let master_probs = master_logits.iter().map(|l| cheby.softmax(l)).collect::<Vec<_>>();
+                        
+                        let round = cober.verify_and_accept_probabilistic(&draft_tokens, &draft_probs, &master_probs);
+                        if round.accepted_tokens.is_empty() {
+                            let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
+                                .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+                            vec![(sampled_token as u32) % vocab_size]
+                        } else {
+                            round.accepted_tokens.into_iter().map(|t| t % vocab_size).collect()
+                        }
+                    }
+                }
+            };
+
+            for &t in &accepted_round {
+                generated_tokens.push(t);
+                
+                // Stream o token convertido para string (fallback simples para tokenizer mock)
+                if let Some(ref tx_stream) = tx {
+                    let token_str = tokenizer.decode(&[t], true).unwrap_or_default();
+                    if !token_str.is_empty() {
+                        let _ = tx_stream.blocking_send(Ok(token_str));
+                    }
                 }
             }
 
-            let next_token = sampled_token;
-
-            if step >= input_tokens.len() {
-                // Usar o vocab_size real do modelo — sem clamp arbitrário para 3 tokens
-                let token_in_range = (next_token as u32) % vocab_size;
-                generated_tokens.push(token_in_range);
-            }
-
-            // Salvar bytes reais dos logits no KV Cache (paging SSD)
-            let logit_bytes = self.engine.download_f32(&logits_buf)
-                .map(|f32s| {
-                    f32s.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
-                })
-                .unwrap_or_else(|_| vec![0u8; (vocab_size * 4) as usize]);
-
+            let logit_bytes = logits.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
             for layer_idx in 0..layers_per_token {
                 if let Some(mut block) = scheduler.next_tensor().await {
                     let gpu_buffer = block.buffer.buffer.as_mut().unwrap();
-                    // Matmul residual para dar pressão no sistema
                     let _ = self.engine.matmul(gpu_buffer, gpu_buffer, 32, 32, 32);
-                    // Paging real: grava bytes do logit/KV para o SSD quando VRAM esgota
                     if let Err(e) = kv_cache.allocate_block(layer_idx, &logit_bytes, &*self.transport) {
                         debug!("KV Cache alloc layer {}: {}", layer_idx, e);
                     }
@@ -423,7 +461,9 @@ impl InferencePipeline {
                     return Err(NodeStorError::TransferFailed("A fila de prefetch secou!".to_string()));
                 }
             }
-            tokens_done += 1;
+            
+            step += accepted_round.len();
+            tokens_done += accepted_round.len();
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM
@@ -472,15 +512,9 @@ impl InferencePipeline {
         let this = self.clone();
 
         tokio::spawn(async move {
-            match this.generate(&prompt, max_tokens).await {
-                Ok((text, stats)) => {
-                    // Faz stream de cada palavra individualmente para UX de baixa latência.
-                    // Em uma implementação com tokenizer bidirecional, enviaria token a token.
-                    for word in text.split_inclusive(' ') {
-                        if tx.send(Ok(word.to_string())).await.is_err() {
-                            break; // cliente desconectou
-                        }
-                    }
+            match this.generate(&prompt, max_tokens, Some(tx.clone())).await {
+                Ok((_text, stats)) => {
+                    // Os fragmentos são enviados pela generate() agora.
                     tracing::debug!(
                         "[Stream] Geração finalizada: {} tokens em {}ms ({:.1} tok/s)",
                         stats.generated_tokens,

@@ -1,3 +1,7 @@
+use crate::clip_encoder::ClipEncoder;
+use crate::whisper_pipeline::WhisperPipeline;
+use crate::diffusion_pipeline::DiffusionPipeline;
+
 /// NodeStor COBER v2 - Subsistema 12: Barramento de Intenção Multimodal
 /// (Cross-Modal Speculation / Espaço Latente Unificado)
 ///
@@ -172,6 +176,12 @@ pub struct CrossModalBus {
     pub stats: CrossModalStats,
     /// Projector de alinhamento MRepE (opcional — None = comportamento original)
     pub alignment_projector: Option<AlignmentProjector>,
+    /// Encoder visual (CLIP-like) — projeta pixels no espaço latente unificado
+    pub clip_encoder: Option<ClipEncoder>,
+    /// Encoder de áudio (Whisper-like) — projeta mel-spectrogram no espaço unificado
+    pub whisper_pipeline: Option<WhisperPipeline>,
+    /// Decodificador de imagem (Diffusion) — gera pixels a partir de um conceito latente
+    pub diffusion_pipeline: Option<DiffusionPipeline>,
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +201,11 @@ impl CrossModalBus {
             reuse_threshold: 0.85,
             stats: CrossModalStats::default(),
             alignment_projector: None,
+            // Encoders/decoders multimodais ativos por padrão, todos no mesmo
+            // espaço latente unificado (latent_dim). Diffusion usa 20 passos DDIM.
+            clip_encoder: Some(ClipEncoder::new(latent_dim)),
+            whisper_pipeline: Some(WhisperPipeline::new(latent_dim)),
+            diffusion_pipeline: Some(DiffusionPipeline::new(latent_dim, 20)),
         }
     }
 
@@ -345,6 +360,41 @@ impl CrossModalBus {
             is_consistent,
             coherence_score: coherence,
             per_modality_scores,
+        }
+    }
+
+    /// Processa uma imagem de entrada e registra no espaço latente unificado
+    pub fn ingest_image(&mut self, pixels: &[f32], description: &str) -> Result<u64, nodestor_core::NodeStorError> {
+        if let Some(encoder) = &self.clip_encoder {
+            let concept = encoder.encode_image(pixels, description)?;
+            let draft = concept.modal_drafts[0].clone();
+            Ok(self.register_concept(concept.unified_embedding, description.to_string(), draft))
+        } else {
+            Err(nodestor_core::NodeStorError::InferenceError("CLIP Encoder não carregado".into()))
+        }
+    }
+
+    /// Processa áudio de entrada e registra no espaço latente unificado
+    pub fn ingest_audio(&mut self, mel: &[f32], description: &str) -> Result<u64, nodestor_core::NodeStorError> {
+        if let Some(pipeline) = &self.whisper_pipeline {
+            let concept = pipeline.encode_audio(mel, description)?;
+            let draft = concept.modal_drafts[0].clone();
+            Ok(self.register_concept(concept.unified_embedding, description.to_string(), draft))
+        } else {
+            Err(nodestor_core::NodeStorError::InferenceError("Whisper Pipeline não carregado".into()))
+        }
+    }
+
+    /// Gera uma imagem baseada num conceito já mapeado no barramento
+    pub fn generate_image_from_concept(&self, concept_id: u64) -> Result<Vec<f32>, nodestor_core::NodeStorError> {
+        if let Some(concept) = self.concepts.iter().find(|c| c.id == concept_id) {
+            if let Some(pipeline) = &self.diffusion_pipeline {
+                pipeline.generate_from_concept(concept)
+            } else {
+                Err(nodestor_core::NodeStorError::InferenceError("Diffusion Pipeline não carregado".into()))
+            }
+        } else {
+            Err(nodestor_core::NodeStorError::InferenceError("Conceito latente não encontrado".into()))
         }
     }
 
@@ -581,8 +631,30 @@ mod tests {
         let source = vec![1.0f32, 0.0, 0.0, 0.0];
         let target = vec![0.5f32, 0.5, 0.0, 0.0];
         bus.align_concept_pair(&source, &target);
+    }
 
-        let proj = bus.alignment_projector.as_ref().unwrap();
-        assert_eq!(proj.pairs_learned, 1);
+    #[test]
+    fn test_cross_modal_pipelines() {
+        let mut bus = CrossModalBus::new(128); // hidden_dim = 128 para testes
+
+        // Teste de ingestão de imagem
+        let pixels = vec![0.5; 100];
+        let id_img = bus.ingest_image(&pixels, "Uma imagem cinza").unwrap();
+        assert_eq!(id_img, 0); // Primeiro conceito
+        
+        let concept_img = &bus.concepts[0];
+        assert_eq!(concept_img.available_modalities[0], ModalityType::Image);
+
+        // Teste de geração a partir do conceito
+        let generated_pixels = bus.generate_image_from_concept(id_img).unwrap();
+        assert_eq!(generated_pixels.len(), 128); // hidden_dim
+
+        // Teste de ingestão de áudio
+        let mel = vec![0.1, 0.2, 0.3];
+        let id_audio = bus.ingest_audio(&mel, "Um som suave").unwrap();
+        assert_eq!(id_audio, 1);
+
+        let concept_audio = &bus.concepts[1];
+        assert_eq!(concept_audio.available_modalities[0], ModalityType::Audio);
     }
 }

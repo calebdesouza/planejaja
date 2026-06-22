@@ -1,0 +1,67 @@
+#version 450
+
+// Kernel de Matmul puramente aditivo para arquitetura BitNet b1.58
+// Layout paralelo massivo alinhado com Warp/Wavefront Size dominantes (32 ou 64).
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// A é a matriz de ativação quantizada (fp16 ou fp32).
+layout(std430, binding = 0) readonly  buffer MatA { float A[]; };
+// B é a matriz de pesos BitNet, com valores ternários compactados em base-3.
+layout(std430, binding = 1) readonly  buffer MatB { uint B_packed[]; };
+// Saída final FP32.
+layout(std430, binding = 2) buffer MatC { float C[]; };
+
+layout(push_constant) uniform Config {
+    uint M; // Batch size / sequence length
+    uint K; // Hidden dimension
+    uint N; // Output dimension
+} cfg;
+
+// Cada bloco processa 1 linha de A e N_TILE colunas de B.
+// N_TILE = gl_WorkGroupSize.x (32).
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // Índice da linha de A (m)
+    uint col = gl_GlobalInvocationID.x; // Índice da coluna de C (n)
+    
+    if (row >= cfg.M || col >= cfg.N) return;
+    
+    float acc = 0.0;
+    
+    // Iteração na dimensão interna K
+    // Otimização: A matriz B_packed tem K elementos por coluna N.
+    // Como os valores estão empacotados (20 valores ternários por u32),
+    // processamos K aos saltos de 20.
+    
+    uint k_blocks = (cfg.K + 19) / 20;
+    
+    for (uint b = 0; b < k_blocks; b++) {
+        // Índice base de B para a coluna `col` e bloco `b`
+        // Assume layout coluna-maior para B_packed: [N, k_blocks]
+        uint b_idx = col * k_blocks + b;
+        uint packed_val = B_packed[b_idx];
+        
+        // Decodificar 20 valores ternários on-the-fly sem divisões na loop interna
+        for (uint i = 0; i < 20; i++) {
+            uint k = b * 20 + i;
+            if (k >= cfg.K) break;
+            
+            float a_val = A[row * cfg.K + k];
+            
+            // Decodifica base-3
+            uint tern_val = packed_val % 3;
+            packed_val /= 3;
+            
+            // Multiplicação substituída por if/else ou mux (ADD/SUB):
+            // tern_val: 0 -> -1, 1 -> 0, 2 -> 1
+            if (tern_val == 0) {
+                acc -= a_val;
+            } else if (tern_val == 2) {
+                acc += a_val;
+            }
+            // se tern_val == 1, multiplica por 0 (fazemos nada)
+        }
+    }
+    
+    C[row * cfg.N + col] = acc;
+}

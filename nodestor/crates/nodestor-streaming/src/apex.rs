@@ -22,8 +22,65 @@ use nodestor_transport::{DirectIOReader, PlatformIOCapabilities};
 use nodestor_vulkan::{TripleBufferPipeline, MemoryPath};
 use crate::speculative::SpeculativeCache;
 use crate::burst_reader::BurstReader;
-use crate::layer_graph::{ExecutionPlan, LayerGraph, TensorGroup};
+use crate::layer_graph::{ExecutionPlan, GroupType, LayerGraph, TensorGroup};
 use tracing::{info, debug};
+use std::collections::VecDeque;
+
+/// Tarefa de background para Ambient AI.
+pub trait AmbientTask: Send + Sync {
+    fn execute(&mut self);
+}
+
+/// Detector de Ociosidade para despachar AmbientTasks.
+pub struct IdleDetector {
+    pub last_inference_fence: Option<ash::vk::Fence>,
+    pub ambient_tasks: VecDeque<Box<dyn AmbientTask>>,
+    pub idle_threshold_ms: u64,
+    pub last_activity: std::time::Instant,
+}
+
+impl IdleDetector {
+    pub fn new() -> Self {
+        Self {
+            last_inference_fence: None,
+            ambient_tasks: VecDeque::new(),
+            idle_threshold_ms: 50, // 50ms de inatividade = GPU ociosa
+            last_activity: std::time::Instant::now(),
+        }
+    }
+
+    pub fn add_task(&mut self, task: Box<dyn AmbientTask>) {
+        self.ambient_tasks.push_back(task);
+    }
+
+    pub fn tick(&mut self, apex: &ApexOrchestrator) {
+        if self.ambient_tasks.is_empty() { return; }
+
+        if let Some(_fence) = self.last_inference_fence {
+            // Emulação de status do fence atrelada aos pipelines do APEX
+            // Em prod real: device.get_fence_status(_fence)
+            let is_idle = !apex.pipeline.is_active() || self.last_activity.elapsed().as_millis() as u64 >= self.idle_threshold_ms;
+            
+            if is_idle {
+                if let Some(mut task) = self.ambient_tasks.pop_front() {
+                    task.execute();
+                }
+            }
+        } else {
+            // Se não há fence (simulação), verifica tempo decorrido
+            if self.last_activity.elapsed().as_millis() as u64 >= self.idle_threshold_ms {
+                if let Some(mut task) = self.ambient_tasks.pop_front() {
+                    task.execute();
+                }
+            }
+        }
+    }
+    
+    pub fn mark_activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
+    }
+}
+
 
 /// Rota de transporte selecionada pelo Decision Engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +135,7 @@ pub struct ApexOrchestrator {
     pub burst_reader: Option<BurstReader>,
     pub plan: Option<ExecutionPlan>,
     pub stats: ApexStats,
+    pub idle_detector: IdleDetector,
 }
 
 impl ApexOrchestrator {
@@ -103,7 +161,8 @@ impl ApexOrchestrator {
             speculative_cache, 
             burst_reader,
             plan: None,
-            stats: ApexStats::default() 
+            stats: ApexStats::default(),
+            idle_detector: IdleDetector::new(),
         })
     }
 
@@ -140,6 +199,7 @@ impl ApexOrchestrator {
             burst_reader,
             plan: Some(plan),
             stats: ApexStats::default(),
+            idle_detector: IdleDetector::new(),
         })
     }
 
@@ -321,6 +381,115 @@ impl ApexOrchestrator {
 
     pub fn is_direct_io_active(&self) -> bool { self.reader.is_direct() }
     pub fn platform(&self) -> &PlatformIOCapabilities { &self.platform }
+
+    // ─── One-Token-Lag Prefetch (Pesquisa: Roteamento PCIe Sublinear) ────────
+    //
+    // Conceito: O resultado do roteamento MoE no token `t` nos diz qual expert
+    // será ativado no token `t+1`. Enquanto a GPU processa o expert atual,
+    // este método dispara a leitura do expert seguinte em background via
+    // DirectIOReader. Quando o token `t+1` chegar, o expert já estará no
+    // SpeculativeCache → cache hit → ZERO I/O.
+    //
+    // Isso elimina o "Paradoxo da Densidade Temporal": em vez de page faults
+    // cascateados, o SSD faz prefetch com 1 token de antecedência.
+
+    /// Dispara prefetch assíncrono do bloco FFN de um expert MoE.
+    ///
+    /// `layer_idx`: índice da camada MoE (0-based)
+    /// `expert_idx`: índice do expert vencedor (resultado do routing do token atual)
+    /// `expert_block_size`: tamanho em bytes do bloco FFN de cada expert
+    /// `experts_base_offset`: offset base no arquivo onde os experts começam
+    ///
+    /// O dado é inserido no `SpeculativeCache` com chave `"moe.{layer}.expert.{idx}"`.
+    /// No próximo token, `load_tensor()` dará cache hit instantâneo.
+    pub fn prefetch_expert_async(
+        &mut self,
+        layer_idx: usize,
+        expert_idx: u32,
+        expert_block_size: usize,
+        experts_base_offset: u64,
+    ) {
+        let cache_key = format!("moe.{}.expert.{}", layer_idx, expert_idx);
+
+        // Se já está no cache, não faz nada (evita leitura duplicada)
+        if self.speculative_cache.try_get_by_name(&cache_key).is_some() {
+            tracing::trace!(
+                "APEX Prefetch: '{}' já no cache — skip",
+                cache_key
+            );
+            return;
+        }
+
+        // Calcula o offset absoluto do expert no arquivo
+        let expert_offset = experts_base_offset
+            + (expert_idx as u64) * (expert_block_size as u64);
+
+        // Lê via DirectIOReader (bypass do page cache do OS)
+        // Em produção com io_uring, isso seria uma submissão non-blocking.
+        // No modo atual, fazemos a leitura síncrona mas com Direct I/O,
+        // que é suficiente para não bloquear graças ao pipeline triple-buffer.
+        let data = self.pipeline.read_via_sim(|buf| {
+            self.reader.read_at(expert_offset, expert_block_size, buf)
+        });
+
+        match data {
+            Ok(bytes) => {
+                tracing::debug!(
+                    "APEX Prefetch: '{}' carregado ({} bytes, offset={})",
+                    cache_key, bytes.len(), expert_offset
+                );
+                self.speculative_cache.insert_by_name(&cache_key, bytes);
+                self.stats.tensors_loaded += 1;
+                // Conta como cache miss agora, mas será cache hit no próximo token
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "APEX Prefetch: falha ao carregar '{}': {}",
+                    cache_key, e
+                );
+                // Falha silenciosa — o sistema continua sem prefetch,
+                // caindo no load_tensor normal (mais lento, mas correto).
+            }
+        }
+    }
+
+    /// Versão inferida: calcula expert_block_size e base_offset a partir do ExecutionPlan.
+    /// Usa quando o plano topológico está disponível.
+    pub fn prefetch_expert_from_plan(
+        &mut self,
+        layer_idx: usize,
+        expert_idx: u32,
+    ) {
+        if let Some(ref plan) = self.plan {
+            // Estima o tamanho do bloco FFN de um expert a partir dos grupos MLP do plano.
+            // Cada grupo MLP contém gate+up+down; dividido por num_experts dá o bloco.
+            let ffn_group_size: u64 = plan.groups.iter()
+                .filter(|g| g.group_type == GroupType::Mlp)
+                .map(|g| g.total_bytes)
+                .next()
+                .unwrap_or(0);
+
+            if ffn_group_size == 0 {
+                return; // Sem info de MLP no plano — skip
+            }
+
+            // Base offset: usamos o data_offset do primeiro tensor MLP
+            let base_offset: u64 = plan.groups.iter()
+                .filter(|g| g.group_type == GroupType::Mlp)
+                .flat_map(|g| g.tensors.iter())
+                .map(|t| t.offset)
+                .next()
+                .unwrap_or(0);
+
+            // Assume divisão uniforme entre experts (Mixtral = 8, DeepSeek = 256)
+            // Para detecção real, o num_experts viria dos metadados GGUF.
+            let num_experts = 8u64; // Fallback conservador: Mixtral
+
+            let expert_size = (ffn_group_size / num_experts) as usize;
+
+            self.prefetch_expert_async(layer_idx, expert_idx, expert_size, base_offset);
+        }
+    }
 }
 
 /// Resultado de um streaming completo via APEX.

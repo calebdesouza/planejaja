@@ -525,6 +525,114 @@ impl CoberEngine {
         }
     }
 
+    /// Rejection Sampling Probabilístico (Lossless para T > 0)
+    /// Formulação: P_accept = min(1, p(x) / q(x))
+    pub fn verify_and_accept_probabilistic(
+        &mut self,
+        draft_tokens: &[u32],
+        draft_probs: &[Vec<f32>], // q(x)
+        master_probs: &[Vec<f32>], // p(x)
+    ) -> CoberRound {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let start = std::time::Instant::now();
+        let mut accepted = Vec::new();
+        let mut rejected_count = 0;
+
+        'outer: for (pos, &draft_token) in draft_tokens.iter().enumerate() {
+            if pos >= master_probs.len() || pos >= draft_probs.len() {
+                break;
+            }
+            let p = &master_probs[pos];
+            let q = &draft_probs[pos];
+            
+            let draft_token_usize = draft_token as usize;
+            let p_val = if draft_token_usize < p.len() { p[draft_token_usize] } else { 0.0 };
+            let q_val = if draft_token_usize < q.len() { q[draft_token_usize] } else { 1.0 };
+            
+            // P_accept = min(1, p(x) / q(x))
+            let p_accept = if q_val > 0.0 { (p_val / q_val).min(1.0) } else { 1.0 };
+            
+            let r: f32 = rng.gen();
+            
+            if r < p_accept {
+                // Aceito
+                accepted.push(draft_token);
+                if let Some(engine) = &mut self.candidate_engine {
+                    engine.ingest_token(draft_token);
+                }
+            } else {
+                // Rejeitado - Amostrar da distribuição residual
+                // P_resample(x) = max(0, p(x) - q(x)) / sum(max(0, p(x') - q(x')))
+                rejected_count += 1;
+                
+                let mut resample_probs = vec![0.0; p.len()];
+                let mut sum = 0.0;
+                for i in 0..p.len() {
+                    let diff = p[i] - if i < q.len() { q[i] } else { 0.0 };
+                    let val = diff.max(0.0);
+                    resample_probs[i] = val;
+                    sum += val;
+                }
+                
+                let mut resampled_token = 0;
+                if sum > 0.0 {
+                    let mut r_resample: f32 = rng.gen::<f32>() * sum;
+                    for (i, &prob) in resample_probs.iter().enumerate() {
+                        r_resample -= prob;
+                        if r_resample <= 0.0 {
+                            resampled_token = i as u32;
+                            break;
+                        }
+                    }
+                } else {
+                    // Fallback se max(0, p-q) for tudo zero
+                    resampled_token = p.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                }
+                
+                accepted.push(resampled_token);
+                if let Some(engine) = &mut self.candidate_engine {
+                    engine.ingest_token(resampled_token);
+                }
+                break 'outer;
+            }
+        }
+
+        let verify_latency = start.elapsed().as_micros() as u64;
+        let acceptance_rate = if draft_tokens.is_empty() { 0.0 }
+            else { (accepted.len() - rejected_count) as f32 / draft_tokens.len() as f32 };
+
+        self.stats.total_rounds += 1;
+        self.stats.total_accepted_tokens += accepted.len() as u64;
+
+        CoberRound {
+            accepted_tokens: accepted,
+            rejected_count,
+            acceptance_rate,
+            draft_latency_us: 0,
+            verify_latency_us: verify_latency,
+        }
+    }
+
+    /// Tree Verification com RRSw (Recursive Rejection Sampling without Replacement)
+    pub fn verify_tree_rrsw(
+        &mut self,
+        draft_tree: &[(u32, Vec<u32>)], // (nó, filhos)
+        master_probs: &[Vec<f32>],
+    ) -> CoberRound {
+        // Implementação simplificada de RRSw delegando para validação linear (por enquanto)
+        let mut flat_draft = Vec::new();
+        for (node, _) in draft_tree {
+            flat_draft.push(*node);
+        }
+        let dummy_q = vec![vec![0.1; master_probs.get(0).map(|v| v.len()).unwrap_or(1)]; flat_draft.len()];
+        self.verify_and_accept_probabilistic(&flat_draft, &dummy_q, master_probs)
+    }
+
     /// Ajusta K dinamicamente baseado na taxa de aceitação recente.
     ///
     /// Se aceitação > 70% → aumenta K (aproveitamos mais o draft)
@@ -801,6 +909,7 @@ impl CoberEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vram_budget::InferenceMode;
 
     fn make_budget_dense(vram_mb: u64) -> VramBudget {
         VramBudget::new(

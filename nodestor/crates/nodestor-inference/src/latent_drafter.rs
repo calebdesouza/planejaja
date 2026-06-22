@@ -2,53 +2,49 @@ use nodestor_core::NodeStorError;
 use nodestor_vulkan::VulkanEngine;
 use nodestor_vulkan::GpuBuffer;
 
+use crate::hamiltonian_dynamics::HamiltonianLatentDynamics;
+use crate::hnsw_index::HnswIndex;
+use crate::lsh_buckets::LshVocabIndex;
+use std::sync::Arc;
+
 /// Motor do Funil Especulativo Híbrido.
-/// Responsável por gerar blocos latentes (EAGLE-2), peneirar com cosseno e projetar.
+/// Responsável por gerar blocos latentes (Hamiltoniano), peneirar com cosseno e projetar.
 pub struct LatentDrafter {
-    pub eagle2_weights: Vec<f32>, // Uma camada linear [H x H] simulada
     pub hidden_dim: usize,
     pub cosine_threshold: f32, // τ_min para a peneira
+    pub dynamics: HamiltonianLatentDynamics,
+    pub hnsw_index: Option<Arc<HnswIndex>>,
+    pub lsh_index: Option<Arc<LshVocabIndex>>,
 }
 
 impl LatentDrafter {
     pub fn new(hidden_dim: usize, cosine_threshold: f32) -> Self {
-        // Inicializa com pesos identity + ruído para testes empíricos
-        let mut weights = vec![0.0; hidden_dim * hidden_dim];
-        for i in 0..hidden_dim {
-            weights[i * hidden_dim + i] = 1.0; // Identidade base
-        }
         Self {
-            eagle2_weights: weights,
             hidden_dim,
             cosine_threshold,
+            // Hamiltoniano: dt=0.05, budget=1.0. Em produção afinaríamos esses valores
+            dynamics: HamiltonianLatentDynamics::new(hidden_dim, 0.05, 1.0),
+            hnsw_index: None,
+            lsh_index: None,
         }
     }
 
-    /// Estágio 1: Gera K hidden states consecutivos no espaço latente
+    /// Adiciona os índices HNSW e LSH para projeção O(1) da LM Head
+    pub fn with_indices(mut self, hnsw: Arc<HnswIndex>, lsh: Arc<LshVocabIndex>) -> Self {
+        self.hnsw_index = Some(hnsw);
+        self.lsh_index = Some(lsh);
+        self
+    }
+
+    /// Estágio 1: Gera K hidden states consecutivos no espaço latente via Hamiltoniano
     pub fn draft_latent_block(&self, seed_hidden: &[f32], max_depth: usize) -> Vec<Vec<f32>> {
-        let mut drafts = Vec::with_capacity(max_depth);
-        let mut current_state = seed_hidden.to_vec();
-
-        // Autoregressivo no espaço latente
-        for _ in 0..max_depth {
-            let next_state = self.eagle2_forward(&current_state);
-            drafts.push(next_state.clone());
-            current_state = next_state;
-        }
-
+        // Inicializa o momentum semântico (p_0)
+        let seed_p = self.dynamics.init_momentum(seed_hidden, 0.01);
+        
+        // Evolui usando Störmer-Verlet (Leapfrog), sem acúmulo de erro exponencial (zero drift)
+        let (drafts, _drift, _ok) = self.dynamics.evolve(seed_hidden, &seed_p, max_depth);
+        
         drafts
-    }
-
-    /// Executa a camada linear EAGLE-2 (Matmul CPU simplificado para demonstração/testes)
-    /// Em produção, rodaria no Vulkan ou seria offloaded se a CPU for gargalo,
-    /// mas o custo O(H^2) é muito baixo comparado ao O(P) do forward master.
-    fn eagle2_forward(&self, input: &[f32]) -> Vec<f32> {
-        let mut output = vec![0.0; self.hidden_dim];
-        // Adiciona um pequeno "drift" pra não ser idêntico (simula predição imperfeita)
-        for i in 0..self.hidden_dim {
-            output[i] = input[i] * 0.995 + (i as f32 * 0.0005); // Drift mais suave E muda o ângulo progressivamente
-        }
-        output
     }
 
     /// Estágio 2: Peneira cossenóide
@@ -83,6 +79,25 @@ impl LatentDrafter {
             return Ok(Vec::new());
         }
 
+        // Fase 3 Quântico-Latente: O(1) LM Head Projection
+        if let (Some(hnsw), Some(lsh)) = (&self.hnsw_index, &self.lsh_index) {
+            let mut tokens = Vec::with_capacity(accepted_states.len());
+            for state in accepted_states {
+                // Lookup O(1) via LSH para achar o sub-espaço (bucket) semântico
+                let candidates: Vec<usize> = lsh.lookup(state);
+                
+                // Em produção real, calcularíamos o argmax explícito só nos `candidates` (ex: 30-80 dot products vs 128k).
+                // Mas aqui usamos a topologia HNSW em O(log V) para demonstrar a busca indexada pura.
+                let top1: Vec<(usize, f32)> = hnsw.search(state, 1);
+                if let Some(&(tok, _)) = top1.first() {
+                    tokens.push(tok as u32);
+                } else {
+                    tokens.push(0); // Fallback
+                }
+            }
+            return Ok(tokens);
+        }
+
         let k_filtered = accepted_states.len();
         
         // Achata os vetores
@@ -100,16 +115,12 @@ impl LatentDrafter {
         };
         let batch_buf = engine.upload(state_bytes)?;
         
-        // Buffer de saída para os logits do batch [K_filtered x V]
-        let output_size = k_filtered * vocab_size * 4;
-        let output_buf = engine.alloc_buffer(output_size.max(4))?;
-
         // Executa Batch Matmul [K x H] x [H x V] -> [K x V]
-        engine.matmul(&batch_buf, lm_head_buffer, k_filtered as u32, self.hidden_dim as u32, vocab_size as u32)
+        let computed_buf = engine.matmul(&batch_buf, lm_head_buffer, k_filtered as u32, self.hidden_dim as u32, vocab_size as u32)
             .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
 
         // Download dos logits
-        let flat_logits = engine.download_f32(&output_buf)?;
+        let flat_logits = engine.download_f32(&computed_buf)?;
         
         // Argmax para cada token no batch
         let mut tokens = Vec::with_capacity(k_filtered);
@@ -147,5 +158,29 @@ impl LatentDrafter {
         } else {
             dot / (norm_a.sqrt() * norm_b.sqrt())
         }
+    }
+
+    /// PRM (Process Reward Model): Avalia um estado latente para o MCTS
+    /// Retorna uma probabilidade/recompensa entre 0 e 1 de que o estado leva à solução correta.
+    /// Em vez de chamar a rede PRM inteira, no NodeStor avaliamos a "surpresa" (entropia)
+    /// ou a estabilidade do estado no índice HNSW (clustering semântico).
+    pub fn evaluate_state(&self, state: &[f32]) -> f32 {
+        if let Some(hnsw) = &self.hnsw_index {
+            // Se o estado está muito próximo do centroide de um cluster forte, recompensa alta
+            let top_k: Vec<(usize, f32)> = hnsw.search(state, 5);
+            let mut avg_dist = 0.0;
+            for &(_, dist) in &top_k {
+                avg_dist += dist;
+            }
+            if !top_k.is_empty() {
+                avg_dist /= top_k.len() as f32;
+                // Distância menor -> similaridade maior -> recompensa maior
+                // Assume que dist é distância L2. Recompensa cai exponencialmente
+                return (- (avg_dist as f32)).exp();
+            }
+        }
+        
+        // Fallback: recompensa base neutra/otimista
+        0.5
     }
 }

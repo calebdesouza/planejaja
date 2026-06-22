@@ -52,6 +52,11 @@ pub enum TensorOp {
         hidden_size: u32,
         eps: f32,
     },
+    /// Fused LayerNorm + GELU: executa norm e ativação num único kernel GPU
+    FusedLayerNormGelu {
+        hidden_size: u32,
+        eps: f32,
+    },
     /// RMS Normalization: `x → x / rms(x) × γ` — Llama/Qwen/Mistral
     RmsNorm {
         hidden_size: u32,
@@ -99,6 +104,23 @@ pub enum TensorOp {
     MoERouting {
         num_experts: u32,
         top_k: u32,
+        /// Se true, força hard routing k=1 (Esparsidade Extrema).
+        /// Ativa automaticamente quando VRAM ≤ 12GB ou modelo > 100B params.
+        /// Elimina o "Paradoxo da Densidade Temporal" (cascata de page faults)
+        /// e permite prefetch preditivo One-Token-Lag via APEX.
+        hard_k1: bool,
+    },
+    /// Matmul com quantização ternária (BitNet b1.58). Usa ADD/SUB.
+    MatmulTernary {
+        m: u32,
+        k: u32,
+        n: u32,
+    },
+    /// Mamba 2 Selective Scan (Atenção Linear O(N))
+    MambaSelectiveScan {
+        seq_len: u32,
+        d_inner: u32,
+        d_state: u32,
     },
 }
 
@@ -109,7 +131,10 @@ impl TensorOp {
             TensorOp::EmbeddingLookup { .. } => "EmbeddingLookup",
             TensorOp::Matmul { quantized: false, .. } => "Matmul",
             TensorOp::Matmul { quantized: true, .. }  => "MatmulQ4",
+            TensorOp::MatmulTernary { .. } => "MatmulTernary",
+            TensorOp::MambaSelectiveScan { .. } => "MambaSelectiveScan",
             TensorOp::LayerNorm { .. }    => "LayerNorm",
+            TensorOp::FusedLayerNormGelu { .. } => "FusedLayerNormGelu",
             TensorOp::RmsNorm { .. }      => "RmsNorm",
             TensorOp::Activation { kind: ActivationKind::SiLU, .. } => "SiLU",
             TensorOp::Activation { kind: ActivationKind::GELU, .. } => "GELU",
@@ -257,6 +282,26 @@ impl OperatorRegistry {
                     }
                     tracing::trace!("Matmul: {}×{}×{} quantized={}", m, k, n, quantized);
                 }
+                TensorOp::MatmulTernary { m, k, n } => {
+                    if let (Some(a), Some(b_packed)) =
+                        (buffers.get("hidden"), buffers.get("weight_ternary"))
+                    {
+                        let _out = self.engine.matmul_ternary(a, b_packed, *m, *k, *n)?;
+                        tracing::trace!("MatmulTernary: {}×{}×{} — dispatch GPU OK", m, k, n);
+                    } else {
+                        tracing::warn!("MatmulTernary: missing buffers (hidden or weight_ternary)");
+                    }
+                }
+                TensorOp::MambaSelectiveScan { seq_len, d_inner, d_state } => {
+                    if let (Some(u), Some(delta), Some(a), Some(b), Some(c), Some(state)) =
+                        (buffers.get("mamba_u"), buffers.get("mamba_delta"), buffers.get("mamba_A"), buffers.get("mamba_B"), buffers.get("mamba_C"), buffers.get("mamba_state"))
+                    {
+                        let _out = self.engine.mamba_selective_scan(u, delta, a, b, c, state, *seq_len, *d_inner, *d_state)?;
+                        tracing::trace!("MambaSelectiveScan: {} seq_len — dispatch GPU OK", seq_len);
+                    } else {
+                        tracing::warn!("MambaSelectiveScan: missing required buffers");
+                    }
+                }
                 TensorOp::RmsNorm { hidden_size, eps } => {
                     if let (Some(input), Some(weight)) =
                         (buffers.get("hidden"), buffers.get("norm_weight"))
@@ -274,6 +319,16 @@ impl OperatorRegistry {
                         );
                     }
                     tracing::trace!("LayerNorm: dim={} eps={}", hidden_size, eps);
+                }
+                TensorOp::FusedLayerNormGelu { hidden_size, eps } => {
+                    if let (Some(input), Some(gamma), Some(beta)) =
+                        (buffers.get("hidden"), buffers.get("gamma"), buffers.get("beta"))
+                    {
+                        let _out = self.engine.fused_layernorm_gelu(input, gamma, beta, *hidden_size, *eps)?;
+                        tracing::trace!("FusedLayerNormGelu: dim={} eps={} — dispatch GPU OK", hidden_size, eps);
+                    } else {
+                        tracing::warn!("FusedLayerNormGelu: missing buffers (hidden, gamma or beta)");
+                    }
                 }
                 TensorOp::Activation { kind, elements } => {
                     match kind {
@@ -352,7 +407,8 @@ impl OperatorRegistry {
                     }
                     tracing::trace!("CosineSim: {} candidates dim={}", num_candidates, dim);
                 }
-                TensorOp::MoERouting { num_experts, top_k } => {
+                TensorOp::MoERouting { num_experts, top_k, hard_k1 } => {
+                    let routing_mode: u32 = if *hard_k1 { 1 } else { 0 };
                     if let (Some(input_x), Some(gate_weights)) =
                         (buffers.get("current_x"), buffers.get("gate_weights"))
                     {
@@ -375,9 +431,10 @@ impl OperatorRegistry {
                             current_hidden_size,
                             *num_experts,
                             *top_k,
+                            routing_mode,
                         ).map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
 
-                        tracing::trace!("MoERouting: {} experts, top_k={} — dispatch OK", num_experts, top_k);
+                        tracing::trace!("MoERouting: {} experts, top_k={}, hard_k1={} — dispatch OK", num_experts, top_k, hard_k1);
                     } else {
                         tracing::warn!("MoERouting: buffers 'current_x' ou 'gate_weights' não encontrados no contexto");
                     }
@@ -419,6 +476,7 @@ impl OperatorRegistry {
                 TensorOp::EmbeddingLookup { hidden_dim, .. } => return *hidden_dim,
                 TensorOp::RmsNorm { hidden_size, .. } => return *hidden_size,
                 TensorOp::LayerNorm { hidden_size, .. } => return *hidden_size,
+                TensorOp::FusedLayerNormGelu { hidden_size, .. } => return *hidden_size,
                 _ => {}
             }
         }

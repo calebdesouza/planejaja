@@ -41,7 +41,7 @@ async fn main() -> Result<(), NodeStorError> {
     let t_gen = Instant::now();
 
     // 4. Primeiro Forward Pass real da história do projeto
-    let (text, stats) = pipeline.generate(prompt, tokens_to_generate).await.unwrap();
+    let (text, stats) = pipeline.generate(prompt, tokens_to_generate, None).await.unwrap();
 
     let total_time = t_gen.elapsed().as_millis();
     println!("╔══════════════════════════════════════════════════════════════════════╗");

@@ -26,6 +26,10 @@ pub enum ShaderKind {
     MatmulQ4,
     /// Cooperative Matrix / Tensor Cores
     MatmulTensorCore,
+    /// BitNet b1.58 Matmul (Ternary)
+    MatmulTernary,
+    /// Mamba Selective Scan (Atenção Linear)
+    MambaSelectiveScan,
     /// Forward Pass
     RmsNorm,
     RoPe,
@@ -45,6 +49,7 @@ pub enum ShaderKind {
     Mul,
     TurboQuantAttention,
     MoERouting,
+    FusedLayerNormGelu,
 }
 
 impl ShaderKind {
@@ -60,6 +65,8 @@ impl ShaderKind {
             Self::GDeflate => "gdeflate_decompress",
             Self::MatmulQ4 => "matmul_q4",
             Self::MatmulTensorCore => "matmul_tensorcore",
+            Self::MatmulTernary => "matmul_ternary",
+            Self::MambaSelectiveScan => "mamba_selective_scan",
             Self::RmsNorm => "rmsnorm",
             Self::RoPe => "rope",
             Self::SiLu => "silu",
@@ -76,6 +83,7 @@ impl ShaderKind {
             Self::Mul => "mul",
             Self::TurboQuantAttention => "turbo_quant_attention",
             Self::MoERouting => "moe_routing",
+            Self::FusedLayerNormGelu => "fused_layernorm_gelu",
         }
     }
 
@@ -91,6 +99,8 @@ impl ShaderKind {
             ShaderKind::GDeflate,
             ShaderKind::MatmulQ4,
             ShaderKind::MatmulTensorCore,
+            ShaderKind::MatmulTernary,
+            ShaderKind::MambaSelectiveScan,
             ShaderKind::RmsNorm,
             ShaderKind::RoPe,
             ShaderKind::SiLu,
@@ -105,7 +115,7 @@ impl ShaderKind {
             ShaderKind::Mul,
             ShaderKind::TurboQuantAttention,
             ShaderKind::MoERouting,
-            // CoopMatrix e TreeAttention NÃO estão em `all()` — carregados separadamente via load_shader_by_kind devido a extensões não suportadas por Naga
+            // CoopMatrix, TreeAttention e FusedLayerNormGelu NÃO estão em `all()` — carregados separadamente
         ]
     }
 }
@@ -162,6 +172,8 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::GDeflate => include_bytes!(concat!(env!("OUT_DIR"), "/gdeflate_decompress.spv")).to_vec(),
         ShaderKind::MatmulQ4 => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_q4.spv")).to_vec(),
         ShaderKind::MatmulTensorCore => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_tensorcore.spv")).to_vec(),
+        ShaderKind::MatmulTernary => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_ternary.spv")).to_vec(),
+        ShaderKind::MambaSelectiveScan => include_bytes!(concat!(env!("OUT_DIR"), "/mamba_selective_scan.spv")).to_vec(),
         ShaderKind::RmsNorm => include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv")).to_vec(),
         ShaderKind::RoPe => include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")).to_vec(),
         ShaderKind::SiLu => include_bytes!(concat!(env!("OUT_DIR"), "/silu.spv")).to_vec(),
@@ -174,7 +186,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::OptStepAdam => include_bytes!(concat!(env!("OUT_DIR"), "/opt_step_adam.spv")).to_vec(),
         ShaderKind::Add => include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")).to_vec(),
         ShaderKind::Mul => include_bytes!(concat!(env!("OUT_DIR"), "/mul.spv")).to_vec(),
-        ShaderKind::TurboQuantAttention | ShaderKind::MoERouting | ShaderKind::CoopMatrix | ShaderKind::TreeAttention => {
+        ShaderKind::TurboQuantAttention | ShaderKind::MoERouting | ShaderKind::CoopMatrix | ShaderKind::TreeAttention | ShaderKind::FusedLayerNormGelu => {
             // Shaders compilados condicionalmente: se o arquivo .spv não existir
             // (hardware/driver não suporta ou precisa de glslc), retorna fallback vazio
             return Err(VulkanError::InvalidShader(
@@ -209,7 +221,7 @@ pub fn load_shader_by_kind(kind: ShaderKind) -> Option<Vec<u8>> {
     // Para CoopMatrix/TreeAttention: verifica se o .spv foi gerado pelo build.rs
     // (depende de glslc/glslangValidator suportarem GL_KHR_cooperative_matrix ou outras extensões)
     match kind {
-        ShaderKind::CoopMatrix | ShaderKind::TreeAttention | ShaderKind::TurboQuantAttention | ShaderKind::MoERouting => {
+        ShaderKind::CoopMatrix | ShaderKind::TreeAttention | ShaderKind::TurboQuantAttention | ShaderKind::MoERouting | ShaderKind::FusedLayerNormGelu => {
             // Em builds onde o shader foi compilado com sucesso:
             // return Some(spv.to_vec());
             //

@@ -1,0 +1,101 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Constants {
+    uint polynomial;
+    uint seed;
+    uint length;
+    uint degree;
+    float scale;
+    float bias;
+    uint skip_n; // Number of items each thread generates (chunk size)
+} pc;
+
+layout(std430, set = 0, binding = 0) buffer OutputBuffer {
+    float data[];
+};
+
+// Matmul in GF(2). Matrix is represented as an array of uint rows.
+void gf2_mat_mul(in uint a[32], in uint b[32], out uint c[32], uint degree) {
+    for (uint i = 0; i < degree; i++) {
+        uint row = 0;
+        for (uint j = 0; j < degree; j++) {
+            if (((a[i] >> j) & 1u) == 1u) {
+                row ^= b[j];
+            }
+        }
+        c[i] = row;
+    }
+}
+
+// Mat-vec multiply in GF(2)
+uint gf2_mat_vec(in uint m[32], uint v, uint degree) {
+    uint result = 0;
+    for (uint i = 0; i < degree; i++) {
+        uint pop = bitCount(m[i] & v);
+        uint bit = pop & 1u;
+        result |= (bit << i);
+    }
+    return result;
+}
+
+// Skip-ahead algorithm
+uint skip_ahead(uint initial_seed, uint poly, uint degree, uint n) {
+    if (degree == 0 || degree >= 32) return initial_seed;
+    
+    uint mask = (1u << degree) - 1u;
+    
+    uint base[32];
+    for (uint i = 0; i < degree - 1; i++) {
+        base[i] = 1u << (i + 1);
+    }
+    base[degree - 1] = poly & mask;
+    
+    uint result[32];
+    for (uint i = 0; i < degree; i++) {
+        result[i] = 1u << i;
+    }
+    
+    uint exp = n;
+    uint temp[32];
+    
+    while (exp > 0) {
+        if ((exp & 1u) == 1u) {
+            gf2_mat_mul(result, base, temp, degree);
+            for(uint i=0; i<degree; i++) result[i] = temp[i];
+        }
+        gf2_mat_mul(base, base, temp, degree);
+        for(uint i=0; i<degree; i++) base[i] = temp[i];
+        exp >>= 1;
+    }
+    
+    return gf2_mat_vec(result, initial_seed, degree) & mask;
+}
+
+float lfsr_step(inout uint state, uint poly, uint degree) {
+    uint pop = bitCount(state & poly);
+    uint feedback = pop & 1u;
+    uint mask = (1u << degree) - 1u;
+    uint shift_amt = (degree > 0) ? (degree - 1) : 0;
+    state = ((state >> 1) | (feedback << shift_amt)) & mask;
+    return float(state & mask) / float(mask + 1u);
+}
+
+void main() {
+    uint thread_id = gl_GlobalInvocationID.x;
+    uint start_idx = thread_id * pc.skip_n;
+    
+    if (start_idx >= pc.length) {
+        return;
+    }
+    
+    // Skip-ahead to this thread's starting state
+    uint state = skip_ahead(pc.seed, pc.polynomial, pc.degree, start_idx);
+    
+    uint end_idx = min(start_idx + pc.skip_n, pc.length);
+    for (uint i = start_idx; i < end_idx; i++) {
+        float raw = lfsr_step(state, pc.polynomial, pc.degree);
+        data[i] = raw * pc.scale + pc.bias;
+    }
+}

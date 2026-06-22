@@ -11,3 +11,5 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 prometheus = { workspace = true }
+toml = "1.1.2"
+dirs = { workspace = true }

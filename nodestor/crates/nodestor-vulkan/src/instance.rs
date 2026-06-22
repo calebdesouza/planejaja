@@ -100,6 +100,15 @@ impl VulkanContext {
         Ok(buffer.as_f32_slice().to_vec())
     }
 
+    /// Cria um contexto de simulação FORÇADA (CPU/RAM puro), sem jamais tocar a
+    /// FFI do Vulkan. Diferente de `new(None)`, que TENTA inicializar Vulkan real
+    /// primeiro — e em máquinas com loader Vulkan quebrado/headless isso pode causar
+    /// access-violation (exceção de hardware não-capturável). Use isto para o caminho
+    /// de simulação garantido (testes, CI, benchmarks, máquinas sem GPU).
+    pub fn simulation() -> Self {
+        Self::simulation_context()
+    }
+
     fn simulation_context() -> Self {
         Self {
             entry: None,

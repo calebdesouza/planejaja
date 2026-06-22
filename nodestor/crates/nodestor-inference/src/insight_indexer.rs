@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::sync::{Arc, Mutex};
+use nodestor_streaming::apex::AmbientTask;
 
 /// NodeStor COBER v2 - Subsistema 10: Indexador de Insights
 /// (Grafo de Sinapses Persistentes)
@@ -353,6 +355,23 @@ impl InsightIndexer {
         if denom < 1e-10 { 0.0 } else { dot / denom }
     }
 }
+
+/// Tarefa Ambient AI para poda do grafo de sinapses sem bloquear a inferência principal.
+pub struct AmbientPruneTask {
+    pub indexer: Arc<Mutex<InsightIndexer>>,
+    pub decay_factor: f32,
+}
+
+impl AmbientTask for AmbientPruneTask {
+    fn execute(&mut self) {
+        if let Ok(mut ix) = self.indexer.lock() {
+            tracing::info!("[Ambient AI] Executando poda Hebbiana em background...");
+            ix.hebbian_decay(self.decay_factor);
+            ix.hebbian_prune();
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

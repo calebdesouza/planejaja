@@ -1,4 +1,5 @@
 mod explorer;
+mod commands;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -68,9 +69,9 @@ enum Commands {
     },
     /// Inicia o motor NodeStor (Daemon) e a Interface
     Start {
-        /// Caminho do modelo
+        /// Caminho do modelo (opcional se houver modelo em ~/.nodestor/models)
         #[arg(long, short)]
-        model: String,
+        model: Option<String>,
     },
     /// Re-acopla a interface a um motor já rodando
     Attach,
@@ -92,6 +93,14 @@ enum Commands {
         /// Formato de compressão (ex: zstd, gdeflate)
         #[arg(long, default_value = "gdeflate")]
         format: String,
+    },
+    /// Baixa um modelo do HuggingFace Hub
+    Pull {
+        /// ID do modelo (ex: TheBloke/Llama-2-7B-GGUF)
+        model_id: String,
+        /// Nome do arquivo ou quantização (ex: llama-2-7b.Q4_K_M.gguf)
+        #[arg(long, short)]
+        filename: String,
     },
 }
 
@@ -119,7 +128,7 @@ async fn main() -> Result<()> {
             Commands::Calibrate => cmd_calibrate(),
             Commands::Chat { server } => cmd_chat(&server).await,
             Commands::Latency { model } => cmd_latency(model).await,
-            Commands::Start { model } => cmd_start(&model, cli.quiet).await,
+            Commands::Start { model } => cmd_start(model.as_deref(), cli.quiet).await,
             Commands::Attach => cmd_attach().await,
             Commands::Search { query, k } => cmd_search(&query, k).await,
             Commands::Connect => {
@@ -127,6 +136,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
+            Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
         },
         None => {
             if cli.quiet {
@@ -169,7 +179,7 @@ async fn cmd_interactive() -> Result<()> {
         match selection {
             Some(0) => {
                 if let Some(path) = explorer::interactive_model_picker()? {
-                    cmd_start(&path, false).await?;
+                    cmd_start(Some(&path), false).await?;
                 }
             },
             Some(1) => cmd_attach().await?,
@@ -191,8 +201,9 @@ async fn cmd_interactive() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_start(model_path: &str, quiet: bool) -> Result<()> {
+async fn cmd_start(model_path: Option<&str>, quiet: bool) -> Result<()> {
     use std::process::{Command, Stdio};
+    use std::path::PathBuf;
 
     println!("\n🚀 Iniciando NodeStor Engine (Muscle)...");
 
@@ -202,10 +213,37 @@ async fn cmd_start(model_path: &str, quiet: bool) -> Result<()> {
         return Ok(());
     }
 
+    let actual_model = if let Some(m) = model_path {
+        m.to_string()
+    } else {
+        // Tenta achar em ~/.nodestor/models
+        let mut model_dir = dirs::home_dir().unwrap_or_default();
+        model_dir.push(".nodestor");
+        model_dir.push("models");
+        
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(&model_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
+                    found = Some(path.to_string_lossy().to_string());
+                    break;
+                }
+            }
+        }
+        
+        if let Some(f) = found {
+            println!("📂 Modelo auto-detectado: {}", f);
+            f
+        } else {
+            return Err(anyhow::anyhow!("Nenhum modelo especificado e nenhum encontrado em ~/.nodestor/models/. Use --model <path> ou faça nodestor pull."));
+        }
+    };
+
     // Inicia o servidor em modo desvinculado
     let child = Command::new("nodestor-server")
         .arg("--model")
-        .arg(model_path)
+        .arg(&actual_model)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -224,8 +262,9 @@ async fn cmd_start(model_path: &str, quiet: bool) -> Result<()> {
             println!("⏳ Aguardando warm-up dos kernels...");
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            println!("🔗 Acoplando interface...");
-            cmd_chat("http://localhost:8080").await?;
+            let sys_config = nodestor_core::config::NodeStorConfig::load_or_default();
+            println!("🔗 Acoplando interface (Porta {})...", sys_config.server.port);
+            cmd_chat(&format!("http://localhost:{}", sys_config.server.port)).await?;
         }
         Err(e) => {
             println!("❌ Erro ao disparar o motor: {}", e);

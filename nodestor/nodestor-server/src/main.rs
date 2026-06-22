@@ -240,8 +240,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/mcp", post(mcp::mcp_handler))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", args.port);
+    let sys_config = nodestor_core::config::NodeStorConfig::load_or_default();
+    let port = if args.port != 8080 { args.port } else { sys_config.server.port };
+
+    let addr = format!("0.0.0.0:{}", port);
     info!("NodeStor Server iniciada em http://{} 🛰️", addr);
+
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -254,7 +258,7 @@ async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InferenceRequest>,
 ) -> Json<Value> {
-    match state.pipeline.generate(&req.prompt, req.max_tokens).await {
+    match state.pipeline.generate(&req.prompt, req.max_tokens, None).await {
         Ok((text, stats)) => Json(json!({
             "text": text,
             "generated_tokens": stats.generated_tokens,
@@ -316,7 +320,7 @@ async fn openai_chat_completions(
 
         Sse::new(sse_stream).into_response()
     } else {
-        match state.pipeline.generate(prompt, max_tokens).await {
+        match state.pipeline.generate(prompt, max_tokens, None).await {
             Ok((text, _)) => Json(OpenAiResponse {
                 id: format!("ns-{}", Uuid::new_v4()),
                 object: "chat.completion".into(),
@@ -402,7 +406,7 @@ async fn anthropic_messages(
 
         Sse::new(sse_stream).into_response()
     } else {
-        match state.pipeline.generate(prompt, req.max_tokens).await {
+        match state.pipeline.generate(prompt, req.max_tokens, None).await {
             Ok((text, stats)) => Json(AnthropicResponse {
                 id,
                 msg_type: "message".into(),
@@ -452,7 +456,7 @@ async fn ollama_chat(
             .body(axum::body::Body::from_stream(json_stream))
             .unwrap()
     } else {
-        match state.pipeline.generate(prompt, 256).await {
+        match state.pipeline.generate(prompt, 256, None).await {
             Ok((text, _)) => Json(OllamaResponse {
                 model,
                 created_at: "2024-03-23T00:00:00Z".into(),

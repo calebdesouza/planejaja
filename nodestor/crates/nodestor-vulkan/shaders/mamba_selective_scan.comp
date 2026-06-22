@@ -1,0 +1,82 @@
+#version 450
+
+// Kernel de Selective Scan para a arquitetura Mamba (Atenção Linear)
+// Otimizado para decodificação Causal em SSD via Vulkan.
+// Em vez de complexidade O(N^2) da atenção tradicional, Mamba usa
+// um modelo de espaço de estados (SSM) com complexidade O(N),
+// acumulando estado ao longo da sequência.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// u: Entrada do Mamba
+layout(std430, binding = 0) readonly buffer InputU { float u[]; };
+// delta: Passo de tempo dinâmico
+layout(std430, binding = 1) readonly buffer InputDelta { float delta[]; };
+// A: Parâmetro do estado dinâmico (transição)
+layout(std430, binding = 2) readonly buffer ParamA { float A[]; };
+// B: Parâmetro de entrada
+layout(std430, binding = 3) readonly buffer ParamB { float B[]; };
+// C: Parâmetro de saída
+layout(std430, binding = 4) readonly buffer ParamC { float C[]; };
+// state: Estado atual do SSM (lido e escrito) [Batch, D, N]
+layout(std430, binding = 5) buffer StateH { float state[]; };
+// y: Saída do bloco
+layout(std430, binding = 6) buffer OutputY { float y[]; };
+
+layout(push_constant) uniform Config {
+    uint seq_len;     // Tamanho da sequência atual (geralmente 1 para decode causal)
+    uint d_inner;     // Dimensão interna (D)
+    uint d_state;     // Dimensão do estado (N)
+} cfg;
+
+// Este kernel foi escrito com foco em inferência (batch=1, seq_len=1).
+// Em decode, a operação de scan não requer prefix-sum paralelo extenso,
+// pois calculamos um token por vez baseados no estado preservado.
+
+void main() {
+    uint d_idx = gl_GlobalInvocationID.x;
+    
+    if (d_idx >= cfg.d_inner) return;
+
+    // Em inferência (seq_len = 1), o loop temporal roda apenas uma vez
+    for (uint t = 0; t < cfg.seq_len; t++) {
+        // Leitura de delta e u
+        float current_delta = delta[t * cfg.d_inner + d_idx];
+        float current_u     = u[t * cfg.d_inner + d_idx];
+        
+        float out_val = 0.0;
+        
+        // Atualização do estado N
+        for (uint n = 0; n < cfg.d_state; n++) {
+            // Endereços (simplificados para 1D sem batch size em mind)
+            uint state_idx = d_idx * cfg.d_state + n;
+            uint a_idx     = d_idx * cfg.d_state + n;
+            uint b_idx     = t * cfg.d_state + n; // Se B for dependente do tempo
+            uint c_idx     = t * cfg.d_state + n; // Se C for dependente do tempo
+            
+            float a_val = A[a_idx];
+            float b_val = B[b_idx];
+            float c_val = C[c_idx];
+            
+            // Discretização do SSM via ZOH (Zero-Order Hold) com exp aproximada:
+            // delta_A = exp(delta * A) ≈ 1 + delta * A
+            // delta_B = delta * B
+            
+            float delta_A = exp(current_delta * a_val);
+            float delta_B = current_delta * b_val;
+            
+            // h_t = delta_A * h_{t-1} + delta_B * x_t
+            float h_prev = state[state_idx];
+            float h_curr = delta_A * h_prev + delta_B * current_u;
+            
+            // Atualiza estado global
+            state[state_idx] = h_curr;
+            
+            // Acumula na saída: y_t = C * h_t
+            out_val += h_curr * c_val;
+        }
+        
+        // Escreve saída
+        y[t * cfg.d_inner + d_idx] = out_val;
+    }
+}

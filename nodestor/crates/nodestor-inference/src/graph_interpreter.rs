@@ -348,7 +348,7 @@ impl GraphInterpreter {
             ops.push(TensorOp::RmsNorm { hidden_size: hidden_dim, eps: 1e-5 });
             if is_moe {
                 // Ao invés do FFN denso, despacha a operação de roteamento MoE (RaBitQ 1-bit logic)
-                ops.push(TensorOp::MoERouting { num_experts, top_k: 2 });
+                ops.push(TensorOp::MoERouting { num_experts, top_k: 2, hard_k1: false });
             } else {
                 ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });
                 ops.push(TensorOp::Matmul { m: 1, k: hidden_dim, n: intermediate_size, quantized: false });

@@ -32,6 +32,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::io::{self, Write, Read};
 use std::fs;
+use std::sync::Arc;
+use nodestor_streaming::apex::AmbientTask;
 
 /// Registro de preset de Steering aprendido automaticamente.
 /// Quando o sistema detecta que uma configuração funciona bem para um tipo de
@@ -460,6 +462,22 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if na < 1e-10 || nb < 1e-10 { return 0.0; }
     (dot / (na * nb)).clamp(-1.0, 1.0)
 }
+
+/// Tarefa Ambient AI para salvar a memória persistente sem bloquear a inferência.
+pub struct AmbientSaveTask {
+    pub memory: Arc<PersistentMemory>,
+    pub snapshot: CognitiveSnapshot,
+}
+
+impl AmbientTask for AmbientSaveTask {
+    fn execute(&mut self) {
+        tracing::info!("[Ambient AI] Salvando CognitiveSnapshot em background...");
+        if let Err(e) = self.memory.save_snapshot(&self.snapshot) {
+            tracing::error!("[Ambient AI] Falha ao salvar a memória cognitiva: {}", e);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

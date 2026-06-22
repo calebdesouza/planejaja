@@ -1,6 +1,7 @@
 use nodestor_core::{DataTransport, NodeStorError};
 use nodestor_vulkan::{GpuBuffer, VulkanContext};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, BinaryHeap};
+use std::cmp::{Ordering, Reverse};
 use tracing::{debug, warn, info};
 
 // ===========================================================
@@ -177,6 +178,125 @@ pub struct LayerKV {
 /// 
 /// Intercepta todos os tokens antigos, rastreia ocupação da VRAM e despeja 
 /// páginas (blocks) pro SSD via DataTransport quando necessário, fornecendo Contexto Infinito.
+///
+/// **H2O Eviction Policy**:
+/// Mantém um conjunto de âncoras (sinks), uma janela recente, e um min-heap
+/// que expele o bloco de menor score acumulado de atenção quando a VRAM enche.
+
+#[derive(Debug, Clone)]
+pub struct TokenScoreEntry {
+    pub score: f32,
+    pub layer_idx: usize,
+    pub block_idx: usize,
+}
+
+impl PartialEq for TokenScoreEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.layer_idx == other.layer_idx && self.block_idx == other.block_idx
+    }
+}
+
+impl Eq for TokenScoreEntry {}
+
+impl PartialOrd for TokenScoreEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+
+impl Ord for TokenScoreEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+pub struct H2OEvictionPolicy {
+    pub sink_count: usize,
+    pub recent_window: VecDeque<(usize, usize)>,
+    pub recent_max: usize,
+    pub evictable_heap: BinaryHeap<Reverse<TokenScoreEntry>>,
+    pub scores: HashMap<(usize, usize), f32>,
+    /// Attention sinks rastreados em ordem FIFO. Normalmente protegidos da
+    /// evicção, mas evictáveis em último recurso quando o limite físico de VRAM
+    /// não deixa alternativa (a invariante de hardware sempre prevalece).
+    pub sink_blocks: VecDeque<(usize, usize)>,
+}
+
+impl H2OEvictionPolicy {
+    pub fn new(sink_count: usize, recent_max: usize) -> Self {
+        Self {
+            sink_count,
+            recent_window: VecDeque::new(),
+            recent_max,
+            evictable_heap: BinaryHeap::new(),
+            scores: HashMap::new(),
+            sink_blocks: VecDeque::new(),
+        }
+    }
+
+    pub fn record_attention(&mut self, layer: usize, block: usize, attn_score: f32) {
+        *self.scores.entry((layer, block)).or_insert(0.0) += attn_score;
+    }
+
+    pub fn add_block(&mut self, layer: usize, block: usize) {
+        // Attention sinks: protegidos, mas RASTREADOS (não descartados) para que
+        // possam ser evictados em último recurso se a VRAM lotar só de sinks.
+        if block < self.sink_count {
+            self.sink_blocks.push_back((layer, block));
+            return;
+        }
+        self.recent_window.push_back((layer, block));
+        self.migrate_recent_to_evictable();
+    }
+
+    pub fn migrate_recent_to_evictable(&mut self) {
+        while self.recent_window.len() > self.recent_max {
+            if let Some((layer, block)) = self.recent_window.pop_front() {
+                let score = *self.scores.get(&(layer, block)).unwrap_or(&0.0);
+                self.evictable_heap.push(Reverse(TokenScoreEntry {
+                    score,
+                    layer_idx: layer,
+                    block_idx: block,
+                }));
+            }
+        }
+    }
+
+    pub fn evict_lowest(&mut self) -> Option<(usize, usize)> {
+        loop {
+            if let Some(Reverse(entry)) = self.evictable_heap.pop() {
+                let current_score = *self.scores.get(&(entry.layer_idx, entry.block_idx)).unwrap_or(&0.0);
+                if (entry.score - current_score).abs() > f32::EPSILON {
+                    self.evictable_heap.push(Reverse(TokenScoreEntry {
+                        score: current_score,
+                        layer_idx: entry.layer_idx,
+                        block_idx: entry.block_idx,
+                    }));
+                } else {
+                    self.scores.remove(&(entry.layer_idx, entry.block_idx));
+                    return Some((entry.layer_idx, entry.block_idx));
+                }
+            } else {
+                break;
+            }
+        }
+        
+        if let Some((layer, block)) = self.recent_window.pop_front() {
+            self.scores.remove(&(layer, block));
+            return Some((layer, block));
+        }
+
+        // Último recurso: o limite físico de VRAM prevalece sobre a proteção do
+        // attention-sink. Evicta o sink mais antigo (FIFO) para honrar max_vram_blocks.
+        if let Some((layer, block)) = self.sink_blocks.pop_front() {
+            self.scores.remove(&(layer, block));
+            return Some((layer, block));
+        }
+
+        None
+    }
+}
+
 pub struct KVCache {
     pub layers: Vec<LayerKV>,
     pub num_layers: usize,
@@ -184,8 +304,9 @@ pub struct KVCache {
     pub head_dim: usize,
     pub max_vram_blocks: usize,
     
-    // Lista FIFO/LRU simples de blocos na VRAM: (layer_idx, block_idx)
-    vram_tracker: VecDeque<(usize, usize)>,
+    // Gerenciador H2O de evicção
+    pub h2o_policy: H2OEvictionPolicy,
+    pub vram_block_count: usize,
     
     // File path onde a swap vive
     swap_file_path: String,
@@ -233,7 +354,8 @@ impl KVCache {
             tokens_per_block,
             head_dim,
             max_vram_blocks,
-            vram_tracker: VecDeque::new(),
+            h2o_policy: H2OEvictionPolicy::new(4, 128), // 4 sinks, janela recente de 128
+            vram_block_count: 0,
             swap_file_path: swap_path.to_string(),
             bytes_per_block,
             vram_buffers: HashMap::new(),
@@ -297,9 +419,9 @@ impl KVCache {
         
         let ssd_offset = ((layer_idx * 1_000_000) + block_idx) as u64 * self.bytes_per_block as u64; // Cálculo raso de offset seguro
         
-        // Se excedemos o VRAM, precisamos ejetar o mais velho (Eviction)
-        if self.vram_tracker.len() >= self.max_vram_blocks {
-            self.evict_oldest(transport, None)?;
+        // Se excedemos o VRAM, precisamos ejetar o menos importante (H2O Eviction)
+        if self.vram_block_count >= self.max_vram_blocks {
+            self.evict_by_h2o(transport, None)?;
         }
         
         // Aloca o novo bloco
@@ -310,23 +432,25 @@ impl KVCache {
             ssd_offset,
         });
         
-        self.vram_tracker.push_back((layer_idx, block_idx));
+        self.h2o_policy.add_block(layer_idx, block_idx);
+        self.vram_block_count += 1;
         
-        debug!("KVCache: Allocate Layer {} Block {} -> VRAM (Tracker size: {})", layer_idx, block_idx, self.vram_tracker.len());
+        debug!("KVCache: Allocate Layer {} Block {} -> VRAM (Block count: {})", layer_idx, block_idx, self.vram_block_count);
 
         Ok(())
     }
 
-    /// Remove o bloco mais antigo da VRAM e salva no SSD.
+    /// Remove o bloco menos importante da VRAM via H2O e salva no SSD.
     ///
     /// **Fase 6**: Usa `ctx.download_from_gpu()` para baixar dados reais da VRAM
     /// antes de gravar no SSD via transport. Zero dados ficticiois.
-    fn evict_oldest(
+    fn evict_by_h2o(
         &mut self,
         transport: &dyn DataTransport,
         ctx: Option<&VulkanContext>,
     ) -> Result<(), NodeStorError> {
-        if let Some((evict_layer, evict_block)) = self.vram_tracker.pop_front() {
+        if let Some((evict_layer, evict_block)) = self.h2o_policy.evict_lowest() {
+            self.vram_block_count = self.vram_block_count.saturating_sub(1);
             let ssd_offset = self.layers[evict_layer].blocks[evict_block].ssd_offset;
             self.layers[evict_layer].blocks[evict_block].in_vram = false;
 
@@ -404,8 +528,8 @@ impl KVCache {
         }
 
         // Page Fault: bloco está no SSD — traz de volta!
-        if self.vram_tracker.len() >= self.max_vram_blocks {
-            self.evict_oldest(transport, ctx)?;
+        if self.vram_block_count >= self.max_vram_blocks {
+            self.evict_by_h2o(transport, ctx)?;
         }
 
         let ssd_offset = self.layers[layer_idx].blocks[block_idx].ssd_offset;
@@ -426,7 +550,8 @@ impl KVCache {
         }
 
         self.layers[layer_idx].blocks[block_idx].in_vram = true;
-        self.vram_tracker.push_back((layer_idx, block_idx));
+        self.h2o_policy.add_block(layer_idx, block_idx);
+        self.vram_block_count += 1;
 
         debug!("KVCache Page IN: Layer {} Block {} ← SSD ({} bytes)",
             layer_idx, block_idx, data.len());
@@ -460,7 +585,7 @@ mod tests {
         // Aloca bloco L1B0 (vram tracker len: 3 -> cheio)
         cache.allocate_block(1, &mock_data, &transport).unwrap();
         
-        assert_eq!(cache.vram_tracker.len(), 3);
+        assert_eq!(cache.vram_block_count, 3);
         
         // Ao alocar L1B1, a engine vai invocar evict_oldest (ejetando o L0B0)
         cache.allocate_block(1, &mock_data, &transport).unwrap();
@@ -530,7 +655,7 @@ mod tests {
         // Final: so 5 blocks quentes na VRAM. O resto (95) foi paged out.
         let vram_blocks = cache.layers[0].blocks.iter().filter(|b| b.in_vram).count();
         assert_eq!(vram_blocks, 5);
-        assert_eq!(cache.vram_tracker.len(), 5);
+        assert_eq!(cache.vram_block_count, 5);
     }
 
     #[test]

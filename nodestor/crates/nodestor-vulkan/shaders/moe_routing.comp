@@ -56,6 +56,12 @@ layout(push_constant) uniform PushConstants {
     uint hidden_dim;
     uint num_experts; // sem limite de compilação — qualquer valor
     uint top_k;       // normalmente ≤ 16
+    // routing_mode: 0 = top-k padrão (Selection Sort)
+    //               1 = HARD k=1 (Esparsidade Extrema — 1 expert determinístico)
+    // Modo k=1 elimina o "Paradoxo da Densidade Temporal" descrito na pesquisa:
+    // ao ativar apenas 1 expert por camada, a cascata de page faults no SSD
+    // é estancada, permitindo prefetch preditivo One-Token-Lag.
+    uint routing_mode;
 } pc;
 
 void main() {
@@ -117,48 +123,93 @@ void main() {
         }
     }
 
-    // Garante que todos os scores estão escritos antes do sort
+    // Garante que todos os scores estão escritos antes do sort/seleção
     memoryBarrierBuffer();
     barrier();
 
-    // ── Passo 2: Top-K Selection Sort com bitmap dinâmico no SSBO ──────────
-    // Apenas as lanes tx < top_k participam do sort.
-    // Selection sort: O(num_experts × top_k) — ótimo para top_k ≤ 16.
-    if (tx < pc.top_k) {
-        uint base_out = token_idx * pc.top_k;
+    // ── Passo 2: Seleção de Experts ────────────────────────────────────────
+    //
+    // MODO 0 (top-k): Selection Sort com bitmap dinâmico no SSBO.
+    //   Apenas as lanes tx < top_k participam do sort.
+    //   Selection sort: O(num_experts × top_k) — ótimo para top_k ≤ 16.
+    //
+    // MODO 1 (HARD k=1): Redução paralela determinística.
+    //   Apenas lane 0 escreve. Zero bitmap, zero sort.
+    //   Complexidade: O(num_experts) — um único scan.
+    //   Elimina cascata de page faults (Paradoxo da Densidade Temporal).
 
-        for (uint k = 0u; k < pc.top_k; k++) {
-            float best_score = -1e30;
-            uint  best_idx   = 0u;
+    if (pc.routing_mode == 1u) {
+        // ── HARD ROUTING k=1 ───────────────────────────────────────────────
+        // Cada lane encontra o melhor expert no seu stride via redução local,
+        // depois subgroupMax colapsa todas as lanes em 1 instrução.
+        float local_best_score = -1e30;
+        uint  local_best_idx   = 0u;
 
-            // Busca o expert não selecionado com maior score
-            for (uint e = 0u; e < pc.num_experts; e++) {
-                uint word    = e / 32u;
-                uint bit_pos = e % 32u;
-                bool already = bool(
-                    (selection_bitmap[bitmap_base + word] >> bit_pos) & 1u
-                );
+        for (uint e = tx; e < pc.num_experts; e += 32u) {
+            float s = expert_scores[scores_base + e];
+            if (s > local_best_score) {
+                local_best_score = s;
+                local_best_idx   = e;
+            }
+        }
 
-                if (!already && expert_scores[scores_base + e] > best_score) {
-                    best_score = expert_scores[scores_base + e];
-                    best_idx   = e;
+        // Subgroup reduction: encontra o máximo global entre as 32 lanes
+        float global_best_score = subgroupMax(local_best_score);
+
+        // A lane que detém o vencedor global escreve o resultado
+        // (em caso de empate, a lane com menor ID ganha — determinístico)
+        bool i_am_winner = (local_best_score == global_best_score);
+        uint winner_lane = subgroupBallotFindLSB(subgroupBallot(i_am_winner));
+
+        if (tx == winner_lane) {
+            uint base_out = token_idx * pc.top_k;
+            out_topk_indices[base_out] = local_best_idx;
+            out_topk_scores [base_out] = local_best_score;
+
+            // Preenche slots restantes com sentinela (0xFFFFFFFF = inválido)
+            for (uint k = 1u; k < pc.top_k; k++) {
+                out_topk_indices[base_out + k] = 0xFFFFFFFFu;
+                out_topk_scores [base_out + k] = -1e30;
+            }
+        }
+    } else {
+        // ── TOP-K SELECTION SORT (modo padrão) ─────────────────────────────
+        if (tx < pc.top_k) {
+            uint base_out = token_idx * pc.top_k;
+
+            for (uint k = 0u; k < pc.top_k; k++) {
+                float best_score = -1e30;
+                uint  best_idx   = 0u;
+
+                // Busca o expert não selecionado com maior score
+                for (uint e = 0u; e < pc.num_experts; e++) {
+                    uint word    = e / 32u;
+                    uint bit_pos = e % 32u;
+                    bool already = bool(
+                        (selection_bitmap[bitmap_base + word] >> bit_pos) & 1u
+                    );
+
+                    if (!already && expert_scores[scores_base + e] > best_score) {
+                        best_score = expert_scores[scores_base + e];
+                        best_idx   = e;
+                    }
                 }
+
+                // A lane tx == k escreve o k-ésimo expert escolhido
+                if (tx == k) {
+                    out_topk_indices[base_out + k] = best_idx;
+                    out_topk_scores [base_out + k] = best_score;
+                }
+
+                // Todas as lanes top_k marcam o mesmo expert via atomicOr
+                // (best_idx é idêntico em todas as lanes — sem divergência)
+                uint word    = best_idx / 32u;
+                uint bit_pos = best_idx % 32u;
+                atomicOr(selection_bitmap[bitmap_base + word], (1u << bit_pos));
+
+                // Barreira leve para garantir visibilidade do bitmap antes da próxima iteração
+                memoryBarrierBuffer();
             }
-
-            // A lane tx == k escreve o k-ésimo expert escolhido
-            if (tx == k) {
-                out_topk_indices[base_out + k] = best_idx;
-                out_topk_scores [base_out + k] = best_score;
-            }
-
-            // Todas as lanes top_k marcam o mesmo expert via atomicOr
-            // (best_idx é idêntico em todas as lanes — sem divergência)
-            uint word    = best_idx / 32u;
-            uint bit_pos = best_idx % 32u;
-            atomicOr(selection_bitmap[bitmap_base + word], (1u << bit_pos));
-
-            // Barreira leve para garantir visibilidade do bitmap antes da próxima iteração
-            memoryBarrierBuffer();
         }
     }
 }

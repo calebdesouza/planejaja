@@ -21,6 +21,9 @@ tokenizers = "0.19.1"
 rand = "0.8"
 serde_json = { workspace = true }
 memmap2 = "0.9"
+rayon.workspace = true
+anyhow.workspace = true
+num_cpus = "1.17.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

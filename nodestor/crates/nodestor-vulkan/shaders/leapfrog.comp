@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Constants {
+    uint hidden_dim;
+    uint steps;
+    float dt;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer QIn { float q_in[]; };
+layout(std430, set = 0, binding = 1) readonly buffer PIn { float p_in[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Weights { float w[]; };
+// QOut contém `steps` blocos de tamanho `hidden_dim`.
+layout(std430, set = 0, binding = 3) buffer QOut { float q_out[]; };
+
+void main() {
+    uint dim_i = gl_GlobalInvocationID.x;
+    if (dim_i >= pc.hidden_dim) return;
+    
+    float q = q_in[dim_i];
+    float p = p_in[dim_i];
+    // Se o buffer W estiver vazio ou com tamanho menor, assumimos peso 1.0 (potencial harmônico uniforme).
+    // O pipeline Rust garante que o buffer tenha o tamanho correto.
+    float weight = w[dim_i]; 
+    float half_dt = pc.dt * 0.5;
+    
+    for (uint s = 0; s < pc.steps; s++) {
+        // Meio passo do momento: p_{n+1/2} = p_n - (dt/2) * ∇V(q_n)
+        float grad_v = weight * q;
+        p -= half_dt * grad_v;
+        
+        // Passo completo da posição: q_{n+1} = q_n + dt * p_{n+1/2}
+        q += pc.dt * p;
+        
+        // Segundo meio passo do momento: p_{n+1} = p_{n+1/2} - (dt/2) * ∇V(q_{n+1})
+        float grad_v_new = weight * q;
+        p -= half_dt * grad_v_new;
+        
+        q_out[s * pc.hidden_dim + dim_i] = q;
+    }
+}

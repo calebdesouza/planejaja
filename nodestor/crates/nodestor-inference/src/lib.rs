@@ -12,6 +12,13 @@ pub mod pipeline;
 pub mod kv_cache;
 pub mod tokenizer;
 pub mod sampler;
+pub mod cpu_backend;
+pub mod lora_adapter;
+pub mod clip_encoder;
+pub mod whisper_pipeline;
+pub mod diffusion_pipeline;
+
+
 pub mod vram_budget;
 pub mod candidate_engine;
 pub mod cober;
@@ -107,7 +114,7 @@ mod tests {
         let mut pipeline = InferencePipeline::init(config).expect("Falha ao inicializar 7 camadas");
         
         // EXEC: Geração de Tokens com RAG e Streaming (Camada 2, 4, 5, 6)
-        let (output, stats) = pipeline.generate("Olá NodeStor!", 5).await
+        let (output, stats) = pipeline.generate("Olá NodeStor!", 5, None).await
             .expect("Falha na geração via 7 camadas");
 
         // PROOF: Verificação de métricas e vitalidade
@@ -124,3 +131,8 @@ mod tests {
 
 pub mod latent_drafter;
 pub mod prod_empirical_test;
+pub mod mamba_layer;
+pub mod mcts_engine;
+pub mod hnsw_index;
+pub mod lsh_buckets;
+pub mod hamiltonian_dynamics;

@@ -1,0 +1,67 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Define um bloco cooperativo paralelo perfeitamente aderente ao Warp Size dominantes 
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer Input { float x[]; };
+layout(std430, binding = 1) readonly  buffer Weights { float gamma[]; };
+layout(std430, binding = 2) readonly  buffer Biases { float beta[]; };
+// Exportação unitária na consumação estrutural do fluxo fundido
+layout(std430, binding = 3) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Config {
+    uint hidden_dim;
+    float eps;
+} cfg;
+
+// Repositórios termicamente resguardados restritos intra-workgroup
+shared float s_sum;
+shared float s_sq_sum;
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint global_row = gl_WorkGroupID.x;
+    uint base_idx = global_row * cfg.hidden_dim;
+    
+    float local_sum = 0.0;
+    float local_sq_sum = 0.0;
+    
+    // Leitura bloqueada linear - coalescência máxima para preencher a banda nominal paralela
+    for (uint i = local_id; i < cfg.hidden_dim; i += gl_WorkGroupSize.x) {
+        float val = x[base_idx + i];
+        local_sum += val;
+        local_sq_sum += val * val;
+    }
+    
+    // Redução síncrona hiper-veloz provida diretamente por via transitória de microcódigo de hardware ALU 
+    float warp_sum = subgroupAdd(local_sum);
+    float warp_sq_sum = subgroupAdd(local_sq_sum);
+    
+    // Sincronização e transposição destas ramificações para a célula primária isolada local 
+    if (subgroupElect()) {
+        atomicAdd(s_sum, warp_sum);
+        atomicAdd(s_sq_sum, warp_sq_sum);
+    }
+    
+    memoryBarrierShared(); // Imposição rigorosa para afiançar integridade
+    barrier();
+    
+    float u = s_sum / float(cfg.hidden_dim);
+    float variance = (s_sq_sum / float(cfg.hidden_dim)) - (u * u);
+    float std_dev = inversesqrt(variance + cfg.eps);
+    
+    // Fusão geométrica ativacional na mesma ramificação primária estritamente in-place
+    for (uint i = local_id; i < cfg.hidden_dim; i += gl_WorkGroupSize.x) {
+        float val = x[base_idx + i];
+        
+        // Cômputo estritamente derivado da LayerNorm com escala dimensional paramétrica associada 
+        float norm_val = ((val - u) * std_dev) * gamma[i] + beta[i];
+        
+        // Passagem não-linear direta com aproximação estatística algébrica rigorosamente atenuada (GELU Polinomial Equivalente)
+        float gelu_out = 0.5 * norm_val * (1.0 + tanh(0.7978845608 * (norm_val + 0.044715 * norm_val * norm_val * norm_val)));
+        
+        // O valor transposto final repousa na VRAM externa puramente uma única e solitária vez 
+        y[base_idx + i] = gelu_out; 
+    }
+}
