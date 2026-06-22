@@ -968,6 +968,61 @@ mod tests {
         assert_eq!(logits.size, 100 * 4);
     }
 
+    /// Banco de pesos NÃO-zero (para provar que o forward computa de verdade).
+    fn make_nonzero_weight_bank(engine: &VulkanEngine, hidden: u32, inter: u32, vocab: u32, layers: u32) -> WeightBank {
+        let h = hidden as usize;
+        let inter = inter as usize;
+        let vocab = vocab as usize;
+        let mut bank = WeightBank::new();
+        let up = |vals: Vec<f32>| {
+            let bytes: Vec<u8> = vals.iter().flat_map(|f| f.to_le_bytes()).collect();
+            engine.upload(&bytes).unwrap()
+        };
+        let small = |n: usize| -> Vec<f32> { (0..n).map(|i| 0.01 + 0.001 * ((i % 7) as f32)).collect() };
+        let ones = |n: usize| -> Vec<f32> { vec![1.0; n] };
+        for i in 0..layers {
+            bank.insert(format!("blk.{}.attn_norm.weight", i), up(ones(h)));
+            bank.insert(format!("blk.{}.attn_q.weight", i), up(small(h * h)));
+            bank.insert(format!("blk.{}.attn_k.weight", i), up(small(h * h)));
+            bank.insert(format!("blk.{}.attn_v.weight", i), up(small(h * h)));
+            bank.insert(format!("blk.{}.attn_output.weight", i), up(small(h * h)));
+            bank.insert(format!("blk.{}.ffn_norm.weight", i), up(ones(h)));
+            bank.insert(format!("blk.{}.ffn_gate.weight", i), up(small(h * inter)));
+            bank.insert(format!("blk.{}.ffn_up.weight", i), up(small(h * inter)));
+            bank.insert(format!("blk.{}.ffn_down.weight", i), up(small(inter * h)));
+        }
+        bank.insert("output_norm.weight".into(), up(ones(h)));
+        bank.insert("output.weight".into(), up(small(h * vocab)));
+        bank.insert("token_embd.weight".into(), up(small(vocab * h)));
+        bank
+    }
+
+    /// CAPSTONE: o forward pass COMPLETO (embed → rmsnorm → QKV → RoPE → attention
+    /// → out_proj → residual → ffn_norm → gate/up → SiLU → mul → down → residual →
+    /// final norm → lm_head) produz logits FINITOS e NÃO-zero com pesos reais.
+    /// Prova que toda a cadeia matemática computa de verdade no caminho CPU.
+    #[test]
+    fn test_full_forward_produces_finite_nonzero_logits() {
+        let engine = mock_engine();
+        let hidden = 8u32;
+        let vocab = 10u32;
+        let transformer = Transformer::from_metadata(1, hidden, 2, 2, 16, vocab, 10000.0, 1e-5, false);
+        let bank = make_nonzero_weight_bank(&engine, hidden, 16, vocab, 1);
+
+        // Embedding de entrada NÃO-zero (senão tudo permanece zero por construção).
+        let embed: Vec<f32> = (0..hidden).map(|i| 0.1 + 0.01 * i as f32).collect();
+        let bytes: Vec<u8> = embed.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let input = engine.upload(&bytes).unwrap();
+
+        let logits = transformer.forward(&engine, &input, &bank, 0).unwrap();
+        let vals = engine.download_f32(&logits).unwrap();
+
+        assert_eq!(vals.len(), vocab as usize, "deve produzir vocab_size logits");
+        assert!(vals.iter().all(|v| v.is_finite()), "todos os logits devem ser finitos: {:?}", vals);
+        assert!(vals.iter().any(|&v| v.abs() > 1e-9),
+            "o forward DEVE produzir logits não-zero (computou de verdade ponta a ponta): {:?}", vals);
+    }
+
     #[test]
     fn test_from_metadata_builds_correct_layers() {
         let t = Transformer::from_metadata(4, 512, 8, 8, 1024, 32000, 10000.0, 1e-5, false);

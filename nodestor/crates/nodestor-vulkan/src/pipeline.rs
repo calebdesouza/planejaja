@@ -567,12 +567,15 @@ impl ComputePipeline {
         hidden_size: u32,
         eps: f32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        if !self.vulkan_active {
+            cpu_rmsnorm(input, weight, output, seq_len, hidden_size, eps);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
             let command_pool = ctx.command_pool.unwrap();
-            
+
             let layouts = [self.descriptor_set_layout.unwrap()];
             let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
             let descriptor_set = device.allocate_descriptor_sets(&alloc_info).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
@@ -739,7 +742,10 @@ impl ComputePipeline {
     }
 
     pub fn dispatch_silu(&self, ctx: &VulkanContext, input: &GpuBuffer, output: &mut GpuBuffer, elements: u32) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        if !self.vulkan_active {
+            cpu_silu(input, output, elements);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -826,7 +832,10 @@ impl ComputePipeline {
         freq_base: f32,
         start_pos: u32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        if !self.vulkan_active {
+            cpu_rope(q, k, seq_len, num_heads_q, num_heads_k, head_dim, freq_base, start_pos);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -1239,7 +1248,10 @@ impl ComputePipeline {
         out: &mut GpuBuffer,
         elems: u32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        if !self.vulkan_active {
+            cpu_elementwise_add(a, b, out, elems);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -1285,7 +1297,10 @@ impl ComputePipeline {
         out: &mut GpuBuffer,
         elems: u32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        if !self.vulkan_active {
+            cpu_elementwise_mul(a, b, out, elems);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -1552,6 +1567,111 @@ fn cpu_attention_sim(
     }
 }
 
+/// Escreve um vetor f32 nos bytes de um GpuBuffer (modo simulação).
+fn write_f32_to_buffer(vals: &[f32], buf: &mut GpuBuffer) {
+    let bytes = buf.as_mut_bytes();
+    for (i, v) in vals.iter().enumerate() {
+        let o = i * 4;
+        if o + 4 <= bytes.len() {
+            bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// RMSNorm de referência (CPU): por linha, `y[i] = x[i] / sqrt(mean(x²) + eps) · w[i]`.
+fn cpu_rmsnorm(input: &GpuBuffer, weight: &GpuBuffer, output: &mut GpuBuffer, seq_len: u32, hidden: u32, eps: f32) {
+    let x = input.as_f32_slice();
+    let w = weight.as_f32_slice();
+    let hidden = (hidden as usize).max(1);
+    let seq = seq_len as usize;
+    let n_out = output.size / 4;
+    let mut out = vec![0.0f32; n_out];
+    for s in 0..seq {
+        let base = s * hidden;
+        if base + hidden > x.len() { break; }
+        let mut sum_sq = 0.0f32;
+        for i in 0..hidden { sum_sq += x[base + i] * x[base + i]; }
+        let inv_rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+        for i in 0..hidden {
+            // Sem pesos materializados (buffer "fino") → escala 1.0 (identidade).
+            let wi = if w.is_empty() { 1.0 } else { w.get(i).copied().unwrap_or(1.0) };
+            if base + i < out.len() { out[base + i] = x[base + i] * inv_rms * wi; }
+        }
+    }
+    write_f32_to_buffer(&out, output);
+}
+
+/// SiLU/Swish de referência (CPU): `y[i] = x[i] · sigmoid(x[i]) = x[i] / (1 + e^-x[i])`.
+fn cpu_silu(input: &GpuBuffer, output: &mut GpuBuffer, elements: u32) {
+    let x = input.as_f32_slice();
+    let n = (elements as usize).min(x.len()).min(output.size / 4);
+    let mut out = vec![0.0f32; output.size / 4];
+    for i in 0..n {
+        let v = x[i];
+        out[i] = v / (1.0 + (-v).exp());
+    }
+    write_f32_to_buffer(&out, output);
+}
+
+/// Soma elementwise de referência (CPU): `out[i] = a[i] + b[i]`.
+fn cpu_elementwise_add(a: &GpuBuffer, b: &GpuBuffer, out: &mut GpuBuffer, elems: u32) {
+    let av = a.as_f32_slice();
+    let bv = b.as_f32_slice();
+    let n = (elems as usize).min(out.size / 4);
+    let mut o = vec![0.0f32; out.size / 4];
+    for i in 0..n {
+        o[i] = av.get(i).copied().unwrap_or(0.0) + bv.get(i).copied().unwrap_or(0.0);
+    }
+    write_f32_to_buffer(&o, out);
+}
+
+/// Multiplicação elementwise de referência (CPU): `out[i] = a[i] · b[i]` (SwiGLU).
+fn cpu_elementwise_mul(a: &GpuBuffer, b: &GpuBuffer, out: &mut GpuBuffer, elems: u32) {
+    let av = a.as_f32_slice();
+    let bv = b.as_f32_slice();
+    let n = (elems as usize).min(out.size / 4);
+    let mut o = vec![0.0f32; out.size / 4];
+    for i in 0..n {
+        o[i] = av.get(i).copied().unwrap_or(0.0) * bv.get(i).copied().unwrap_or(0.0);
+    }
+    write_f32_to_buffer(&o, out);
+}
+
+/// Aplica RoPE (Rotary Position Embedding) interleaved in-place a um buffer
+/// [seq_len, num_heads, head_dim]. Para cada par (2i, 2i+1): rotação por
+/// θ = pos / freq_base^(2i/head_dim), com pos = start_pos + índice da posição.
+fn rope_apply(buf: &mut GpuBuffer, seq_len: u32, num_heads: u32, head_dim: u32, freq_base: f32, start_pos: u32) {
+    let hd = head_dim as usize;
+    if hd < 2 { return; }
+    let half = hd / 2;
+    let mut data: Vec<f32> = buf.as_f32_slice().to_vec();
+    for s in 0..seq_len as usize {
+        let pos = (start_pos as usize + s) as f32;
+        for h in 0..num_heads as usize {
+            let base = (s * num_heads as usize + h) * hd;
+            for i in 0..half {
+                let theta = pos / freq_base.powf((2 * i) as f32 / hd as f32);
+                let (sin, cos) = theta.sin_cos();
+                let i0 = base + 2 * i;
+                let i1 = base + 2 * i + 1;
+                if i1 < data.len() {
+                    let x0 = data[i0];
+                    let x1 = data[i1];
+                    data[i0] = x0 * cos - x1 * sin;
+                    data[i1] = x0 * sin + x1 * cos;
+                }
+            }
+        }
+    }
+    write_f32_to_buffer(&data, buf);
+}
+
+/// RoPE de referência (CPU) aplicado a Q e K.
+fn cpu_rope(q: &mut GpuBuffer, k: &mut GpuBuffer, seq_len: u32, num_heads_q: u32, num_heads_k: u32, head_dim: u32, freq_base: f32, start_pos: u32) {
+    rope_apply(q, seq_len, num_heads_q, head_dim, freq_base, start_pos);
+    rope_apply(k, seq_len, num_heads_k, head_dim, freq_base, start_pos);
+}
+
 fn cpu_matmul_f32(a: &[f32], b: &[f32], output: &mut GpuBuffer, m: usize, k: usize, n: usize) {
     for i in 0..m {
         for j in 0..n {
@@ -1726,5 +1846,95 @@ mod tests {
         let score_slice = scores.as_f32_slice();
         assert_eq!(score_slice[0], 0.0); // ortogonal = 0
         assert_eq!(score_slice[1], 1.0); // idêntico = 1
+    }
+}
+
+/// Testes de FIDELIDADE MATEMÁTICA das operações-núcleo do Transformer.
+///
+/// Cada teste compara a saída em CPU (caminho de simulação) contra valores
+/// calculados À MÃO a partir das fórmulas canônicas. Provam que rmsnorm, silu,
+/// add, mul, rope e matmul computam exatamente o que a matemática exige — base
+/// para 100% de fidelidade do forward pass quando há pesos reais.
+#[cfg(test)]
+mod math_fidelity_tests {
+    use crate::VulkanEngine;
+
+    fn f2b(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() }
+    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-3 }
+
+    #[test]
+    fn test_rmsnorm_formula() {
+        let engine = VulkanEngine::new_simulation();
+        // x = [3, 4], hidden=2. mean(x²) = (9+16)/2 = 12.5; rms = 3.53553.
+        // y = x/rms · w, com w = [2, 0.5] → [3/3.53553·2, 4/3.53553·0.5]
+        //   = [1.69706, 0.56569]
+        let x = engine.upload(&f2b(&[3.0, 4.0])).unwrap();
+        let w = engine.upload(&f2b(&[2.0, 0.5])).unwrap();
+        let out = engine.rmsnorm(&x, &w, 1, 2, 1e-9).unwrap();
+        let y = engine.download_f32(&out).unwrap();
+        assert!(approx(y[0], 1.69706), "rmsnorm[0]={}", y[0]);
+        assert!(approx(y[1], 0.56569), "rmsnorm[1]={}", y[1]);
+    }
+
+    #[test]
+    fn test_silu_formula() {
+        let engine = VulkanEngine::new_simulation();
+        // silu(x) = x·sigmoid(x): silu(0)=0, silu(1)=0.73106, silu(-1)=-0.26894
+        let x = engine.upload(&f2b(&[0.0, 1.0, -1.0])).unwrap();
+        let out = engine.silu(&x, 3).unwrap();
+        let y = engine.download_f32(&out).unwrap();
+        assert!(approx(y[0], 0.0), "silu(0)={}", y[0]);
+        assert!(approx(y[1], 0.73106), "silu(1)={}", y[1]);
+        assert!(approx(y[2], -0.26894), "silu(-1)={}", y[2]);
+    }
+
+    #[test]
+    fn test_add_and_mul_elementwise() {
+        let engine = VulkanEngine::new_simulation();
+        let a = engine.upload(&f2b(&[1.0, 2.0, 3.0])).unwrap();
+        let b = engine.upload(&f2b(&[10.0, 20.0, 30.0])).unwrap();
+        let sum = engine.download_f32(&engine.add(&a, &b, 3).unwrap()).unwrap();
+        assert_eq!(sum, vec![11.0, 22.0, 33.0]);
+
+        let c = engine.upload(&f2b(&[2.0, 3.0, 4.0])).unwrap();
+        let d = engine.upload(&f2b(&[5.0, 6.0, 7.0])).unwrap();
+        let prod = engine.download_f32(&engine.mul(&c, &d, 3).unwrap()).unwrap();
+        assert_eq!(prod, vec![10.0, 18.0, 28.0]);
+    }
+
+    #[test]
+    fn test_matmul_formula() {
+        let engine = VulkanEngine::new_simulation();
+        // A(2×2)=[[1,2],[3,4]] · B(2×2)=[[5,6],[7,8]] = [[19,22],[43,50]]
+        let a = engine.upload(&f2b(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+        let b = engine.upload(&f2b(&[5.0, 6.0, 7.0, 8.0])).unwrap();
+        let out = engine.matmul(&a, &b, 2, 2, 2).unwrap();
+        let y = engine.download_f32(&out).unwrap();
+        assert_eq!(y, vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_rope_rotation() {
+        let engine = VulkanEngine::new_simulation();
+        // head_dim=2, pos=1, freq_base=10000 → θ = 1/10000^0 = 1 rad.
+        // q=[1,0] → [cos(1), sin(1)] = [0.54030, 0.84147]
+        let mut q = engine.upload(&f2b(&[1.0, 0.0])).unwrap();
+        let mut k = engine.upload(&f2b(&[1.0, 0.0])).unwrap();
+        engine.rope(&mut q, &mut k, 1, 1, 1, 2, 10000.0, 1).unwrap();
+        let qv = engine.download_f32(&q).unwrap();
+        assert!(approx(qv[0], 0.54030), "rope q[0]={}", qv[0]);
+        assert!(approx(qv[1], 0.84147), "rope q[1]={}", qv[1]);
+    }
+
+    #[test]
+    fn test_rope_pos_zero_is_identity() {
+        let engine = VulkanEngine::new_simulation();
+        // pos=0 → θ=0 → rotação identidade: q inalterado.
+        let mut q = engine.upload(&f2b(&[0.7, -0.3, 0.1, 0.9])).unwrap();
+        let mut k = engine.upload(&f2b(&[0.2, 0.4, 0.6, 0.8])).unwrap();
+        engine.rope(&mut q, &mut k, 1, 2, 2, 2, 10000.0, 0).unwrap();
+        let qv = engine.download_f32(&q).unwrap();
+        assert!(approx(qv[0], 0.7) && approx(qv[1], -0.3) && approx(qv[2], 0.1) && approx(qv[3], 0.9),
+            "pos=0 deve ser identidade, got {:?}", qv);
     }
 }

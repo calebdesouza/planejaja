@@ -386,7 +386,19 @@ impl InferencePipeline {
             .or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json))
             .map_err(|e| NodeStorError::InferenceError(format!("Falha ao construir tokenizer: {}", e)))?;
 
-        let mut input_tokens = tokenizer.encode(prompt).unwrap_or(vec![0]);
+        // RAG end-to-end: costura os fragmentos recuperados ANTES do prompt, para
+        // que o forward pass condicione a geração no conhecimento factual indexado.
+        let effective_prompt = if rag_context.is_empty() {
+            prompt.to_string()
+        } else {
+            let ctx: String = rag_context.iter()
+                .filter_map(|r| r.payload.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            debug!("RAG: injetando {} fragmentos ({} chars) no contexto", rag_context.len(), ctx.len());
+            format!("[Contexto]\n{}\n\n[Pergunta]\n{}", ctx, prompt)
+        };
+        let mut input_tokens = tokenizer.encode(&effective_prompt).unwrap_or(vec![0]);
         if input_tokens.is_empty() { input_tokens.push(0); }
 
         // Pre-enche a RAM/VRAM para que o Kernel nunca bloqueie (Burst Pump)
