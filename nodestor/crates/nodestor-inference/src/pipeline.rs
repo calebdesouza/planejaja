@@ -256,7 +256,32 @@ impl InferencePipeline {
         // Em produção, os tensores do GGUF já foram carregados pelo parser e
         // estão no `self.metadata.tensors`. Aqui subimos cada um para a VRAM.
         let mut weight_bank = nodestor_vulkan::WeightBank::new();
+
+        // ─── Carregamento de PESOS REAIS via WeightStore (mmap zero-copy + upload) ──
+        // Tenta abrir o GGUF e subir os bytes reais de cada tensor para a GPU. Esta é
+        // a ponte que faz o forward pass operar sobre os pesos verdadeiros do modelo,
+        // e não sobre buffers zerados. Em arquivos sintéticos/testes (sem tensores
+        // mapeáveis), cai no fallback de buffers vazios com as shapes corretas.
+        let mut real_loaded = 0usize;
+        match crate::weight_store::WeightStore::open(std::path::Path::new(&self.config.model_path)) {
+            Ok(store) => {
+                for name in store.list_tensors() {
+                    if let Some(bytes) = store.tensor_bytes(name) {
+                        match self.engine.upload(bytes) {
+                            Ok(buf) => { weight_bank.insert(name.to_string(), buf); real_loaded += 1; }
+                            Err(e) => debug!("WeightStore: upload de '{}' falhou: {}", name, e),
+                        }
+                    }
+                }
+                debug!("WeightStore: {} tensores REAIS carregados do GGUF para a GPU", real_loaded);
+            }
+            Err(e) => debug!("WeightStore indisponível ({}); usando fallback de buffers vazios", e),
+        }
+
+        // Fallback: garante que todo tensor esperado exista (shapes corretas) mesmo
+        // que o WeightStore não tenha conseguido mapeá-lo (modelos sintéticos/dummy).
         for tensor in &self.metadata.tensors {
+            if weight_bank.get(&tensor.name).is_some() { continue; }
             // Converte shape Vec<u64> para bytes (cada dim é u64 no formato GGUF)
             let size_bytes: usize = tensor.shape.iter()
                 .map(|&d| d as usize)
