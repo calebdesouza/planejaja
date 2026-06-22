@@ -266,14 +266,29 @@ impl InferencePipeline {
         match crate::weight_store::WeightStore::open(std::path::Path::new(&self.config.model_path)) {
             Ok(store) => {
                 for name in store.list_tensors() {
-                    if let Some(bytes) = store.tensor_bytes(name) {
-                        match self.engine.upload(bytes) {
-                            Ok(buf) => { weight_bank.insert(name.to_string(), buf); real_loaded += 1; }
-                            Err(e) => debug!("WeightStore: upload de '{}' falhou: {}", name, e),
+                    let bytes = match store.tensor_bytes(name) { Some(b) => b, None => continue };
+                    // Converte do dtype nativo do GGUF para FP32. NÚCLEO LOSSLESS:
+                    // F32/F16/BF16 com fidelidade total (zero perda de qualidade).
+                    // Quant (Q8_0…) é opcional e também convertida aqui.
+                    let (dtype, n_elems) = store.tensor_info(name)
+                        .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
+                        .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
+                    let upload = match tensor_to_f32(bytes, dtype, n_elems) {
+                        Some(f32s) => {
+                            let raw = unsafe {
+                                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
+                            };
+                            self.engine.upload(raw)
                         }
+                        // Formato ainda não coberto pelo conversor: sobe os bytes crus.
+                        None => self.engine.upload(bytes),
+                    };
+                    match upload {
+                        Ok(buf) => { weight_bank.insert(name.to_string(), buf); real_loaded += 1; }
+                        Err(e) => debug!("WeightStore: upload de '{}' falhou: {}", name, e),
                     }
                 }
-                debug!("WeightStore: {} tensores REAIS carregados do GGUF para a GPU", real_loaded);
+                debug!("WeightStore: {} tensores REAIS carregados (dtype→FP32 lossless) do GGUF para a GPU", real_loaded);
             }
             Err(e) => debug!("WeightStore indisponível ({}); usando fallback de buffers vazios", e),
         }
@@ -554,5 +569,82 @@ impl InferencePipeline {
         });
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+/// Converte os bytes crus de um tensor GGUF (no seu dtype nativo) para FP32,
+/// prontos para Matmul/Attention.
+///
+/// O núcleo do NodeStor é **lossless por especulação**: F32/F16/BF16 são
+/// convertidos com fidelidade numérica TOTAL — o modelo roda com a qualidade
+/// máxima da arquitetura, sem perda. A quantização (Q8_0, e via `dequant`
+/// também Q4_K/Q5_K) é **opcional**: quem quiser economizar memória pode usar
+/// modelos quantizados, mas isso nunca é exigido.
+///
+/// Retorna `None` para formatos ainda não cobertos pelo conversor direto
+/// (quants legados Q4_0/Q5_0, tipos inteiros), sinalizando fallback ao chamador.
+fn tensor_to_f32(
+    bytes: &[u8],
+    dtype: nodestor_core::TensorDtype,
+    num_elements: usize,
+) -> Option<Vec<f32>> {
+    use nodestor_core::TensorDtype as DT;
+    use crate::dequant::{DequantDispatcher, QuantFormat};
+
+    // BF16 → FP32 é EXATO: o bfloat16 são exatamente os 16 bits altos de um FP32.
+    if dtype == DT::BF16 {
+        return Some(
+            bytes.chunks_exact(2)
+                .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+                .collect(),
+        );
+    }
+
+    let format = match dtype {
+        DT::F32  => QuantFormat::F32,
+        DT::F16  => QuantFormat::F16,
+        DT::Q8_0 => QuantFormat::Q8_0, // near-lossless (~idêntico a FP16)
+        _ => return None,
+    };
+
+    let mut dispatcher = DequantDispatcher::new(false);
+    Some(dispatcher.dequantize(bytes, format, num_elements))
+}
+
+#[cfg(test)]
+mod weight_dtype_tests {
+    use super::tensor_to_f32;
+    use nodestor_core::TensorDtype;
+
+    #[test]
+    fn test_f32_passthrough() {
+        let v = [1.5f32, -2.0, 3.25];
+        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let out = tensor_to_f32(&bytes, TensorDtype::F32, 3).unwrap();
+        assert_eq!(out, vec![1.5, -2.0, 3.25]);
+    }
+
+    #[test]
+    fn test_f16_to_f32_lossless() {
+        // half: 0x3C00 = 1.0 ; 0xC000 = -2.0 (little-endian nos bytes)
+        let bytes = [0x00u8, 0x3C, 0x00, 0xC0];
+        let out = tensor_to_f32(&bytes, TensorDtype::F16, 2).unwrap();
+        assert!((out[0] - 1.0).abs() < 1e-6, "F16 0x3C00 → 1.0, foi {}", out[0]);
+        assert!((out[1] + 2.0).abs() < 1e-6, "F16 0xC000 → -2.0, foi {}", out[1]);
+    }
+
+    #[test]
+    fn test_bf16_to_f32_exact() {
+        // bfloat16: 0x3F80 = 1.0 ; 0x4040 = 3.0
+        let bytes = [0x80u8, 0x3F, 0x40, 0x40];
+        let out = tensor_to_f32(&bytes, TensorDtype::BF16, 2).unwrap();
+        assert_eq!(out[0], 1.0, "BF16 0x3F80 deve ser exatamente 1.0");
+        assert_eq!(out[1], 3.0, "BF16 0x4040 deve ser exatamente 3.0");
+    }
+
+    #[test]
+    fn test_unsupported_format_returns_none() {
+        // Q4_0 legado ainda não tem conversor direto → None (chamador usa fallback)
+        assert!(tensor_to_f32(&[0u8; 18], TensorDtype::Q4_0, 32).is_none());
     }
 }
