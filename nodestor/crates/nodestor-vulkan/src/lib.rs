@@ -45,7 +45,24 @@ impl VulkanEngine {
             None => return Ok(Self::new_simulation()),
         };
         let ctx = VulkanContext::new(Some(gpu)).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        // O device Vulkan não inicializou de fato (driver headless) → CPU completa.
+        if !ctx.vulkan_available {
+            return Ok(Self::new_simulation());
+        }
         let pipelines = pipeline::create_all_pipelines(&ctx).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        // Se o conjunto de pipelines GPU estiver INCOMPLETO (ex.: o SPIR-V do
+        // TurboQuantAttention não compila neste driver), caímos para o motor de
+        // simulação COMPLETO (CPU) em vez de um estado GPU meio-carregado. Um
+        // forward consistente vale mais — e roda em qualquer máquina.
+        let required = [
+            PipelineKind::Matmul, PipelineKind::RmsNorm, PipelineKind::RoPe,
+            PipelineKind::SiLu, PipelineKind::Softmax, PipelineKind::Attention,
+            PipelineKind::TurboQuantAttention, PipelineKind::Add, PipelineKind::Mul,
+        ];
+        if required.iter().any(|k| !pipelines.contains_key(k)) {
+            tracing::warn!("Pipelines GPU incompletos neste driver — usando simulação CPU completa.");
+            return Ok(Self::new_simulation());
+        }
         Ok(Self { ctx, pipelines })
     }
 

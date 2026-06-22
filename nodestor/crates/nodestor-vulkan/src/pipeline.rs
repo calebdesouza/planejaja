@@ -1405,27 +1405,14 @@ impl ComputePipeline {
 pub fn create_all_pipelines(
     ctx: &VulkanContext,
 ) -> Result<HashMap<PipelineKind, ComputePipeline>, VulkanError> {
-    let mut map = HashMap::new();
     if !ctx.vulkan_available {
-        map.insert(PipelineKind::DequantQ4, ComputePipeline::new_simulation(PipelineKind::DequantQ4));
-        map.insert(PipelineKind::DequantQ8, ComputePipeline::new_simulation(PipelineKind::DequantQ8));
-        map.insert(PipelineKind::DequantQ6K, ComputePipeline::new_simulation(PipelineKind::DequantQ6K));
-        map.insert(PipelineKind::Matmul, ComputePipeline::new_simulation(PipelineKind::Matmul));
-        map.insert(PipelineKind::CosineSim, ComputePipeline::new_simulation(PipelineKind::CosineSim));
-        map.insert(PipelineKind::Lossless, ComputePipeline::new_simulation(PipelineKind::Lossless));
-        map.insert(PipelineKind::GDeflate, ComputePipeline::new_simulation(PipelineKind::GDeflate));
-        map.insert(PipelineKind::MatmulQ4, ComputePipeline::new_simulation(PipelineKind::MatmulQ4));
-        map.insert(PipelineKind::MatmulTensorCore, ComputePipeline::new_simulation(PipelineKind::MatmulTensorCore));
-        map.insert(PipelineKind::MatmulTernary, ComputePipeline::new_simulation(PipelineKind::MatmulTernary));
-        map.insert(PipelineKind::MambaSelectiveScan, ComputePipeline::new_simulation(PipelineKind::MambaSelectiveScan));
-        map.insert(PipelineKind::RmsNorm, ComputePipeline::new_simulation(PipelineKind::RmsNorm));
-        map.insert(PipelineKind::RoPe, ComputePipeline::new_simulation(PipelineKind::RoPe));
-        map.insert(PipelineKind::SiLu, ComputePipeline::new_simulation(PipelineKind::SiLu));
-        map.insert(PipelineKind::Softmax, ComputePipeline::new_simulation(PipelineKind::Softmax));
-        map.insert(PipelineKind::Attention, ComputePipeline::new_simulation(PipelineKind::Attention));
-        map.insert(PipelineKind::CoopMatrix, ComputePipeline::new_simulation(PipelineKind::CoopMatrix));
-        return Ok(map);
+        // Sem device Vulkan real (headless/driver ausente): usa o conjunto COMPLETO
+        // de pipelines de simulação — inclui TurboQuantAttention, MoERouting,
+        // FusedLayerNormGelu, Add, Mul, etc. O subconjunto antigo aqui estava
+        // INCOMPLETO (faltava TQA), travando o forward de modelos reais.
+        return Ok(create_simulation_pipelines());
     }
+    let mut map = HashMap::new();
 
     // Tentativa de carregar Cooperative Matrix (Fase 5).
     // Detecta suporte ao carregar o shader — se o SPIR-V for inválido para este
