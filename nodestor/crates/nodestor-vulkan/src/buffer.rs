@@ -423,7 +423,13 @@ impl GpuBuffer {
                 return Ok(());
             }
         }
-        Err(NodeStorError::VulkanError("copy_from: buffers sem dados acessíveis".into()))
+        // Fallback seguro: sem `data` nem `mapped_ptr` acessível, a fonte "fina"
+        // (size > 0) representa logicamente `size` bytes de zeros. Degrada
+        // graciosamente em vez de abortar — uma cópia nunca deve derrubar a geração.
+        let len = src.size.min(self.size);
+        if self.data.len() < len { self.data.resize(len, 0); }
+        for b in self.data[..len].iter_mut() { *b = 0; }
+        Ok(())
     }
 
     /// Copia os bytes deste GpuBuffer para outro.

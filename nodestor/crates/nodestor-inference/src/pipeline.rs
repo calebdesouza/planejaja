@@ -377,12 +377,13 @@ impl InferencePipeline {
 
         // ── Tokenizer — encode do prompt ─────────────────────────────────────────
         // Tenta carregar o tokenizer real do GGUF; fallback para tokenizer dummy
-        let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"Hello":1,"World":2},"unk_token":"<unk>"}}"#;
+        let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"Hello":1,"World":2},"unk_token":"<unk>"}}"#;
         let tokenizer_json = self.metadata.extra.get("tokenizer.ggml.model")
             .and_then(|v| v.as_str())
             .unwrap_or(dummy_json);
         let tokenizer = crate::tokenizer::TokenizerManager::from_string(tokenizer_json)
-            .unwrap_or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json).unwrap());
+            .or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json))
+            .map_err(|e| NodeStorError::InferenceError(format!("Falha ao construir tokenizer: {}", e)))?;
 
         let mut input_tokens = tokenizer.encode(prompt).unwrap_or(vec![0]);
         if input_tokens.is_empty() { input_tokens.push(0); }

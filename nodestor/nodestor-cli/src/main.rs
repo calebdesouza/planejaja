@@ -102,6 +102,17 @@ enum Commands {
         #[arg(long, short)]
         filename: String,
     },
+    /// Roda um prompt direto contra um modelo local e mede TTFT/tok-s REAIS (sem servidor)
+    Run {
+        /// Prompt de entrada
+        prompt: String,
+        /// Caminho do modelo (GGUF/SafeTensors)
+        #[arg(long, short)]
+        model: String,
+        /// Máximo de tokens a gerar
+        #[arg(long, default_value = "128")]
+        max_tokens: usize,
+    },
 }
 
 #[tokio::main]
@@ -137,6 +148,7 @@ async fn main() -> Result<()> {
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
+            Commands::Run { prompt, model, max_tokens } => cmd_run(&model, &prompt, max_tokens).await,
         },
         None => {
             if cli.quiet {
@@ -328,39 +340,133 @@ async fn cmd_search(query: &str, k: usize) -> Result<()> {
     println!("Consulta: \"{}\"\n", query);
 
     let client = reqwest::Client::new();
-    // No sistema real, faríamos embedding da query e buscaríamos no LanceDB
-    // Para a CLI, conectamos ao servidor motor
-    let url = format!("http://localhost:8080/scan"); // Simulação via endpoint existente
-    
-    let res = client.get(url).send().await;
+    let base = "http://localhost:8080";
 
-    match res {
-        Ok(_) => {
-            println!("✅ Resultados encontrados no LanceDB:");
-            println!("   - [ID-123] Contexto de manual técnico (score: 0.98)");
-            println!("   - [ID-456] Histórico de chat anterior (score: 0.85)");
+    // Confirma que o motor residente está ativo antes de consultar o índice.
+    match client.get(format!("{}/health", base)).send().await {
+        Ok(r) if r.status().is_success() => {
+            println!("✅ Motor residente ativo. Consultando índice semântico (LanceDB)...");
+            // A busca vetorial real roda no motor (embedding da query → kNN no LanceDB).
+            // O endpoint dedicado de busca é exposto pelo servidor; aqui encaminhamos.
+            match client
+                .get(format!("{}/search", base))
+                .query(&[("q", query), ("k", &k.to_string())])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+                    println!("\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+                }
+                _ => {
+                    println!("ℹ️  O endpoint /search ainda não está exposto neste servidor.");
+                    println!("    Indexe documentos colocando .txt/.md em ./knowledge — o");
+                    println!("    Self-Indexing Hub do servidor os ingere automaticamente.");
+                }
+            }
         }
-        Err(_) => println!("❌ Motor desligado. Use 'nodestor start' primeiro."),
+        _ => {
+            println!("❌ Motor desligado. Use 'nodestor start --model <path>' primeiro.");
+        }
     }
-    
+
     Ok(())
 }
 
-async fn cmd_latency(_model_path: Option<String>) -> Result<()> {
-    println!("\n⏱️ Iniciando Teste de Latência NodeStor (7 Camadas)...");
-    
-    // Simulação p/ CLI dinâmica
-    println!("🚀 Calibrando Kernels Vulkan...");
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    
-    println!("\n-------------------------------------------");
-    println!("💎 RESULTADOS DE PERFORMANCE INDUSTRIAL");
-    println!("-------------------------------------------");
-    println!("| Time To First Token: \x1b[1;32m~12.4 ms\x1b[0m");
-    println!("| Velocidade de Ponta: \x1b[1;32m84.2 tokens/s\x1b[0m");
-    println!("-------------------------------------------");
+/// Procura um modelo (.gguf/.safetensors) em ~/.nodestor/models/.
+fn autodetect_model() -> Option<String> {
+    let mut model_dir = dirs::home_dir().unwrap_or_default();
+    model_dir.push(".nodestor");
+    model_dir.push("models");
+    if let Ok(entries) = std::fs::read_dir(&model_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
 
+/// Inferência local direta: carrega o modelo no pipeline e gera, medindo
+/// TTFT e tokens/s REAIS em tempo de execução (nada estimado/hardcoded).
+async fn cmd_run(model: &str, prompt: &str, max_tokens: usize) -> Result<()> {
+    use nodestor_inference::pipeline::{InferenceConfig, InferencePipeline};
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use std::io::Write;
+
+    println!("\n🚀 NodeStor Run — Inferência local direta (sem servidor)\n{}", "─".repeat(60));
+    println!("📂 Modelo : {}", model);
+    println!("💬 Prompt : {}", prompt);
+    println!("🎯 Tokens : {}", max_tokens);
+
+    if !std::path::Path::new(model).exists() {
+        return Err(anyhow::anyhow!("Modelo não encontrado: {}. Use 'nodestor pull' ou indique o caminho.", model));
+    }
+
+    let config = InferenceConfig {
+        model_path: model.to_string(),
+        prefetch_depth: 4,
+        buffer_size: 64 * 1024 * 1024,
+    };
+
+    print!("\n⏳ Carregando motor (scanner → transport → Vulkan → pesos)... ");
+    std::io::stdout().flush().ok();
+    let boot = Instant::now();
+    let pipeline = Arc::new(
+        InferencePipeline::init(config).map_err(|e| anyhow::anyhow!("Falha ao carregar modelo: {}", e))?
+    );
+    println!("pronto em {:.2}s", boot.elapsed().as_secs_f64());
+
+    // Stream real token-a-token, cronometrando o primeiro token (TTFT).
+    let gen_start = Instant::now();
+    let mut stream = pipeline.clone().generate_stream(prompt.to_string(), max_tokens).await;
+
+    print!("\n🤖 ");
+    std::io::stdout().flush().ok();
+    let mut ttft_ms: Option<f64> = None;
+    let mut n_tokens = 0usize;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(token) => {
+                if ttft_ms.is_none() {
+                    ttft_ms = Some(gen_start.elapsed().as_secs_f64() * 1000.0);
+                }
+                print!("{}", token);
+                std::io::stdout().flush().ok();
+                n_tokens += 1;
+            }
+            Err(e) => eprintln!("\n⚠️  {}", e),
+        }
+    }
+    let total = gen_start.elapsed().as_secs_f64();
+    let tps = if total > 0.0 { n_tokens as f64 / total } else { 0.0 };
+
+    println!("\n\n📊 Métricas (medidas em tempo real — não estimadas):");
+    println!("   TTFT       : {}", ttft_ms.map(|t| format!("{:.1} ms", t)).unwrap_or_else(|| "—".into()));
+    println!("   Tokens     : {}", n_tokens);
+    println!("   Velocidade : {:.2} tok/s", tps);
+    println!("   Tempo total: {:.2}s", total);
     Ok(())
+}
+
+async fn cmd_latency(model_path: Option<String>) -> Result<()> {
+    println!("\n⏱️  NodeStor — Teste de Latência REAL (TTFT + tok/s medidos)\n{}", "─".repeat(60));
+
+    let model = match model_path.or_else(autodetect_model) {
+        Some(m) => m,
+        None => {
+            println!("⚠️  Nenhum modelo informado e nenhum encontrado em ~/.nodestor/models/.");
+            println!("    Uso: nodestor latency --model <caminho.gguf>");
+            return Ok(());
+        }
+    };
+
+    // Mede com um prompt curto padrão (32 tokens). Reaproveita o caminho real.
+    cmd_run(&model, "The quick brown fox", 32).await
 }
 
 fn print_logo() {
@@ -785,7 +891,6 @@ async fn cmd_bench_sts(path: &str) -> Result<()> {
     use nodestor_transport::create_transport;
     use nodestor_formats::detect_parser;
     use nodestor_streaming::{BurstScheduler, MesPrefetchQueue, BufferPool};
-    use nodestor_vulkan::VulkanContext;
     use std::sync::Arc;
 
     println!("\n🚀 NodeStor — Benchmark: Speculative Tensor Streaming (STS)\n{}", "─".repeat(65));
@@ -825,12 +930,12 @@ async fn cmd_bench_sts(path: &str) -> Result<()> {
     println!("📄 Modelo: {}", metadata_arc.model_name.as_deref().unwrap_or(path));
     println!("🗂️  Construindo Grafo Causal...");
     
-    let ctx = match VulkanContext::new(None) {
-        Ok(c) => c,
-        Err(_) => return Err(anyhow::anyhow!("Vulkan é mandatório para buffer pool")),
-    };
-    
-    let pool = BufferPool::new(&ctx, 1024, 8)
+    // Usa VulkanEngine::new (fallback gracioso para simulação em máquinas sem GPU)
+    // em vez de VulkanContext::new(None), que tocaria a FFI real e poderia crashar.
+    let engine = nodestor_vulkan::VulkanEngine::new(&profile)
+        .map_err(|e| anyhow::anyhow!("Falha ao iniciar engine: {}", e))?;
+
+    let pool = BufferPool::new(&engine.ctx, 1024, 8)
         .map_err(|e| anyhow::anyhow!("Falha pool: {}", e))?;
 
     let queue = MesPrefetchQueue::new(tport.clone(), path.to_string(), pool);
