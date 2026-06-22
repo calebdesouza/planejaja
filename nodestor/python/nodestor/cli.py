@@ -149,10 +149,13 @@ def print_logo() -> None:
 # ─────────────────────────────── catálogo de comandos ───────────────────────────
 # Poucos comandos, claros. (nome, uso, descrição)
 COMMANDS = [
+    ("pull",    "nodestor pull <repo> --filename <arquivo>",    "Baixa um modelo do HuggingFace para ~/.nodestor/models"),
     ("run",     "nodestor run \"<prompt>\" --model <arquivo>", "Roda um prompt num modelo local e mostra TTFT e tok/s reais"),
     ("chat",    "nodestor chat --model <arquivo>",              "Conversa interativa contínua com o modelo"),
     ("serve",   "nodestor serve --model <arquivo>",             "Sobe o servidor (API OpenAI/Anthropic/Ollama) na porta 8080"),
+    ("inspect", "nodestor inspect <arquivo>",                   "Mostra formato, nº de tensores e tamanho do modelo"),
     ("scan",    "nodestor scan",                                "Detecta GPU, VRAM, SSD e o melhor caminho SSD→GPU"),
+    ("connect", "nodestor connect",                             "Como ligar Claude Code, Cursor e outras ferramentas"),
     ("help",    "nodestor help",                                "Mostra esta lista de comandos e para que servem"),
     ("version", "nodestor version",                             "Mostra a versão instalada"),
 ]
@@ -217,13 +220,13 @@ def cmd_scan() -> int:
 
 def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
     header("Inferência Local", model)
+    if not os.path.exists(model):
+        out(_c(f"Modelo não encontrado: {model}", "red"))
+        out("  Baixe um com: " + _c("nodestor pull <repo> --filename <arquivo.gguf>", "cyan"))
+        return 1
     if not _require_engine():
         return 1
     from . import NodeStorEngine
-
-    if not os.path.exists(model):
-        out(_c(f"Modelo não encontrado: {model}", "red"))
-        return 1
     out(_c("⏳ Carregando motor…", "dim"))
     t0 = time.time()
     try:
@@ -250,13 +253,13 @@ def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
 
 def cmd_chat(model: str, max_tokens: int) -> int:
     header("Chat Interativo", "digite /sair para encerrar")
+    if not os.path.exists(model):
+        out(_c(f"Modelo não encontrado: {model}", "red"))
+        out("  Baixe um com: " + _c("nodestor pull <repo> --filename <arquivo.gguf>", "cyan"))
+        return 1
     if not _require_engine():
         return 1
     from . import NodeStorEngine
-
-    if not os.path.exists(model):
-        out(_c(f"Modelo não encontrado: {model}", "red"))
-        return 1
     out(_c("⏳ Carregando motor…", "dim"))
     try:
         engine = NodeStorEngine(model)
@@ -282,32 +285,164 @@ def cmd_chat(model: str, max_tokens: int) -> int:
     return 0
 
 
+def _find_server_binary() -> "str | None":
+    """Procura o binário nodestor-server no PATH e nos diretórios de build."""
+    import shutil
+
+    exe = "nodestor-server.exe" if os.name == "nt" else "nodestor-server"
+    found = shutil.which("nodestor-server")
+    if found:
+        return found
+    here = os.path.dirname(os.path.abspath(__file__))          # .../python/nodestor
+    repo = os.path.abspath(os.path.join(here, "..", ".."))     # .../nodestor
+    candidates = [
+        os.path.join(repo, "target", "release", exe),
+        os.path.join(repo, "target", "debug", exe),
+    ]
+    triple_root = os.path.join(repo, "target")
+    if os.path.isdir(triple_root):
+        for entry in os.listdir(triple_root):
+            for prof in ("release", "debug"):
+                candidates.append(os.path.join(triple_root, entry, prof, exe))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def cmd_serve(model: str, port: int) -> int:
     header("Servidor NodeStor", f"API OpenAI/Anthropic/Ollama • porta {port}")
-    import shutil
     import subprocess
 
-    server_bin = shutil.which("nodestor-server")
+    server_bin = _find_server_binary()
     if server_bin is None:
-        out(_c("Binário 'nodestor-server' não encontrado no PATH.", "yellow"))
+        out(_c("Binário 'nodestor-server' não encontrado.", "yellow"))
         out("  Compile o servidor com: " + _c("cargo build --release -p nodestor-server", "cyan"))
-        out("  e adicione ./target/release ao PATH.")
         return 1
-    out(_c(f"▶ iniciando servidor em http://localhost:{port} …", "green"))
+    if not os.path.exists(model):
+        out(_c(f"Modelo não encontrado: {model}", "red"))
+        return 1
+    out(_c(f"▶ iniciando servidor em http://localhost:{port} …", "green") + _c(f"  [{server_bin}]", "dim"))
     try:
         return subprocess.call([server_bin, "--model", model, "--port", str(port)])
     except KeyboardInterrupt:
         return 0
 
 
+def cmd_pull(repo: str, filename: str) -> int:
+    """Baixa um modelo do HuggingFace Hub para ~/.nodestor/models (sem deps extras)."""
+    header("Baixar modelo", f"{repo} / {filename}")
+    import urllib.request
+    import urllib.error
+
+    dest_dir = os.path.join(os.path.expanduser("~"), ".nodestor", "models")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(filename))
+    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+    out(_c("baixando ", "dim") + url)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "nodestor-cli"})
+        with urllib.request.urlopen(req) as resp:
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            done = 0
+            chunk = 1 << 20  # 1 MB
+            with open(dest, "wb") as fh:
+                while True:
+                    block = resp.read(chunk)
+                    if not block:
+                        break
+                    fh.write(block)
+                    done += len(block)
+                    if total:
+                        pct = done * 100 // total
+                        bar_len = 30
+                        filled = bar_len * done // total
+                        bar = ("#" * filled).ljust(bar_len)
+                        sys.stdout.write(f"\r  [{bar}] {pct:3d}%  {done/1e6:6.1f} MB")
+                    else:
+                        sys.stdout.write(f"\r  {done/1e6:6.1f} MB")
+                    sys.stdout.flush()
+        sys.stdout.write("\n")
+        out(_c(f"✓ salvo em {dest}", "green"))
+        out("  Rode: " + _c(f'nodestor run "Olá" --model "{dest}"', "cyan"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        out(_c(f"\nFalha HTTP {exc.code}: {exc.reason}", "red"))
+        out("  Verifique o repo/arquivo. Ex: " + _c("nodestor pull TheBloke/Llama-2-7B-GGUF --filename llama-2-7b.Q4_K_M.gguf", "dim"))
+        return 1
+    except Exception as exc:
+        out(_c(f"\nErro ao baixar: {exc}", "red"))
+        return 1
+
+
+def cmd_inspect(path: str) -> int:
+    """Inspeção de modelo (cabeçalho GGUF em Python puro — observabilidade sem o motor)."""
+    header("Inspeção de Modelo", path)
+    if not os.path.exists(path):
+        out(_c(f"Arquivo não encontrado: {path}", "red"))
+        return 1
+    import struct
+
+    size = os.path.getsize(path)
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+            if magic == b"GGUF":
+                version = struct.unpack("<I", fh.read(4))[0]
+                n_tensors = struct.unpack("<Q", fh.read(8))[0]
+                n_kv = struct.unpack("<Q", fh.read(8))[0]
+                out(_c("Formato      : ", "bold") + "GGUF v" + str(version))
+                out(_c("Tensores     : ", "bold") + f"{n_tensors:,}")
+                out(_c("Metadados KV : ", "bold") + f"{n_kv:,}")
+                out(_c("Tamanho      : ", "bold") + f"{size/1e9:.2f} GB")
+                out(_c("\nDica:", "yellow", "bold") + " a lista completa de tensores/arquitetura vem do motor (" + _c("nodestor inspect", "cyan") + " no binário Rust).")
+                return 0
+            elif path.endswith(".safetensors"):
+                # Header SafeTensors: u64 little-endian com o tamanho do JSON de header.
+                fh.seek(0)
+                hlen = struct.unpack("<Q", fh.read(8))[0]
+                import json
+                meta = json.loads(fh.read(hlen).decode("utf-8", errors="replace"))
+                n = len([k for k in meta.keys() if k != "__metadata__"])
+                out(_c("Formato      : ", "bold") + "SafeTensors")
+                out(_c("Tensores     : ", "bold") + f"{n:,}")
+                out(_c("Tamanho      : ", "bold") + f"{size/1e9:.2f} GB")
+                return 0
+            else:
+                out(_c("Formato não reconhecido (esperado GGUF ou SafeTensors).", "yellow"))
+                out(_c("Tamanho: ", "bold") + f"{size/1e9:.2f} GB")
+                return 1
+    except Exception as exc:
+        out(_c(f"Erro ao ler: {exc}", "red"))
+        return 1
+
+
+def cmd_connect() -> int:
+    """Instruções para conectar Claude Code, Cursor e outras ferramentas."""
+    header("Conectar ferramentas", "Claude Code • Cursor • Ollama-compatible")
+    out(_c("1) Anthropic API (Claude Code):", "bold"))
+    out("   export ANTHROPIC_BASE_URL=" + _c("http://localhost:8080", "cyan"))
+    out("   export ANTHROPIC_API_KEY=" + _c("nodestor", "cyan"))
+    out(_c("\n2) OpenAI API (Cursor / Windsurf):", "bold"))
+    out("   Base URL: " + _c("http://localhost:8080/v1", "cyan"))
+    out("   Model ID: " + _c("nodestor", "cyan"))
+    out(_c("\n3) MCP (Model Context Protocol):", "bold"))
+    out("   Endpoint: " + _c("http://localhost:8080/mcp", "cyan"))
+    out(_c("\nSuba o servidor primeiro com: ", "dim") + _c("nodestor serve --model <arquivo>", "cyan"))
+    return 0
+
+
 # ─────────────────────────────── painel interativo ─────────────────────────────
 def interactive_menu() -> int:
     print_logo()
     options = [
+        ("Baixar um modelo (pull)", "pull"),
         ("Rodar um prompt (run)", "run"),
         ("Conversar (chat)", "chat"),
         ("Subir o servidor (serve)", "serve"),
+        ("Inspecionar um modelo (inspect)", "inspect"),
         ("Escanear o hardware (scan)", "scan"),
+        ("Conectar ferramentas (connect)", "connect"),
         ("Ver os comandos (help)", "help"),
         ("Sair", "exit"),
     ]
@@ -339,10 +474,32 @@ def interactive_menu() -> int:
         if action == "scan":
             cmd_scan()
             continue
-        # run / chat / serve precisam de um modelo
+        if action == "connect":
+            cmd_connect()
+            continue
+        if action == "pull":
+            repo = input(_c("  repo HuggingFace (ex: TheBloke/Llama-2-7B-GGUF): ", "cyan")).strip()
+            fname = input(_c("  arquivo (ex: llama-2-7b.Q4_K_M.gguf): ", "cyan")).strip()
+            if repo and fname:
+                cmd_pull(repo, fname)
+            else:
+                out(_c("  cancelado", "dim"))
+            continue
+        if action == "inspect":
+            path = input(_c("  caminho do modelo: ", "cyan")).strip().strip('"')
+            if path:
+                cmd_inspect(path)
+            else:
+                out(_c("  cancelado", "dim"))
+            continue
+        # run / chat / serve precisam de um modelo existente
         model = input(_c("  caminho do modelo (.gguf): ", "cyan")).strip().strip('"')
         if not model:
             out(_c("  cancelado", "dim"))
+            continue
+        if not os.path.exists(model):
+            out(_c(f"  Modelo não encontrado: {model}", "red"))
+            out(_c("  Baixe um primeiro pela opção 'Baixar um modelo (pull)'.", "dim"))
             continue
         if action == "run":
             prompt = input(_c("  prompt: ", "cyan")).strip()
@@ -363,10 +520,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command")
 
+    pp = sub.add_parser("pull", help="Baixa um modelo do HuggingFace Hub")
+    pp.add_argument("repo", help="ID do repo (ex: TheBloke/Llama-2-7B-GGUF)")
+    pp.add_argument("-f", "--filename", required=True, help="Arquivo a baixar (ex: llama-2-7b.Q4_K_M.gguf)")
+
     pr = sub.add_parser("run", help="Roda um prompt num modelo local")
     pr.add_argument("prompt", help="Texto do prompt")
     pr.add_argument("-m", "--model", required=True, help="Caminho do modelo (.gguf/.safetensors)")
     pr.add_argument("--max-tokens", type=int, default=128)
+
+    pi = sub.add_parser("inspect", help="Mostra metadados de um arquivo de modelo")
+    pi.add_argument("path", help="Caminho do modelo (.gguf/.safetensors)")
 
     pc = sub.add_parser("chat", help="Conversa interativa com o modelo")
     pc.add_argument("-m", "--model", required=True)
@@ -377,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--port", type=int, default=8080)
 
     sub.add_parser("scan", help="Detecta hardware (GPU/VRAM/SSD)")
+    sub.add_parser("connect", help="Como ligar Claude Code/Cursor/etc.")
     sub.add_parser("help", help="Mostra os comandos e para que servem")
     sub.add_parser("version", help="Mostra a versão")
     return p
@@ -392,14 +557,20 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "pull":
+        return cmd_pull(args.repo, args.filename)
     if args.command == "run":
         return cmd_run(args.model, args.prompt, args.max_tokens)
     if args.command == "chat":
         return cmd_chat(args.model, args.max_tokens)
     if args.command == "serve":
         return cmd_serve(args.model, args.port)
+    if args.command == "inspect":
+        return cmd_inspect(args.path)
     if args.command == "scan":
         return cmd_scan()
+    if args.command == "connect":
+        return cmd_connect()
     if args.command == "version":
         return cmd_version()
     # help (ou comando ausente)
