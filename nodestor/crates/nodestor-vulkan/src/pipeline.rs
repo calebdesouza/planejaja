@@ -883,7 +883,13 @@ impl ComputePipeline {
         head_dim: u32,
         scale: f32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        // Simulação (sem GPU): atenção de referência em CPU. O caminho principal
+        // continua sendo o shader Vulkan abaixo; isto só preenche numéricos reais
+        // quando não há acelerador.
+        if !self.vulkan_active {
+            cpu_attention_sim(q, k, v, out_attn, seq_len, head_dim, scale);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -939,7 +945,12 @@ impl ComputePipeline {
         head_dim: u32,
         scale: f32,
     ) -> Result<(), NodeStorError> {
-        if !self.vulkan_active { return Ok(()); }
+        // Simulação (sem GPU): mesma atenção de referência em CPU. Em hardware real
+        // o caminho abaixo usa o shader TurboQuant (Lloyd-Max dequant + softmax).
+        if !self.vulkan_active {
+            cpu_attention_sim(q, k, v, out_attn, seq_len, head_dim, scale);
+            return Ok(());
+        }
         unsafe {
             let device = ctx.device.as_ref().unwrap();
             let descriptor_pool = ctx.descriptor_pool.unwrap();
@@ -1464,6 +1475,83 @@ pub fn create_all_pipelines(
     Ok(map)
 }
 
+/// Atenção de referência em CPU para o caminho de SIMULAÇÃO (sem Vulkan).
+///
+/// Implementa atenção multi-head com suporte a GQA derivando o nº de cabeças dos
+/// tamanhos dos buffers: `num_q_heads = (q_len/seq_len)/head_dim`. Para cada
+/// cabeça/posição: scores = scale·(Q·Kᵀ) → softmax estável → saída = Σ p·V.
+/// A saída tem o mesmo layout de Q (`seq_len · num_q_heads · head_dim`).
+///
+/// O foco do NodeStor é a GPU; esta rotina é o espelho fiel em CPU para máquinas
+/// sem acelerador e para testes numéricos determinísticos.
+fn cpu_attention_sim(
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    out_attn: &mut GpuBuffer,
+    seq_len: u32,
+    head_dim: u32,
+    scale: f32,
+) {
+    let seq = seq_len as usize;
+    let hd = head_dim as usize;
+    if seq == 0 || hd == 0 { return; }
+
+    let qs = q.as_f32_slice();
+    let ks = k.as_f32_slice();
+    let vs = v.as_f32_slice();
+
+    let per_pos_q = (qs.len() / seq).max(hd);   // num_q_heads · head_dim
+    let per_pos_kv = (ks.len() / seq).max(hd);  // num_kv_heads · head_dim
+    let num_q_heads = (per_pos_q / hd).max(1);
+    let num_kv_heads = (per_pos_kv / hd).max(1);
+    let group = (num_q_heads / num_kv_heads).max(1); // mapeamento GQA
+
+    let n_out = out_attn.size / 4;
+    let mut out_vals = vec![0.0f32; n_out];
+
+    for qi in 0..seq {
+        for h in 0..num_q_heads {
+            let kvh = (h / group).min(num_kv_heads - 1);
+            // 1) scores = scale · (Q · Kᵀ) sobre todas as posições de chave
+            let q_base = qi * per_pos_q + h * hd;
+            let mut scores = vec![0.0f32; seq];
+            for kj in 0..seq {
+                let k_base = kj * per_pos_kv + kvh * hd;
+                let mut dot = 0.0f32;
+                for d in 0..hd {
+                    dot += qs.get(q_base + d).copied().unwrap_or(0.0)
+                         * ks.get(k_base + d).copied().unwrap_or(0.0);
+                }
+                scores[kj] = dot * scale;
+            }
+            // 2) softmax numericamente estável (subtrai o máximo)
+            let maxs = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() { *s = (*s - maxs).exp(); sum += *s; }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            // 3) saída = Σ (p · V)
+            let o_base = qi * per_pos_q + h * hd;
+            for d in 0..hd {
+                let mut acc = 0.0f32;
+                for kj in 0..seq {
+                    let v_base = kj * per_pos_kv + kvh * hd;
+                    acc += scores[kj] * inv * vs.get(v_base + d).copied().unwrap_or(0.0);
+                }
+                if let Some(slot) = out_vals.get_mut(o_base + d) { *slot = acc; }
+            }
+        }
+    }
+
+    let bytes = out_attn.as_mut_bytes();
+    for (i, val) in out_vals.iter().enumerate() {
+        let o = i * 4;
+        if o + 4 <= bytes.len() {
+            bytes[o..o + 4].copy_from_slice(&val.to_le_bytes());
+        }
+    }
+}
+
 fn cpu_matmul_f32(a: &[f32], b: &[f32], output: &mut GpuBuffer, m: usize, k: usize, n: usize) {
     for i in 0..m {
         for j in 0..n {
@@ -1527,6 +1615,69 @@ pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
     map.insert(PipelineKind::MoERouting, ComputePipeline::new_simulation(PipelineKind::MoERouting));
     map.insert(PipelineKind::FusedLayerNormGelu, ComputePipeline::new_simulation(PipelineKind::FusedLayerNormGelu));
     map
+}
+
+#[cfg(test)]
+mod attention_sim_tests {
+    use crate::VulkanEngine;
+
+    fn f2b(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() }
+
+    /// Prova numérica: a atenção em simulação computa softmax(Q·Kᵀ·scale)·V de
+    /// verdade — não é mais um no-op que devolve zeros.
+    #[test]
+    fn test_cpu_attention_matches_hand_computed() {
+        let engine = VulkanEngine::new_simulation();
+        // 1 cabeça, head_dim=2, seq_len=2, scale=1.0
+        let q = engine.upload(&f2b(&[1.0, 0.0,  0.0, 1.0])).unwrap();
+        let k = engine.upload(&f2b(&[1.0, 0.0,  0.0, 1.0])).unwrap();
+        let v = engine.upload(&f2b(&[1.0, 2.0,  3.0, 4.0])).unwrap();
+
+        let out = engine.attention(&q, &k, &v, 2, 2, 1.0).unwrap();
+        let got = engine.download_f32(&out).unwrap();
+
+        // pos0: scores=[1,0] → p=[0.7311,0.2689] → [1.5379, 2.5379]
+        // pos1: scores=[0,1] → p=[0.2689,0.7311] → [2.4621, 3.4621]
+        let expected = [1.5379f32, 2.5379, 2.4621, 3.4621];
+        assert_eq!(got.len(), 4, "saída deve ter seq_len·head_dim = 4 floats");
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-3, "idx {}: esperado {:.4}, obtido {:.4}", i, e, g);
+        }
+    }
+
+    /// Com uma única posição de chave (seq_len=1), softmax de 1 elemento = 1.0,
+    /// logo a saída da atenção deve ser exatamente V.
+    #[test]
+    fn test_cpu_attention_single_key_returns_v() {
+        let engine = VulkanEngine::new_simulation();
+        let q = engine.upload(&f2b(&[0.5, -0.3])).unwrap();
+        let k = engine.upload(&f2b(&[9.0, 9.0])).unwrap();
+        let v = engine.upload(&f2b(&[7.0, -2.0])).unwrap();
+        let out = engine.attention(&q, &k, &v, 1, 2, 0.125).unwrap();
+        let got = engine.download_f32(&out).unwrap();
+        assert!((got[0] - 7.0).abs() < 1e-5, "saída[0] deve ser V[0]=7.0, foi {}", got[0]);
+        assert!((got[1] + 2.0).abs() < 1e-5, "saída[1] deve ser V[1]=-2.0, foi {}", got[1]);
+    }
+
+    /// GQA: 2 cabeças de query compartilhando 1 cabeça de KV não deve quebrar
+    /// (saída do tamanho de Q, finita).
+    #[test]
+    fn test_cpu_attention_gqa_shapes() {
+        let engine = VulkanEngine::new_simulation();
+        // q: 2 heads × head_dim 2 = 4 floats; k/v: 1 kv head × 2 = 2 floats; seq=1
+        let q = engine.upload(&f2b(&[1.0, 0.0, 0.0, 1.0])).unwrap();
+        let k = engine.upload(&f2b(&[1.0, 1.0])).unwrap();
+        let v = engine.upload(&f2b(&[5.0, 6.0])).unwrap();
+        let out = engine.attention(&q, &k, &v, 1, 2, 1.0).unwrap();
+        let got = engine.download_f32(&out).unwrap();
+        assert_eq!(got.len(), 4, "saída deve ter o layout de Q (2 heads × 2)");
+        // seq=1 → softmax=1 → cada cabeça de query recebe V da única kv head
+        for (i, g) in got.iter().enumerate() {
+            assert!(g.is_finite(), "saída[{}] deve ser finita", i);
+            let expected = if i % 2 == 0 { 5.0 } else { 6.0 };
+            assert!((g - expected).abs() < 1e-5, "idx {}: esperado {}, foi {}", i, expected, g);
+        }
+    }
 }
 
 #[cfg(test)]
