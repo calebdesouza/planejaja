@@ -16,7 +16,73 @@ impl TokenizerManager {
     pub fn from_string(json_content: &str) -> std::result::Result<Self, NodeStorError> {
         let inner = Tokenizer::from_str(json_content)
             .map_err(|e: Box<dyn std::error::Error + Send + Sync>| NodeStorError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
-        
+
+        Ok(Self { inner })
+    }
+
+    /// Constrói um tokenizer REAL a partir dos metadados embutidos no GGUF
+    /// (`tokenizer.ggml.tokens` + `tokenizer.ggml.merges`).
+    ///
+    /// Monta um `tokenizer.json` BPE byte-level (estilo GPT-2/Llama-3/Qwen/SmolLM2)
+    /// e o desserializa via a lib oficial — assim modelos reais decodificam para
+    /// TEXTO coerente em vez do tokenizer dummy. `model_type` vem de
+    /// `tokenizer.ggml.model` ("gpt2"/"llama"/...).
+    pub fn from_gguf(
+        tokens: &[String],
+        merges: &[String],
+        bos: Option<u32>,
+        eos: Option<u32>,
+        unk: Option<u32>,
+    ) -> std::result::Result<Self, NodeStorError> {
+        use std::collections::HashMap;
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::AddedToken;
+
+        if tokens.is_empty() {
+            return Err(NodeStorError::InvalidModelFormat("GGUF sem vocab de tokenizer".into()));
+        }
+
+        let err = |m: String| NodeStorError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, m));
+
+        // vocab: token_string → id (índice no array do GGUF)
+        let vocab: HashMap<String, u32> = tokens.iter().enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        // merges "a b" → (a, b)
+        let merges_pairs: Vec<(String, String)> = merges.iter()
+            .filter_map(|m| {
+                let mut it = m.splitn(2, ' ');
+                match (it.next(), it.next()) {
+                    (Some(a), Some(b)) => Some((a.to_string(), b.to_string())),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges_pairs)
+            .build()
+            .map_err(|e| err(format!("BPE build: {}", e)))?;
+
+        let mut inner = Tokenizer::new(bpe);
+        // GPT-2/Llama-3/Qwen/SmolLM2 usam BPE byte-level: o ByteLevel é tanto
+        // pré-tokenizador (encode) quanto decodificador (espaços → 'Ġ' e volta).
+        let bl = ByteLevel::new(false, true, true);
+        inner.with_pre_tokenizer(bl.clone());
+        inner.with_decoder(bl);
+
+        // Tokens especiais (bos/eos/unk) → reconhecidos no encode e puláveis no decode.
+        let mut specials: Vec<AddedToken> = Vec::new();
+        for id in [bos, eos, unk].into_iter().flatten() {
+            if let Some(content) = tokens.get(id as usize) {
+                specials.push(AddedToken::from(content.clone(), true));
+            }
+        }
+        if !specials.is_empty() {
+            inner.add_special_tokens(&specials);
+        }
+
         Ok(Self { inner })
     }
 

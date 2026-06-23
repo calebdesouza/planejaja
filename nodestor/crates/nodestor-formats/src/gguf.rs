@@ -208,13 +208,16 @@ fn read_gguf_value<R: Read>(reader: &mut R, value_type: u32) -> std::io::Result<
             // Array: type (u32) + count (u64) + items
             let arr_type = reader.read_u32::<LittleEndian>()?;
             let count = reader.read_u64::<LittleEndian>()?;
-            let mut arr = Vec::with_capacity(count.min(1000) as usize);
-            for _ in 0..count.min(1000) {
+            // Limite de segurança ALTO: o vocab do tokenizer (tokenizer.ggml.tokens)
+            // pode ter 256k+ itens; truncar quebra a tokenização. Cobrimos vocabs
+            // reais sem materializar arrays patologicamente gigantes.
+            let cap = count.min(2_000_000) as usize;
+            let mut arr = Vec::with_capacity(cap.min(65_536));
+            for _ in 0..cap {
                 arr.push(read_gguf_value(reader, arr_type)?);
             }
-            // Pula elementos além de 1000
-            for _ in 1000..count {
-                let _ = read_gguf_value(reader, arr_type);
+            for _ in (cap as u64)..count {
+                let _ = read_gguf_value(reader, arr_type)?;
             }
             Ok(serde_json::Value::Array(arr))
         }

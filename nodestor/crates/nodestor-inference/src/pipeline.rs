@@ -378,15 +378,36 @@ impl InferencePipeline {
             use_conformal: probes_enabled,
         });
 
-        // ── Tokenizer — encode do prompt ─────────────────────────────────────────
-        // Tenta carregar o tokenizer real do GGUF; fallback para tokenizer dummy
+        // ── Tokenizer — encode/decode ────────────────────────────────────────────
+        // Constrói o tokenizer REAL a partir do vocab+merges embutidos no GGUF
+        // (`tokenizer.ggml.tokens`/`.merges`). Sem isso, texto de modelos reais sai
+        // ilegível. Fallback para um WordLevel dummy se o GGUF não trouxer vocab.
         let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"Hello":1,"World":2},"unk_token":"<unk>"}}"#;
-        let tokenizer_json = self.metadata.extra.get("tokenizer.ggml.model")
-            .and_then(|v| v.as_str())
-            .unwrap_or(dummy_json);
-        let tokenizer = crate::tokenizer::TokenizerManager::from_string(tokenizer_json)
-            .or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json))
-            .map_err(|e| NodeStorError::InferenceError(format!("Falha ao construir tokenizer: {}", e)))?;
+        let extra = &self.metadata.extra;
+        let str_array = |key: &str| -> Vec<String> {
+            extra.get(key).and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default()
+        };
+        let u32_meta = |key: &str| -> Option<u32> {
+            extra.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+        };
+        let gguf_tokens = str_array("tokenizer.ggml.tokens");
+        let gguf_merges = str_array("tokenizer.ggml.merges");
+        let tokenizer = if !gguf_tokens.is_empty() {
+            debug!("Tokenizer GGUF: {} tokens, {} merges", gguf_tokens.len(), gguf_merges.len());
+            crate::tokenizer::TokenizerManager::from_gguf(
+                &gguf_tokens, &gguf_merges,
+                u32_meta("tokenizer.ggml.bos_token_id"),
+                u32_meta("tokenizer.ggml.eos_token_id"),
+                u32_meta("tokenizer.ggml.unknown_token_id"),
+            ).or_else(|e| {
+                warn!("Tokenizer GGUF falhou ({}); usando dummy", e);
+                crate::tokenizer::TokenizerManager::from_string(dummy_json)
+            })
+        } else {
+            crate::tokenizer::TokenizerManager::from_string(dummy_json)
+        }.map_err(|e| NodeStorError::InferenceError(format!("Falha ao construir tokenizer: {}", e)))?;
 
         // RAG end-to-end: costura os fragmentos recuperados ANTES do prompt, para
         // que o forward pass condicione a geração no conhecimento factual indexado.
@@ -424,10 +445,26 @@ impl InferencePipeline {
                 *generated_tokens.last().unwrap_or(&0)
             };
 
-            // Criar embedding de entrada
+            // Embedding de entrada: LOOKUP REAL da linha do token em token_embd.weight
+            // (matriz [vocab × hidden]). Antes usava um one-hot FALSO, o que dava lixo
+            // na entrada do forward → saída incoerente. A linha do token é a embedding.
             let embed_dim = hidden_size as usize;
-            let mut embed_data = vec![0.0f32; embed_dim];
-            embed_data[current_token as usize % embed_dim] = 1.0;
+            let embed_data: Vec<f32> = match weight_bank.get("token_embd.weight") {
+                Some(buf) => {
+                    let table = buf.as_f32_slice();
+                    let start = (current_token as usize) * embed_dim;
+                    if start + embed_dim <= table.len() {
+                        table[start..start + embed_dim].to_vec()
+                    } else {
+                        vec![0.0f32; embed_dim]
+                    }
+                }
+                None => {
+                    let mut e = vec![0.0f32; embed_dim];
+                    e[current_token as usize % embed_dim] = 1.0;
+                    e
+                }
+            };
             let embed_bytes = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4) };
             let embed_buf = self.engine.upload(embed_bytes)?;
 
@@ -511,7 +548,9 @@ impl InferencePipeline {
                 if let Some(ref tx_stream) = tx {
                     let token_str = tokenizer.decode(&[t], true).unwrap_or_default();
                     if !token_str.is_empty() {
-                        let _ = tx_stream.blocking_send(Ok(token_str));
+                        // `generate` roda como task async → usa o send assíncrono.
+                        // (`blocking_send` panica dentro do runtime Tokio.)
+                        let _ = tx_stream.send(Ok(token_str)).await;
                     }
                 }
             }
