@@ -403,8 +403,14 @@ impl InferencePipeline {
         let mut input_tokens = tokenizer.encode(&effective_prompt).unwrap_or(vec![0]);
         if input_tokens.is_empty() { input_tokens.push(0); }
 
-        // Pre-enche a RAM/VRAM para que o Kernel nunca bloqueie (Burst Pump)
-        scheduler.prime_pump().await?;
+        // Pre-enche a RAM/VRAM (Burst Pump) — best-effort e LIMITADO no tempo: o
+        // priming do streaming não pode bloquear a geração. Se estourar o limite,
+        // seguimos (os pesos já vêm do WeightStore mmap; o pump é otimização).
+        match tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.prime_pump()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("prime_pump: {}", e),
+            Err(_) => warn!("prime_pump excedeu 5s; seguindo sem pré-aquecer o stream"),
+        }
 
         let mut cober = crate::cober::CoberEngine::new_dense(crate::vram_budget::VramBudget::estimate(4 * 1024 * 1024 * 1024));
         let mut drafter = crate::latent_drafter::LatentDrafter::new(hidden_size as usize, 0.9);
@@ -510,16 +516,14 @@ impl InferencePipeline {
                 }
             }
 
+            // Paginação KV (contexto → SSD). Escrita direta, sem depender do
+            // prefetch streaming (cujo `next_tensor().await` podia bloquear o loop
+            // de geração indefinidamente). O streaming especulativo de pesos é
+            // orquestrado pelo APEX em paralelo; aqui só persistimos o KV.
             let logit_bytes = logits.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
             for layer_idx in 0..layers_per_token {
-                if let Some(mut block) = scheduler.next_tensor().await {
-                    let gpu_buffer = block.buffer.buffer.as_mut().unwrap();
-                    let _ = self.engine.matmul(gpu_buffer, gpu_buffer, 32, 32, 32);
-                    if let Err(e) = kv_cache.allocate_block(layer_idx, &logit_bytes, &*self.transport) {
-                        debug!("KV Cache alloc layer {}: {}", layer_idx, e);
-                    }
-                } else {
-                    return Err(NodeStorError::TransferFailed("A fila de prefetch secou!".to_string()));
+                if let Err(e) = kv_cache.allocate_block(layer_idx, &logit_bytes, &*self.transport) {
+                    debug!("KV Cache alloc layer {}: {}", layer_idx, e);
                 }
             }
             
