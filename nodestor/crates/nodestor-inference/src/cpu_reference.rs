@@ -225,7 +225,7 @@ pub fn argmax(logits: &[f32]) -> u32 {
 /// Forward INCREMENTAL de UM token na posição `pos`, usando/atualizando o KV cache.
 /// Retorna os logits [vocab] para predizer o PRÓXIMO token. Custo O(seq) por passo
 /// (atende ao histórico cacheado) em vez de O(seq²) do recompute total.
-pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache) -> Option<Vec<f32>> {
+fn step_impl(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache, n_run: usize) -> Option<Vec<f32>> {
     let h = cfg.hidden;
     let hd = cfg.head_dim;
     let nq = cfg.n_heads;
@@ -239,7 +239,7 @@ pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBan
     let s = (token as usize) * h;
     let mut x: Vec<f32> = tok_embd.get(s..s + h).map(|r| r.to_vec()).unwrap_or_else(|| vec![0.0; h]);
 
-    for layer in 0..cfg.n_layers {
+    for layer in 0..n_run.min(cfg.n_layers) {
         let attn_norm = weight(wb, &format!("blk.{}.attn_norm.weight", layer))?;
         let wq = weight(wb, &format!("blk.{}.attn_q.weight", layer))?;
         let wk = weight(wb, &format!("blk.{}.attn_k.weight", layer))?;
@@ -297,4 +297,16 @@ pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBan
     let normed = rmsnorm(&x, final_norm, cfg.eps);
     let lm_head = weight(wb, "output.weight").unwrap_or(tok_embd);
     Some(matvec(lm_head, &normed, cfg.vocab, h))
+}
+
+/// Forward incremental COMPLETO (todas as camadas) — o modelo ALVO.
+pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache) -> Option<Vec<f32>> {
+    step_impl(token, pos, cfg, wb, cache, cfg.n_layers)
+}
+
+/// Forward incremental PARCIAL (primeiras `n_run` camadas + norm + lm_head) — o
+/// RASCUNHADOR self-speculative (early-exit): o próprio modelo, truncado, prevê o
+/// futuro de forma barata. Sem pesos extras nem treino; usa as features do modelo.
+pub fn forward_step_partial(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache, n_run: usize) -> Option<Vec<f32>> {
+    step_impl(token, pos, cfg, wb, cache, n_run.max(1).min(cfg.n_layers))
 }
