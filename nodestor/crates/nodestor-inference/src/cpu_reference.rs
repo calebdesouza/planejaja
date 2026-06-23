@@ -310,3 +310,24 @@ pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBan
 pub fn forward_step_partial(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache, n_run: usize) -> Option<Vec<f32>> {
     step_impl(token, pos, cfg, wb, cache, n_run.max(1).min(cfg.n_layers))
 }
+
+/// VERIFICAÇÃO BATCHED de K rascunhos (especulação SEM cabeça / n-gram).
+///
+/// Processa cada rascunho `drafts[i]` na posição `start_pos+i`, ESTENDENDO o cache,
+/// e retorna os K vetores de logits (logits[i] prediz a posição start_pos+i+1).
+///
+/// Na GPU isto é UM ÚNICO forward pass com tree-attention causal — carrega os pesos
+/// do modelo da VRAM UMA vez e avalia os K tokens em paralelo. É exatamente daí que
+/// vem "1 weight-load = K tokens" (a vitória contra o gargalo de banda). Na CPU
+/// (compute-bound) é a soma de K passos; o chamador aceita o prefixo concordante e
+/// faz rollback (`cache.truncate`) dos rejeitados.
+pub fn forward_verify(drafts: &[u32], start_pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache) -> Vec<Vec<f32>> {
+    let mut out = Vec::with_capacity(drafts.len());
+    for (i, &d) in drafts.iter().enumerate() {
+        match forward_step(d, start_pos + i, cfg, wb, cache) {
+            Some(l) => out.push(l),
+            None => break,
+        }
+    }
+    out
+}

@@ -477,81 +477,105 @@ impl InferencePipeline {
         // Decode: processa só o token NOVO, atendendo ao histórico cacheado —
         // evita recomputar a sequência inteira a cada passo (O(seq²) → O(seq)).
         // É também a base para a especulação (COBER/EAGLE) render de verdade.
-        // ─── Decode GREEDY + SELF-SPECULATION (early-exit, lossless) ────────────
-        // (A) O RASCUNHADOR é o PRÓPRIO modelo truncado nas primeiras `draft_layers`
-        // camadas (early-exit) — sem pesos extras nem treino, usando as features do
-        // modelo. O ALVO (todas as camadas) VERIFICA cada rascunho; o prefixo
-        // concordante é aceito (greedy ⇒ lossless). Medimos a ACEITAÇÃO.
-        // (B) Se a cabeça EAGLE-2 estiver TREINADA, ela substitui o early-exit como
-        // rascunhador (mais barato e mais preciso) — ver `cober.eagle2_*`.
-        let draft_layers = (cpu_cfg.n_layers / 4).max(1);
-        const SPEC_K: usize = 4;
+        // ─── Decode GREEDY + ESPECULAÇÃO SEM CABEÇA (n-gram / Prompt Lookup) ────
+        // O método que MELHOR se encaixa: ZERO pesos extras, plug-and-play em
+        // QUALQUER modelo. A CPU faz string-matching no contexto (n-gram) e "copia"
+        // K tokens — custo ~zero. O ALVO os VERIFICA em UM forward batched
+        // (`forward_verify` = tree-attention na GPU: 1 weight-load avalia os K),
+        // aceita o PREFIXO concordante (greedy ⇒ lossless) e GUILHOTINA o resto
+        // (rollback do cache). Em texto repetitivo (código/JSON/listas) a aceitação
+        // é alta → "K tokens no tempo de 1" na placa limitada por banda.
+        const NGRAM: usize = 2;
+        const DRAFT_K: usize = 8;
+        let prompt_lookup = |seq: &[u32]| -> Vec<u32> {
+            let n = seq.len();
+            if n <= NGRAM { return Vec::new(); }
+            let suffix = &seq[n - NGRAM..];
+            let mut i = n - NGRAM;
+            while i > 0 {
+                i -= 1;
+                if &seq[i..i + NGRAM] == suffix {
+                    let start = i + NGRAM;
+                    let end = (start + DRAFT_K).min(n);
+                    if start < n { return seq[start..end].to_vec(); }
+                }
+            }
+            Vec::new()
+        };
         let mut main_kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
-        let mut draft_kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
         let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
 
-        // Prefill: preenche AMBAS as caches (alvo e rascunhador) com o prompt.
+        // Prefill: preenche o cache com o prompt.
         let mut cur_logits: Option<Vec<f32>> = None;
-        let mut draft_logits: Option<Vec<f32>> = None;
         for (p, &tok) in input_tokens.iter().enumerate() {
             match crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv) {
                 Some(l) => cur_logits = Some(l),
                 None => break, // pesos ausentes (modelo sintético) → encerra
             }
-            draft_logits = crate::cpu_reference::forward_step_partial(tok, p, &cpu_cfg, &weight_bank, &mut draft_kv, draft_layers);
         }
 
-        let mut next_pos = input_tokens.len();
+        let mut full_seq: Vec<u32> = input_tokens.clone();
+        let mut pos = input_tokens.len();
         let mut spec_drafted = 0usize;
         let mut spec_accepted = 0usize;
-
-        // Rascunho do próximo token via early-exit (argmax dos logits truncados).
-        // (B) A cabeça EAGLE-2 TREINADA — ver `cober::train_eagle2_head`, já testada —
-        // substituiria isto como rascunhador, lendo o HIDDEN do modelo (h-dim). O
-        // wiring de inferência do EAGLE precisa capturar esse hidden no loop
-        // (forward que retorne o hidden), passo claro e pequeno. Aqui usamos o
-        // rascunhador early-exit (treino-zero) para medir o mecanismo.
-        let draft_next = |draft_logits: &Option<Vec<f32>>| -> Option<u32> {
-            draft_logits.as_ref().map(|l| crate::cpu_reference::argmax(l))
-        };
+        let mut spec_rounds = 0usize;
 
         'outer: while generated_tokens.len() < max_tokens {
-            // Âncora: escolha greedy do modelo ALVO (sempre commitada; lossless).
-            let anchor = match &cur_logits { Some(l) => crate::cpu_reference::argmax(l), None => break };
+            let logits = match cur_logits.take() { Some(l) => l, None => break };
+
+            // 1+2+3. Rascunho n-gram → verificação batched → aceita prefixo.
+            let draft = prompt_lookup(&full_seq);
+            if !draft.is_empty() {
+                spec_rounds += 1;
+                spec_drafted += draft.len();
+                let orig = main_kv.len();
+                let vlogits = crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv);
+                let mut m = 0usize;
+                let mut prev: &Vec<f32> = &logits;
+                for i in 0..vlogits.len() {
+                    if crate::cpu_reference::argmax(prev) != draft[i] { break; }
+                    m += 1;
+                    prev = &vlogits[i];
+                }
+                main_kv.truncate(orig + m); // guilhotina os rascunhos rejeitados
+                spec_accepted += m;
+                for &t in draft.iter().take(m) {
+                    if Some(t) == eos_token { break 'outer; }
+                    generated_tokens.push(t);
+                    full_seq.push(t);
+                    tokens_done += 1;
+                    if let Some(ref tx_stream) = tx {
+                        let s = tokenizer.decode(&[t], true).unwrap_or_default();
+                        if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
+                    }
+                    if generated_tokens.len() >= max_tokens { break 'outer; }
+                }
+                cur_logits = Some(if m > 0 { vlogits[m - 1].clone() } else { logits.clone() });
+                pos += m;
+            } else {
+                cur_logits = Some(logits);
+            }
+            if generated_tokens.len() >= max_tokens { break; }
+
+            // 4. Token de correção do ALVO (sempre 1; lossless).
+            let next_logits = match cur_logits.take() { Some(l) => l, None => break };
+            let anchor = crate::cpu_reference::argmax(&next_logits);
             if Some(anchor) == eos_token { break; }
             generated_tokens.push(anchor);
+            full_seq.push(anchor);
             tokens_done += 1;
             if let Some(ref tx_stream) = tx {
                 let s = tokenizer.decode(&[anchor], true).unwrap_or_default();
                 if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
             }
-            cur_logits = crate::cpu_reference::forward_step(anchor, next_pos, &cpu_cfg, &weight_bank, &mut main_kv);
-            draft_logits = crate::cpu_reference::forward_step_partial(anchor, next_pos, &cpu_cfg, &weight_bank, &mut draft_kv, draft_layers);
-            next_pos += 1;
-            if generated_tokens.len() >= max_tokens { break; }
-
-            // Self-speculation: rascunhador propõe; o ALVO verifica (greedy, lossless).
-            for _ in 0..SPEC_K {
-                let d = match draft_next(&draft_logits) { Some(d) => d, None => break };
-                spec_drafted += 1;
-                let want = match &cur_logits { Some(l) => crate::cpu_reference::argmax(l), None => break };
-                if want != d { break; } // alvo discorda → rejeita, encerra a rodada
-                spec_accepted += 1;
-                generated_tokens.push(d);
-                tokens_done += 1;
-                if let Some(ref tx_stream) = tx {
-                    let s = tokenizer.decode(&[d], true).unwrap_or_default();
-                    if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
-                }
-                cur_logits = crate::cpu_reference::forward_step(d, next_pos, &cpu_cfg, &weight_bank, &mut main_kv);
-                draft_logits = crate::cpu_reference::forward_step_partial(d, next_pos, &cpu_cfg, &weight_bank, &mut draft_kv, draft_layers);
-                next_pos += 1;
-                if generated_tokens.len() >= max_tokens { break 'outer; }
-            }
+            cur_logits = crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv);
+            pos += 1;
         }
-        if spec_drafted > 0 {
-            debug!("Self-speculation (early-exit, rascunho={}/{} camadas): {}/{} aceitos ({:.0}%) — na GPU vira multiplicador de tok/s",
-                draft_layers, cpu_cfg.n_layers, spec_accepted, spec_drafted, 100.0 * spec_accepted as f64 / spec_drafted as f64);
+        if spec_rounds > 0 {
+            debug!("Especulação SEM CABEÇA (n-gram K={}): {}/{} rascunhos aceitos ({:.0}%), {:.2} tokens/rodada — na GPU = K tokens por weight-load",
+                DRAFT_K, spec_accepted, spec_drafted,
+                100.0 * spec_accepted as f64 / spec_drafted.max(1) as f64,
+                (spec_accepted + spec_rounds) as f64 / spec_rounds as f64);
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM
