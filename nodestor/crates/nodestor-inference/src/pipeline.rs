@@ -310,6 +310,22 @@ impl InferencePipeline {
                 }
             }
         }
+        // TIED EMBEDDINGS: muitos modelos (SmolLM2, Gemma…) não trazem `output.weight`
+        // — a lm_head É o `token_embd.weight`. Sem amarrar, o lm_head ficaria um
+        // placeholder zerado e os LOGITS sairiam todos nulos. Materializa a amarração.
+        if weight_bank.get("output.weight").is_none() {
+            let tied = weight_bank.get("token_embd.weight")
+                .map(|te| te.as_f32_slice().to_vec())
+                .filter(|d| !d.is_empty());
+            if let Some(data) = tied {
+                let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+                if let Ok(buf) = self.engine.upload(raw) {
+                    weight_bank.insert("output.weight".to_string(), buf);
+                    debug!("Tied embeddings: output.weight amarrado ao token_embd ({} floats)", data.len());
+                }
+            }
+        }
+
         // Garante que as chaves críticas existam mesmo se ausentes no GGUF
         let ensure_key = |bank: &mut nodestor_vulkan::WeightBank, key: &str, size: usize| {
             if bank.get(key).is_none() {
@@ -437,109 +453,46 @@ impl InferencePipeline {
         let mut drafter = crate::latent_drafter::LatentDrafter::new(hidden_size as usize, 0.9);
         let cheby = nodestor_vulkan::transformer::ChebyshevSoftmax::default();
 
+        // Config do forward de REFERÊNCIA correto (CPU) — base de coerência.
+        let head_dim_cfg = if num_heads > 0 { (hidden_size / num_heads) as usize } else { 64 };
+        let cpu_cfg = crate::cpu_reference::CpuModelConfig {
+            n_layers: num_layers,
+            hidden: hidden_size as usize,
+            n_heads: num_heads as usize,
+            n_kv_heads: num_kv_heads as usize,
+            head_dim: head_dim_cfg,
+            intermediate: intermediate_size as usize,
+            vocab: vocab_size as usize,
+            rope_base,
+            eps: 1e-5,
+        };
+        let eos_token: Option<u32> = self.metadata.extra.get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u64()).map(|n| n as u32);
+        debug!("CPU-fwd cfg: layers={} hidden={} n_heads={} n_kv={} head_dim={} inter={} vocab={} rope_base={} eos={:?}",
+            cpu_cfg.n_layers, cpu_cfg.hidden, cpu_cfg.n_heads, cpu_cfg.n_kv_heads,
+            cpu_cfg.head_dim, cpu_cfg.intermediate, cpu_cfg.vocab, cpu_cfg.rope_base, eos_token);
+
         let mut step = 0;
         while step < max_tokens {
-            let current_token = if step < input_tokens.len() {
-                input_tokens[step]
-            } else {
-                *generated_tokens.last().unwrap_or(&0)
+            // Forward CORRETO (referência CPU): processa TODA a sequência
+            // (prompt + tokens já gerados) com atenção causal + RoPE NeoX +
+            // layout GGUF [out,in], e prediz o PRÓXIMO token. É a base de coerência;
+            // a especulação (COBER) e o compute GPU entram POR CIMA deste forward.
+            let mut seq_ids: Vec<u32> = input_tokens.clone();
+            seq_ids.extend(generated_tokens.iter().copied());
+            let mut logits = match crate::cpu_reference::forward_last_logits(&seq_ids, &cpu_cfg, &weight_bank) {
+                Some(l) => l,
+                None => break, // pesos ausentes (modelo sintético) → encerra
             };
+            // Motores disponíveis (especulação/probes/GPU), fora do loop quente por ora.
+            let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled);
 
-            // Embedding de entrada: LOOKUP REAL da linha do token em token_embd.weight
-            // (matriz [vocab × hidden]). Antes usava um one-hot FALSO, o que dava lixo
-            // na entrada do forward → saída incoerente. A linha do token é a embedding.
-            let embed_dim = hidden_size as usize;
-            let embed_data: Vec<f32> = match weight_bank.get("token_embd.weight") {
-                Some(buf) => {
-                    let table = buf.as_f32_slice();
-                    let start = (current_token as usize) * embed_dim;
-                    if start + embed_dim <= table.len() {
-                        table[start..start + embed_dim].to_vec()
-                    } else {
-                        vec![0.0f32; embed_dim]
-                    }
-                }
-                None => {
-                    let mut e = vec![0.0f32; embed_dim];
-                    e[current_token as usize % embed_dim] = 1.0;
-                    e
-                }
-            };
-            let embed_bytes = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u8, embed_data.len() * 4) };
-            let embed_buf = self.engine.upload(embed_bytes)?;
-
-            // Forward pass (mestre) do token atual (ou token draft base)
-            let logits_buf = transformer.forward(&self.engine, &embed_buf, &weight_bank, step as u32)
-                .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
-
-            if probes_enabled {
-                let latent_features = probes_sae.encode(&embed_data);
-                if let Some(ref tool_mutex) = self.probes_tool {
-                    if let Ok(mut tool) = tool_mutex.lock() {
-                        let (is_safe, maybe_alert) = tool.inspect(&embed_data, step);
-                        if let Some(alert) = maybe_alert {
-                            warn!("{}", alert);
-                            probes_alerts.push(alert.clone());
-                        }
-                        if !is_safe {
-                            let block_msg = format!("[PROBES] Step {}: Bloqueio por ferramenta externa", step);
-                            warn!("{}", block_msg);
-                            probes_alerts.push(block_msg);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let mut logits = self.engine.download_f32(&logits_buf)?;
-            let current_probs = cheby.softmax(&logits);
-            let entropy = crate::cober::CoberEngine::compute_entropy(&current_probs);
-
-            // Se for prompt/prefill, não usa spec, apenas autoregressivo
-            let accepted_round = if step < input_tokens.len() {
-                let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                    .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-                vec![(sampled_token as u32) % vocab_size]
-            } else {
-                // Modo decoding: Especulação Ativa.
-                // NOTA: o MCTS (busca profunda) é caro — N simulações × profundidade,
-                // centenas de forwards por token. NÃO é para o caminho interativo
-                // padrão; fica opt-in (deep reasoning). Aqui, alta entropia cai na
-                // amostragem direta do modelo mestre (rápida e correta).
-                let _ = &_mcts_engine; // mantém o motor disponível sem invocá-lo no loop quente
-                if entropy > 2.0 {
-                    let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                        .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-                    vec![(sampled_token as u32) % vocab_size]
-                } else {
-                    // COBER Engine (Lossless)
-                    let (tree_k, _) = cober.easd_compute_tree_params(&current_probs);
-                    let mut indexed_probs: Vec<(usize, f32)> = current_probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-                    indexed_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                    let draft_tokens: Vec<u32> = indexed_probs.iter().take(tree_k).map(|(i, _)| *i as u32).collect();
-
-                    if draft_tokens.is_empty() {
-                        let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-                        vec![(sampled_token as u32) % vocab_size]
-                    } else {
-                        // Batch forward
-                        let master_logits = transformer.forward_batch(&self.engine, &draft_tokens, &weight_bank, step as u32 + 1)
-                            .map_err(|e| nodestor_core::NodeStorError::VulkanError(e.to_string()))?;
-                        let draft_probs = vec![current_probs.clone(); draft_tokens.len()];
-                        let master_probs = master_logits.iter().map(|l| cheby.softmax(l)).collect::<Vec<_>>();
-                        
-                        let round = cober.verify_and_accept_probabilistic(&draft_tokens, &draft_probs, &master_probs);
-                        if round.accepted_tokens.is_empty() {
-                            let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                                .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-                            vec![(sampled_token as u32) % vocab_size]
-                        } else {
-                            round.accepted_tokens.into_iter().map(|t| t % vocab_size).collect()
-                        }
-                    }
-                }
-            };
+            // Amostra o próximo token dos logits do forward correto (conformal).
+            let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
+                .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+            let next_tok = (sampled_token as u32) % vocab_size;
+            if Some(next_tok) == eos_token { break; }
+            let accepted_round = vec![next_tok];
 
             for &t in &accepted_round {
                 generated_tokens.push(t);

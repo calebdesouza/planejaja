@@ -9,6 +9,7 @@
 //! - [`caches`] — Expert LRU Cache (MoE) + Feature Cache (Diffusion)
 
 pub mod pipeline;
+pub mod cpu_reference;
 pub mod kv_cache;
 pub mod tokenizer;
 pub mod sampler;
