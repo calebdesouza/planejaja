@@ -194,15 +194,41 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
 pub struct CpuKvCache {
     k: Vec<Vec<Vec<f32>>>, // [layer][pos][kv_dim]
     v: Vec<Vec<Vec<f32>>>,
+    /// JANELA DESLIZANTE: se `Some(w)`, o cache nunca passa de `w` posições — as
+    /// mais antigas são despejadas. Memória LIMITADA, nunca OOM, com contexto de
+    /// qualquer tamanho. `None` = ilimitado (cresce com a RAM).
+    max_window: Option<usize>,
 }
 
 impl CpuKvCache {
     pub fn new(n_layers: usize) -> Self {
-        Self { k: vec![Vec::new(); n_layers], v: vec![Vec::new(); n_layers] }
+        Self { k: vec![Vec::new(); n_layers], v: vec![Vec::new(); n_layers], max_window: None }
+    }
+    /// Cache com JANELA DESLIZANTE de `window` posições (sliding-window attention,
+    /// estilo Mistral). O token atual atende às últimas `window` posições; as que
+    /// saem podem ir para o vector DB (LanceDB) para recuperação híbrida posterior
+    /// — é a base do "contexto infinito com VRAM constante".
+    pub fn with_window(n_layers: usize, window: usize) -> Self {
+        Self { k: vec![Vec::new(); n_layers], v: vec![Vec::new(); n_layers], max_window: Some(window.max(1)) }
     }
     /// Número de posições já cacheadas (idêntico em todas as camadas).
     pub fn len(&self) -> usize { self.k.first().map(|l| l.len()).unwrap_or(0) }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Despeja as posições mais antigas até caber na janela. Retorna quantas saíram
+    /// (para o chamador indexá-las no vector DB, se desejar). No-op se `max_window`
+    /// for `None` ou se já couber.
+    pub fn enforce_window(&mut self) -> usize {
+        let mut evicted = 0;
+        if let Some(w) = self.max_window {
+            while self.len() > w {
+                for l in self.k.iter_mut() { if !l.is_empty() { l.remove(0); } }
+                for l in self.v.iter_mut() { if !l.is_empty() { l.remove(0); } }
+                evicted += 1;
+            }
+        }
+        evicted
+    }
 
     /// Reverte o cache para `len` posições (rollback de rascunhos REJEITADOS na
     /// decodificação especulativa). Mantém o histórico aceito intacto.
@@ -553,4 +579,39 @@ pub fn extract_final_hidden(
     // antes da projeção na cabeça de linguagem). É este espaço que a calibração usa.
     let final_norm = weight(wb, "output_norm.weight")?;
     Some(rmsnorm(&x, final_norm, cfg.eps))
+}
+
+#[cfg(test)]
+mod sliding_window_tests {
+    use super::CpuKvCache;
+
+    /// Empurra 1 posição (marcada por `marker`) em todas as camadas — como o forward.
+    fn push_pos(c: &mut CpuKvCache, marker: f32) {
+        for l in c.k.iter_mut() { l.push(vec![marker]); }
+        for l in c.v.iter_mut() { l.push(vec![marker]); }
+    }
+
+    #[test]
+    fn test_sliding_window_bounds_memory_and_evicts_oldest() {
+        let window = 4;
+        let mut c = CpuKvCache::with_window(2, window);
+        // Empurra 10 posições (0..10) — equivalente a um contexto bem maior que a janela.
+        for i in 0..10 {
+            push_pos(&mut c, i as f32);
+            c.enforce_window();
+            assert!(c.len() <= window, "cache NUNCA passa da janela (i={}, len={})", i, c.len());
+        }
+        // Memória LIMITADA: exatamente `window` posições, independente do contexto.
+        assert_eq!(c.len(), window);
+        // Mantém as MAIS RECENTES (6,7,8,9), despejou as antigas (0..6).
+        assert_eq!(c.k[0][window - 1][0], 9.0, "última = mais recente");
+        assert_eq!(c.k[0][0][0], 6.0, "primeira na janela = 10−window = 6");
+    }
+
+    #[test]
+    fn test_unlimited_cache_grows_freely() {
+        let mut c = CpuKvCache::new(1); // sem janela (None)
+        for i in 0..50 { push_pos(&mut c, i as f32); c.enforce_window(); }
+        assert_eq!(c.len(), 50, "sem janela, enforce_window é no-op e o cache cresce");
+    }
 }

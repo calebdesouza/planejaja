@@ -547,7 +547,15 @@ impl InferencePipeline {
             }
             Vec::new()
         };
-        let mut main_kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
+        // JANELA DESLIZANTE (contexto infinito com VRAM/RAM constante): se
+        // NODESTOR_KV_WINDOW=<n> estiver setado, o KV cache nunca passa de n posições
+        // — as antigas são despejadas (e podem ir ao vector DB para retrieval híbrido).
+        // Padrão: None (ilimitado), preservando o comportamento original.
+        let kv_window = std::env::var("NODESTOR_KV_WINDOW").ok().and_then(|s| s.parse::<usize>().ok());
+        let mut main_kv = match kv_window {
+            Some(w) => crate::cpu_reference::CpuKvCache::with_window(cpu_cfg.n_layers, w),
+            None => crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers),
+        };
         let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
 
         // Prefill: preenche o cache com o prompt.
@@ -635,6 +643,9 @@ impl InferencePipeline {
                 None => crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv),
             };
             pos += 1;
+            // Aplica a janela deslizante por rodada (fora da verificação especulativa,
+            // para não conflitar com o rollback): memória limitada, nunca OOM.
+            main_kv.enforce_window();
         }
         if spec_rounds > 0 {
             debug!("Especulação SEM CABEÇA (n-gram, K-dinâmico→{}): {}/{} rascunhos aceitos ({:.0}%), {:.2} tokens/rodada — na GPU = K tokens por weight-load",
