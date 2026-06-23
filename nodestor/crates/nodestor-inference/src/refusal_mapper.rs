@@ -388,6 +388,170 @@ impl RefusalMapper {
     }
 }
 
+// ─── Álgebra de Projeção Ortogonal ───────────────────────────────────────────
+
+/// Remove a componente de `h` ao longo de `d` (projeção ortogonal completa).
+///
+/// Matemática exata:
+///   h_clean = h − (⟨h, d⟩ / ⟨d, d⟩) · d
+///
+/// Geometricamente, projeta `h` no hiperplano perpendicular a `d`.
+/// `d` não precisa estar normalizado — a divisão por `⟨d, d⟩` corrige a escala.
+/// Operação in-place: zero alocação extra, segura para loops de inferência.
+pub fn project_out_direction(h: &mut [f32], d: &[f32]) {
+    project_out_direction_scaled(h, d, 1.0);
+}
+
+/// Projeção ortogonal com intensidade controlável.
+///
+///   h_clean = h − intensity · (⟨h, d⟩ / ⟨d, d⟩) · d
+///
+/// | intensity | efeito                                              |
+/// |-----------|-----------------------------------------------------|
+/// | `1.0`     | remoção completa da componente (projeção pura)      |
+/// | `0.0`     | sem intervenção (h inalterado)                      |
+/// | `> 1.0`   | super-projeção (sobre-remove a direção)             |
+/// | `< 0.0`   | injeta a direção (steering positivo / amplificação) |
+pub fn project_out_direction_scaled(h: &mut [f32], d: &[f32], intensity: f32) {
+    let n = h.len().min(d.len());
+    // ⟨d, d⟩ = ‖d‖²
+    let d_sq: f32 = d[..n].iter().map(|&v| v * v).sum();
+    if d_sq < 1e-12 { return; }
+    // ⟨h, d⟩ — produto interno
+    let h_dot_d: f32 = h[..n].iter().zip(d[..n].iter()).map(|(&hi, &di)| hi * di).sum();
+    let scale = intensity * h_dot_d / d_sq;
+    for i in 0..n {
+        h[i] -= scale * d[i];
+    }
+}
+
+/// Projeção ortogonal com clamping de intensidade — variante segura para produção.
+///
+/// Idêntica a `project_out_direction_scaled`, mas limita `|intensity|` a
+/// `max_intensity` antes de aplicar. Evita "Saturação Residual" (Erro 2):
+/// com `--intensity 10.0` ou superior, o hidden state pode ser distorcido
+/// além do regime linear de operação da RMSNorm, produzindo valores extremos
+/// após múltiplas camadas.
+///
+/// Uso recomendado: `max_intensity = 4.0` para modelos com ≥ 16 camadas.
+pub fn project_out_direction_saturating(h: &mut [f32], d: &[f32], intensity: f32, max_intensity: f32) {
+    let clamped = intensity.clamp(-max_intensity, max_intensity);
+    project_out_direction_scaled(h, d, clamped);
+}
+
+/// Carrega um vetor de direção e valida a dimensão contra o modelo carregado.
+///
+/// Previne o "Vetor Fantasma" (Erro 1): um `.lsp` calibrado para um modelo
+/// de dimensão `expected_dim` diferente do modelo atual causaria produto
+/// escalar entre vetores de tamanhos incompatíveis, truncado silenciosamente.
+/// Esta função torna o erro explícito antes que o pipeline comece.
+pub fn load_direction_vector_checked(
+    path: &std::path::Path,
+    expected_dim: usize,
+) -> Result<Vec<f32>, nodestor_core::NodeStorError> {
+    let v = load_direction_vector(path)
+        .map_err(|e| nodestor_core::NodeStorError::InferenceError(format!("Falha ao carregar .lsp: {}", e)))?;
+
+    if v.len() != expected_dim {
+        return Err(nodestor_core::NodeStorError::InferenceError(format!(
+            "Incompatibilidade de dimensão no vetor de direção .lsp: \
+             arquivo tem {} dimensões mas o modelo tem hidden_dim={}. \
+             O arquivo foi calibrado para uma arquitetura diferente.",
+            v.len(), expected_dim
+        )));
+    }
+    Ok(v)
+}
+
+// ─── Calibração Contrastiva por Diferença de Centroides ──────────────────────
+
+/// Calcula o vetor de direção por análise de centroides contrastivos.
+///
+/// Algoritmo (método PCA-1D de Rep-Eng / diferença de médias):
+///   1. μ⁺ = mean(hidden_states dos exemplos positivos/ativação)
+///   2. μ⁻ = mean(hidden_states dos exemplos negativos/controle)
+///   3. d  = μ⁺ − μ⁻
+///   4. d̂  = d / ‖d‖  (normalização L2)
+///
+/// O vetor resultante **aponta** da representação "negativa" para a "positiva".
+/// Aplicar `project_out_direction` remove essa distinção do stream residual.
+///
+/// Retorna `None` se os grupos forem estatisticamente indistinguíveis (‖d‖ ≈ 0).
+pub fn calibrate_direction_from_hidden_states(
+    positive: &[Vec<f32>],
+    negative: &[Vec<f32>],
+) -> Option<Vec<f32>> {
+    if positive.is_empty() || negative.is_empty() { return None; }
+    let dim = positive[0].len().max(negative.first().map_or(0, |h| h.len()));
+    if dim == 0 { return None; }
+
+    let centroid = |group: &[Vec<f32>]| -> Vec<f32> {
+        let mut acc = vec![0.0f32; dim];
+        for h in group {
+            let n = h.len().min(dim);
+            for i in 0..n { acc[i] += h[i]; }
+        }
+        let n = group.len() as f32;
+        acc.iter_mut().for_each(|v| *v /= n);
+        acc
+    };
+
+    let c_pos = centroid(positive);
+    let c_neg = centroid(negative);
+
+    // Diferença vetorial dos centroides
+    let mut direction: Vec<f32> = c_pos.iter().zip(c_neg.iter()).map(|(&p, &n)| p - n).collect();
+
+    // Normalização L2: d̂ = d / ‖d‖
+    let norm: f32 = direction.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    if norm < 1e-12 { return None; } // grupos indistinguíveis
+    direction.iter_mut().for_each(|v| *v /= norm);
+
+    Some(direction)
+}
+
+// ─── I/O do Vetor de Direção (formato binário simples) ───────────────────────
+
+/// Serializa um vetor de direção em arquivo binário de f32 simples.
+///
+/// Formato no disco:
+///   [dim: u32 LE]  [f32_0 LE]  [f32_1 LE]  …  [f32_{dim-1} LE]
+///
+/// Compatível com NumPy via `np.fromfile(path, dtype=np.float32)[1:]`
+/// (ignorando os 4 bytes do header de dimensão).
+pub fn save_direction_vector(path: &std::path::Path, vector: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(&(vector.len() as u32).to_le_bytes())?;
+    for &v in vector {
+        f.write_all(&v.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Carrega um vetor de direção de arquivo binário (gerado por `save_direction_vector`).
+pub fn load_direction_vector(path: &std::path::Path) -> std::io::Result<Vec<f32>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut dim_buf = [0u8; 4];
+    f.read_exact(&mut dim_buf)?;
+    let dim = u32::from_le_bytes(dim_buf) as usize;
+    // Sanidade: hidden_dim de modelos conhecidos ≤ 32 768 (futuro: ≤ 131 072)
+    if dim > 200_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("dim={} fora do limite sanidade (> 200 000)", dim),
+        ));
+    }
+    let mut vector = vec![0.0f32; dim];
+    let mut buf = [0u8; 4];
+    for v in vector.iter_mut() {
+        f.read_exact(&mut buf)?;
+        *v = f32::from_le_bytes(buf);
+    }
+    Ok(vector)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +723,194 @@ mod tests {
         mapper.calibrate();
         let r = mapper.report();
         assert!(r.contains("CALIBRADO"));
+    }
+
+    // ── POD Álgebra de Projeção Ortogonal ─────────────────────────────────────
+
+    #[test]
+    fn test_pod_removes_direction_component() {
+        // h = [3, 4, 0], d = [1, 0, 0]  → proj = 3; h_clean = [0, 4, 0]
+        let mut h = vec![3.0_f32, 4.0, 0.0];
+        let d = vec![1.0_f32, 0.0, 0.0];
+        project_out_direction(&mut h, &d);
+        assert!((h[0]).abs() < 1e-6, "componente na direção d deve ser zero");
+        assert!((h[1] - 4.0).abs() < 1e-6, "componente ortogonal preservada");
+    }
+
+    #[test]
+    fn test_pod_zero_direction_is_noop() {
+        // d = zero vector → d_sq < 1e-12 → h inalterado
+        let mut h = vec![1.0_f32, 2.0, 3.0];
+        let original = h.clone();
+        let d = vec![0.0_f32, 0.0, 0.0];
+        project_out_direction(&mut h, &d);
+        assert_eq!(h, original, "d nulo não deve modificar h");
+    }
+
+    #[test]
+    fn test_pod_intensity_zero_is_noop() {
+        let mut h = vec![3.0_f32, 4.0, 0.0];
+        let original = h.clone();
+        let d = vec![1.0_f32, 0.0, 0.0];
+        project_out_direction_scaled(&mut h, &d, 0.0);
+        assert_eq!(h, original, "intensity=0 não deve modificar h");
+    }
+
+    #[test]
+    fn test_pod_orthogonal_vector_unchanged() {
+        // h perpendicular a d → dot = 0 → h inalterado
+        let mut h = vec![0.0_f32, 1.0, 0.0];
+        let original = h.clone();
+        let d = vec![1.0_f32, 0.0, 0.0];
+        project_out_direction(&mut h, &d);
+        assert_eq!(h, original, "vetor ortogonal não deve ser afetado");
+    }
+
+    // ── Calibração Contrastiva ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_calibrate_direction_returns_unit_vector() {
+        // Grupos claramente separados em dimensão 0
+        let pos: Vec<Vec<f32>> = (0..4).map(|_| vec![10.0_f32, 0.0, 0.0]).collect();
+        let neg: Vec<Vec<f32>> = (0..4).map(|_| vec![-10.0_f32, 0.0, 0.0]).collect();
+        let dir = calibrate_direction_from_hidden_states(&pos, &neg)
+            .expect("deve retornar direção para grupos separados");
+        let norm: f32 = dir.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "direção deve ser unitária, norm={}", norm);
+    }
+
+    #[test]
+    fn test_calibrate_direction_identical_groups_returns_none() {
+        // Grupos idênticos → d = zero → None
+        let group: Vec<Vec<f32>> = (0..4).map(|_| vec![1.0_f32, 2.0, 3.0]).collect();
+        let result = calibrate_direction_from_hidden_states(&group, &group);
+        assert!(result.is_none(), "grupos idênticos devem retornar None");
+    }
+
+    #[test]
+    fn test_calibrate_direction_empty_group_returns_none() {
+        let pos: Vec<Vec<f32>> = vec![];
+        let neg: Vec<Vec<f32>> = (0..4).map(|_| vec![1.0_f32, 0.0]).collect();
+        assert!(calibrate_direction_from_hidden_states(&pos, &neg).is_none());
+    }
+
+    // ── Serialização binária de vetores ───────────────────────────────────────
+
+    #[test]
+    fn test_save_load_round_trip() {
+        let dir = vec![0.1_f32, -0.5, 0.9, 1.3];
+        let tmp = std::env::temp_dir().join("test_pod_dir.bin");
+        save_direction_vector(&tmp, &dir).expect("salvar");
+        let loaded = load_direction_vector(&tmp).expect("carregar");
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(dir.len(), loaded.len());
+        for (a, b) in dir.iter().zip(loaded.iter()) {
+            assert!((a - b).abs() < 1e-7, "round-trip f32: {} ≠ {}", a, b);
+        }
+    }
+
+    // ── Guarda de NaN/divergência insuficiente ────────────────────────────────
+
+    #[test]
+    fn test_dscp_nan_guard_d_sq_below_threshold() {
+        // Simula o invariante da DSCP: se d_sq < 1e-12 após calibração,
+        // o steering não deve ser ativado. Verificamos o invariant diretamente
+        // na função de calibração (retorna None para grupos idênticos).
+        let same: Vec<Vec<f32>> = (0..6).map(|_| vec![0.5_f32; 16]).collect();
+        let result = calibrate_direction_from_hidden_states(&same, &same);
+        // d = μ⁺ − μ⁻ = 0 → norm < 1e-12 → None
+        assert!(result.is_none(), "divergência zero deve ativar No-Op seguro");
+    }
+
+    #[test]
+    fn test_dscp_unit_vector_d_sq_approx_one() {
+        // Verifica que um vetor retornado por `calibrate_direction_from_hidden_states`
+        // tem d_sq ≈ 1.0 (pré-condição do loop de inferência POD).
+        let pos: Vec<Vec<f32>> = (0..6).map(|i| {
+            let mut v = vec![0.0_f32; 8];
+            v[i % 8] = 2.0;
+            v
+        }).collect();
+        let neg: Vec<Vec<f32>> = (0..6).map(|i| {
+            let mut v = vec![0.0_f32; 8];
+            v[(i + 4) % 8] = 2.0;
+            v
+        }).collect();
+        if let Some(dir) = calibrate_direction_from_hidden_states(&pos, &neg) {
+            let d_sq: f32 = dir.iter().map(|&v| v * v).sum();
+            assert!(d_sq > 1e-12, "d_sq deve ser > 1e-12 para habilitar steering");
+            assert!((d_sq - 1.0).abs() < 1e-5, "d_sq deve ≈ 1.0 (vetor normalizado), obtido {}", d_sq);
+        }
+        // Se None, os grupos eram idênticos — também correto (sem divergência).
+    }
+
+    // ── Cenários de Erro de Produção ──────────────────────────────────────────
+
+    /// Erro 1: "Vetor Fantasma" — incompatibilidade de arquitetura.
+    ///
+    /// Um .lsp calibrado para modelo 70B (dim=8192) carregado em 8B (dim=4096)
+    /// deve ser detectado ANTES de qualquer operação, com erro claro.
+    #[test]
+    fn test_profile_dimension_mismatch_returns_error() {
+        // Cria um .lsp com dim=8192
+        let tmp = std::env::temp_dir().join("test_ghost_vector.lsp");
+        let dir_8192: Vec<f32> = (0..8192).map(|i| (i as f32).sin() / 90.0).collect();
+        save_direction_vector(&tmp, &dir_8192).expect("salvar .lsp");
+
+        // Tenta carregar validando contra modelo de dim=4096
+        let result = load_direction_vector_checked(&tmp, 4096);
+        std::fs::remove_file(&tmp).ok();
+
+        assert!(result.is_err(), "dimensão incorreta deve retornar erro explícito");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("8192") && msg.contains("4096"),
+                "mensagem deve citar ambas as dimensões: {}", msg);
+    }
+
+    /// Erro 2: Saturação Residual — intensidade excessiva de steering.
+    ///
+    /// Com --intensity 10.0 ou maior, a projeção ortogonal pode distorcer
+    /// o hidden state além do regime linear. `project_out_direction_saturating`
+    /// deve manter os valores dentro de limites razoáveis.
+    #[test]
+    fn test_high_intensity_steering_clamping() {
+        // h = vetor unitário na direção d → após POD com intensity=10.0, h = -9 * d
+        // Com saturating (max=4.0), o resultado deve ser mais moderado
+        let mut h_unclamped = vec![1.0f32, 0.0, 0.0];
+        let mut h_clamped = vec![1.0f32, 0.0, 0.0];
+        let d = vec![1.0f32, 0.0, 0.0]; // d unitário
+
+        project_out_direction_scaled(&mut h_unclamped, &d, 10.0);
+        project_out_direction_saturating(&mut h_clamped, &d, 10.0, 4.0);
+
+        // Sem clamping: h = 1.0 - 10.0*1.0 = -9.0 (distorção extrema)
+        assert!((h_unclamped[0] - (-9.0)).abs() < 1e-5,
+                "sem clamping: h[0] deve ser -9.0, obtido {}", h_unclamped[0]);
+
+        // Com clamping (max=4.0): h = 1.0 - 4.0*1.0 = -3.0 (distorção limitada)
+        assert!((h_clamped[0] - (-3.0)).abs() < 1e-5,
+                "com clamping: h[0] deve ser -3.0, obtido {}", h_clamped[0]);
+
+        // Resultado clamped deve ser finito e ter magnitude menor
+        assert!(h_clamped[0].is_finite(), "resultado clamped deve ser finito");
+        assert!(h_clamped[0].abs() < h_unclamped[0].abs(),
+                "clamped={} deve ter magnitude < unclamped={}", h_clamped[0], h_unclamped[0]);
+    }
+
+    #[test]
+    fn test_high_intensity_saturating_at_extreme_values() {
+        // intensity=1000.0 com clamping=4.0 → mesmo resultado que intensity=4.0
+        let mut h_extreme = vec![1.0f32, 0.0, 0.0];
+        let mut h_at_max  = vec![1.0f32, 0.0, 0.0];
+        let d = vec![1.0f32, 0.0, 0.0];
+
+        project_out_direction_saturating(&mut h_extreme, &d, 1000.0, 4.0);
+        project_out_direction_saturating(&mut h_at_max,  &d,    4.0, 4.0);
+
+        for i in 0..3 {
+            assert!((h_extreme[i] - h_at_max[i]).abs() < 1e-6,
+                    "intensity=1000 clamped a 4 deve = intensity=4: [{}] {} ≠ {}",
+                    i, h_extreme[i], h_at_max[i]);
+        }
     }
 }

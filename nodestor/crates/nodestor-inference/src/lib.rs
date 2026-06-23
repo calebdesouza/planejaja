@@ -53,6 +53,10 @@ pub mod persistent_memory;
 // --- PROBES V2 Expansão: Cirurgia Latente Universal ---
 pub mod refusal_mapper;
 
+// --- Edge Training: LoRA Core + Trainer Local ---
+pub mod lora_core;
+pub mod trainer;
+
 // --- K-Quants: Dequantização Universal (Crítico para modelos 70B+) ---
 pub mod dequant;
 

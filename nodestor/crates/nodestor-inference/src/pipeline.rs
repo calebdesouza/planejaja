@@ -82,6 +82,25 @@ impl Default for ProbesConfig {
     }
 }
 
+/// Configuração da Projeção Ortogonal Dinâmica (POD) para steering de ativações.
+///
+/// Quando presente no pipeline, cada token processado terá seu hidden state
+/// projetado fora de `direction` após cada bloco Attention+MLP:
+///   h_clean = h − intensity · (⟨h, d⟩ / ⟨d, d⟩) · d
+pub struct ActivationSteeringConfig {
+    /// Vetor de direção no espaço hidden_dim (normalizado L2 recomendado)
+    pub direction: Vec<f32>,
+    /// Intensidade da projeção: 1.0 = remoção completa; 0.0 = sem intervenção
+    pub intensity: f32,
+}
+
+/// Contexto compartilhado pelos métodos de calibração (privado ao módulo).
+struct CalibContext {
+    cpu_cfg: crate::cpu_reference::CpuModelConfig,
+    weight_bank: nodestor_vulkan::WeightBank,
+    tokenizer: crate::tokenizer::TokenizerManager,
+}
+
 /// Pipeline central de execução do modelo.
 pub struct InferencePipeline {
     pub config: InferenceConfig,
@@ -96,6 +115,8 @@ pub struct InferencePipeline {
     pub probes_tool: Option<std::sync::Mutex<Box<dyn ProbesTool>>>,
     /// Escalonador de Batching Contínuo
     pub scheduler: std::sync::Mutex<crate::multi_tenant::MultiTenantScheduler>,
+    /// Configuração de steering por projeção ortogonal (None = passivo)
+    pub steering: Option<ActivationSteeringConfig>,
 }
 
 impl InferencePipeline {
@@ -131,6 +152,7 @@ impl InferencePipeline {
             kv_paginator,
             probes_tool: None,
             scheduler: std::sync::Mutex::new(crate::multi_tenant::MultiTenantScheduler::new(1024, 128)),
+            steering: None,
         })
     }
 
@@ -145,6 +167,23 @@ impl InferencePipeline {
     pub fn with_probes_tool(mut self, tool: Box<dyn ProbesTool>) -> Self {
         self.probes_tool = Some(std::sync::Mutex::new(tool));
         self
+    }
+
+    /// Ativa a Projeção Ortogonal Dinâmica com um vetor de direção pré-computado.
+    pub fn with_steering(mut self, config: ActivationSteeringConfig) -> Self {
+        self.steering = Some(config);
+        self
+    }
+
+    /// Carrega um vetor de direção de disco e ativa o steering com a `intensity` dada.
+    pub fn load_steering_vector_file(mut self, path: &std::path::Path, intensity: f32) -> Result<Self, NodeStorError> {
+        let direction = crate::refusal_mapper::load_direction_vector(path)
+            .map_err(|e| NodeStorError::InferenceError(
+                format!("Falha ao carregar vetor de steering '{}': {}", path.display(), e)
+            ))?;
+        debug!("Steering: vetor carregado de '{}' — dim={} intensity={}", path.display(), direction.len(), intensity);
+        self.steering = Some(ActivationSteeringConfig { direction, intensity });
+        Ok(self)
     }
 
     /// Orquestração Zero-Loss: Move KV Cache de alta fidelidade para o SSD via DMA.
@@ -386,6 +425,11 @@ impl InferencePipeline {
         let mut _mcts_engine = crate::mcts_engine::MctsEngine::new(1.414); // Cp = sqrt(2)
         // ─────────────────────────────────────────────────────────────────────────
 
+        // Extrai parâmetros de steering como referências locais para evitar re-borrow
+        // de `self` dentro do loop de geração (onde `main_kv` precisa de &mut).
+        let steering_dir: Option<&[f32]> = self.steering.as_ref().map(|s| s.direction.as_slice());
+        let steering_intensity: f32 = self.steering.as_ref().map_or(1.0, |s| s.intensity);
+
         let mut sampler = crate::sampler::Sampler::new(crate::sampler::SamplerConfig {
             temperature: 0.7,
             top_k: 40,
@@ -509,9 +553,15 @@ impl InferencePipeline {
         // Prefill: preenche o cache com o prompt.
         let mut cur_logits: Option<Vec<f32>> = None;
         for (p, &tok) in input_tokens.iter().enumerate() {
-            match crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv) {
+            let logits = match steering_dir {
+                Some(dir) => crate::cpu_reference::forward_step_with_steering(
+                    tok, p, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                ),
+                None => crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv),
+            };
+            match logits {
                 Some(l) => cur_logits = Some(l),
-                None => break, // pesos ausentes (modelo sintético) → encerra
+                None => break,
             }
         }
 
@@ -530,7 +580,12 @@ impl InferencePipeline {
                 spec_rounds += 1;
                 spec_drafted += draft.len();
                 let orig = main_kv.len();
-                let vlogits = crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv);
+                let vlogits = match steering_dir {
+                    Some(dir) => crate::cpu_reference::forward_verify_with_steering(
+                        &draft, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                    ),
+                    None => crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                };
                 let mut m = 0usize;
                 let mut prev: &Vec<f32> = &logits;
                 for i in 0..vlogits.len() {
@@ -573,7 +628,12 @@ impl InferencePipeline {
                 let s = tokenizer.decode(&[anchor], true).unwrap_or_default();
                 if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
             }
-            cur_logits = crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv);
+            cur_logits = match steering_dir {
+                Some(dir) => crate::cpu_reference::forward_step_with_steering(
+                    anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                ),
+                None => crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+            };
             pos += 1;
         }
         if spec_rounds > 0 {
@@ -612,6 +672,255 @@ impl InferencePipeline {
         };
 
         Ok((generated_text, stats))
+    }
+
+    // ── Helpers privados compartilhados entre calibrate_steering_direction e ───
+    // ── auto_calibrate_steering                                               ───
+
+    /// Constrói o WeightBank + CPU config + tokenizer usados pelos métodos de calibração.
+    /// Retorna `Err` apenas em falhas críticas do tokenizer; a ausência de pesos GGUF
+    /// é tratada graciosamente (fallback para buffers vazios — modelo sintético).
+    fn build_calib_context(
+        &self,
+    ) -> Result<CalibContext, NodeStorError> {
+        use crate::cpu_reference::CpuModelConfig;
+
+        let graph = graph_interpreter::GraphInterpreter::interpret(&self.metadata)
+            .unwrap_or_else(|_| {
+                let mut extra = serde_json::Map::new();
+                extra.insert("llama.embedding_length".into(), serde_json::Value::Number(4096u64.into()));
+                extra.insert("llama.attention.head_count".into(), serde_json::Value::Number(32u64.into()));
+                extra.insert("llama.attention.head_count_kv".into(), serde_json::Value::Number(8u64.into()));
+                extra.insert("llama.feed_forward_length".into(), serde_json::Value::Number(11008u64.into()));
+                extra.insert("llama.vocab_size".into(), serde_json::Value::Number(32000u64.into()));
+                let fallback_meta = nodestor_core::ModelMetadata {
+                    format: self.metadata.format.clone(),
+                    model_name: self.metadata.model_name.clone(),
+                    architecture: Some("llama".to_string()),
+                    param_count: self.metadata.param_count,
+                    tensors: vec![nodestor_core::TensorInfo {
+                        name: "blk.0.attn_q.weight".to_string(),
+                        shape: vec![4096, 4096],
+                        dtype: nodestor_core::TensorDtype::F16,
+                        data_offset: 0, data_size: 0,
+                    }],
+                    data_offset: 0, file_size: 0,
+                    extra: serde_json::Value::Object(extra),
+                };
+                graph_interpreter::GraphInterpreter::interpret(&fallback_meta).unwrap()
+            });
+
+        let (num_layers, vocab_size, hidden_size, num_heads, num_kv_heads, intermediate_size, rope_base) =
+            match &graph.architecture {
+                graph_interpreter::ModelArchitecture::Llama {
+                    num_layers, vocab_size, hidden_dim, num_heads, num_kv_heads,
+                    intermediate_size, rope_base, ..
+                } => (*num_layers as usize, *vocab_size, *hidden_dim, *num_heads, *num_kv_heads, *intermediate_size, *rope_base),
+                _ => (32usize, 32000u32, 4096u32, 32u32, 8u32, 11008u32, 10000.0f32),
+            };
+
+        let head_dim = if num_heads > 0 { (hidden_size / num_heads) as usize } else { 64 };
+        let cpu_cfg = CpuModelConfig {
+            n_layers: num_layers,
+            hidden: hidden_size as usize,
+            n_heads: num_heads as usize,
+            n_kv_heads: num_kv_heads as usize,
+            head_dim,
+            intermediate: intermediate_size as usize,
+            vocab: vocab_size as usize,
+            rope_base,
+            eps: 1e-5,
+        };
+
+        let mut weight_bank = nodestor_vulkan::WeightBank::new();
+        match crate::weight_store::WeightStore::open(std::path::Path::new(&self.config.model_path)) {
+            Ok(store) => {
+                for name in store.list_tensors() {
+                    let bytes = match store.tensor_bytes(name) { Some(b) => b, None => continue };
+                    let (dtype, n_elems) = store.tensor_info(name)
+                        .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
+                        .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
+                    let upload = match tensor_to_f32(bytes, dtype, n_elems) {
+                        Some(f32s) => {
+                            let raw = unsafe {
+                                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
+                            };
+                            self.engine.upload(raw)
+                        }
+                        None => self.engine.upload(bytes),
+                    };
+                    if let Ok(buf) = upload { weight_bank.insert(name.to_string(), buf); }
+                }
+            }
+            Err(e) => debug!("CalibWeightStore indisponível ({}); usando buffers vazios", e),
+        }
+        for tensor in &self.metadata.tensors {
+            if weight_bank.get(&tensor.name).is_some() { continue; }
+            let size_bytes = (tensor.shape.iter().map(|&d| d as usize).product::<usize>() * 4).max(4);
+            if let Ok(buf) = self.engine.alloc_buffer(size_bytes) {
+                weight_bank.insert(tensor.name.clone(), buf);
+            }
+        }
+
+        let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#;
+        let extra = &self.metadata.extra;
+        let str_array = |key: &str| -> Vec<String> {
+            extra.get(key).and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default()
+        };
+        let u32_meta = |key: &str| -> Option<u32> {
+            extra.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+        };
+        let gguf_tokens = str_array("tokenizer.ggml.tokens");
+        let gguf_merges = str_array("tokenizer.ggml.merges");
+        let tokenizer = if !gguf_tokens.is_empty() {
+            crate::tokenizer::TokenizerManager::from_gguf(
+                &gguf_tokens, &gguf_merges,
+                u32_meta("tokenizer.ggml.bos_token_id"),
+                u32_meta("tokenizer.ggml.eos_token_id"),
+                u32_meta("tokenizer.ggml.unknown_token_id"),
+            ).unwrap_or_else(|_| crate::tokenizer::TokenizerManager::from_string(dummy_json).unwrap())
+        } else {
+            crate::tokenizer::TokenizerManager::from_string(dummy_json)
+                .map_err(|e| NodeStorError::InferenceError(format!("Tokenizer: {}", e)))?
+        };
+
+        Ok(CalibContext { cpu_cfg, weight_bank, tokenizer })
+    }
+
+    /// Extrai hidden states normalizados (pre-LM-head) para uma lista de textos.
+    /// Compartilhado por `calibrate_steering_direction` e `auto_calibrate_steering`.
+    fn extract_hidden_states_batch(
+        ctx: &CalibContext,
+        texts: &[String],
+    ) -> Vec<Vec<f32>> {
+        use crate::cpu_reference::{CpuKvCache, extract_final_hidden, forward_step};
+
+        texts.iter().filter_map(|text| {
+            let tokens = ctx.tokenizer.encode(text).unwrap_or(vec![0u32]);
+            if tokens.is_empty() { return None; }
+            let mut kv = CpuKvCache::new(ctx.cpu_cfg.n_layers);
+            for (p, &tok) in tokens[..tokens.len().saturating_sub(1)].iter().enumerate() {
+                forward_step(tok, p, &ctx.cpu_cfg, &ctx.weight_bank, &mut kv);
+            }
+            let last = tokens.len() - 1;
+            extract_final_hidden(tokens[last], last, &ctx.cpu_cfg, &ctx.weight_bank, &mut kv)
+        }).collect()
+    }
+
+    /// Calibração Contrastiva de Ativação — gera o vetor de direção em disco.
+    ///
+    /// Algoritmo:
+    ///   1. Extrai hidden states dos dois grupos (positivos e negativos)
+    ///   2. Calcula d̂ = normalize(μ⁺ − μ⁻)
+    ///   3. Serializa d̂ em `output_path` no formato binário f32 LE
+    pub async fn calibrate_steering_direction(
+        &self,
+        positive_texts: &[String],
+        negative_texts: &[String],
+        output_path: &std::path::Path,
+    ) -> Result<usize, NodeStorError> {
+        use crate::refusal_mapper::{calibrate_direction_from_hidden_states, save_direction_vector};
+
+        let ctx = self.build_calib_context()?;
+
+        debug!("Calibração: {} amostras positivas...", positive_texts.len());
+        let pos = Self::extract_hidden_states_batch(&ctx, positive_texts);
+        debug!("Calibração: {} amostras negativas...", negative_texts.len());
+        let neg = Self::extract_hidden_states_batch(&ctx, negative_texts);
+        debug!("Calibração: {}/{} hidden states extraídos", pos.len(), neg.len());
+
+        let direction = calibrate_direction_from_hidden_states(&pos, &neg)
+            .ok_or_else(|| NodeStorError::InferenceError(
+                "Grupos estatisticamente indistinguíveis — aumente o dataset ou verifique os textos".into()
+            ))?;
+
+        let dim = direction.len();
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| NodeStorError::InferenceError(format!("Falha ao criar diretório: {}", e)))?;
+        }
+        save_direction_vector(output_path, &direction)
+            .map_err(|e| NodeStorError::InferenceError(format!("Falha ao salvar vetor: {}", e)))?;
+
+        debug!("Calibração concluída: dim={} → '{}'", dim, output_path.display());
+        Ok(dim)
+    }
+
+    /// Dynamic Self-Calibration Pipeline (DSCP) — Autocalibração em Memória.
+    ///
+    /// Sem datasets externos. Usa templates estáticos internos para gerar um par
+    /// de representações contrastivas, roda prefill assíncrono em RAM, calcula
+    /// d̂ = normalize(μ⁺ − μ⁻) e retorna um `ActivationSteeringConfig` pronto
+    /// para injeção no loop de inferência.
+    ///
+    /// Templates internos:
+    ///   • Positivos: queries técnicas e analíticas (representação de ativação alvo)
+    ///   • Negativos: frases genéricas não-comprometidas (representação de controle)
+    ///
+    /// Retorna `None` (No-Op seguro) quando:
+    ///   - O modelo não exibe divergência geométrica nos templates (d_sq < 1e-12)
+    ///   - Pesos GGUF insuficientes para produzir hidden states distintos
+    ///   - Contexto de calibração inacessível (falha silenciosa do WeightStore)
+    ///
+    /// Compatível com qualquer arquitetura GGUF — agnóstico de modelo.
+    pub async fn auto_calibrate_steering(&self, intensity: f32) -> Option<ActivationSteeringConfig> {
+        use crate::refusal_mapper::calibrate_direction_from_hidden_states;
+
+        // Templates estáticos internos — cobrindo diversas dimensões semânticas
+        // para maximizar a separação geométrica em qualquer arquitetura GGUF.
+        const POSITIVE: &[&str] = &[
+            "Derive the mathematical proof of the central limit theorem using characteristic functions.",
+            "Explain the computational complexity of the Cooley-Tukey FFT algorithm in Big-O notation.",
+            "Describe the quantum mechanical basis for covalent bond formation in molecular orbital theory.",
+            "Analyze the formal semantics of the lambda calculus using beta and eta reduction rules.",
+            "What are the foundational axioms of Zermelo-Fraenkel set theory and their implications?",
+            "Calculate the Jacobian matrix of a multivariate function and explain its geometric interpretation.",
+        ];
+        const NEGATIVE: &[&str] = &[
+            "I cannot provide that information.",
+            "That falls outside what I am able to discuss in this context.",
+            "I am not in a position to help with that specific request.",
+            "I must respectfully decline to engage with this subject matter.",
+            "That is not something I am capable of addressing at this time.",
+            "I do not have the ability to respond to that type of query.",
+        ];
+
+        let pos_texts: Vec<String> = POSITIVE.iter().map(|&s| s.to_string()).collect();
+        let neg_texts: Vec<String> = NEGATIVE.iter().map(|&s| s.to_string()).collect();
+
+        let ctx = self.build_calib_context().ok()?;
+
+        debug!("DSCP: extraindo hidden states dos templates internos ({} pos / {} neg)...",
+               pos_texts.len(), neg_texts.len());
+
+        let pos_hiddens = Self::extract_hidden_states_batch(&ctx, &pos_texts);
+        let neg_hiddens = Self::extract_hidden_states_batch(&ctx, &neg_texts);
+
+        debug!("DSCP: {}/{} representações extraídas com sucesso", pos_hiddens.len(), neg_hiddens.len());
+
+        // Mínimo de 2 amostras por grupo para estatísticas confiáveis
+        if pos_hiddens.len() < 2 || neg_hiddens.len() < 2 {
+            debug!("DSCP: representações insuficientes — No-Op ativado");
+            return None;
+        }
+
+        let direction = calibrate_direction_from_hidden_states(&pos_hiddens, &neg_hiddens)?;
+
+        // Guarda explícita de divergência geométrica.
+        // `calibrate_direction_from_hidden_states` normaliza o vetor (‖d̂‖ = 1),
+        // então d_sq ≈ 1.0 em caso normal; < 1e-12 indica vetor nulo (grupos idênticos).
+        let d_sq: f32 = direction.iter().map(|&v| v * v).sum();
+        if d_sq < 1e-12 {
+            debug!("DSCP: d_sq={:.2e} < 1e-12 — divergência geométrica insuficiente — No-Op ativado", d_sq);
+            return None;
+        }
+
+        debug!("DSCP: vetor de direção gerado (dim={}, d_sq={:.4}, intensity={})",
+               direction.len(), d_sq, intensity);
+
+        Some(ActivationSteeringConfig { direction, intensity })
     }
 
     /// Versão Reativa/Stream: devolve tokens um a um conforme são gerados pela GPU.
