@@ -187,3 +187,97 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
     let lm_head = weight(wb, "output.weight").unwrap_or(tok_embd);
     Some(matvec(lm_head, &normed, cfg.vocab, h))
 }
+
+/// KV cache em CPU: por camada, K e V acumulados (uma entrada por posição já vista).
+/// Permite o forward INCREMENTAL — processa só o token novo e atende sobre todo o
+/// histórico cacheado, em vez de recomputar a sequência inteira a cada passo.
+pub struct CpuKvCache {
+    k: Vec<Vec<Vec<f32>>>, // [layer][pos][kv_dim]
+    v: Vec<Vec<Vec<f32>>>,
+}
+
+impl CpuKvCache {
+    pub fn new(n_layers: usize) -> Self {
+        Self { k: vec![Vec::new(); n_layers], v: vec![Vec::new(); n_layers] }
+    }
+    /// Número de posições já cacheadas (idêntico em todas as camadas).
+    pub fn len(&self) -> usize { self.k.first().map(|l| l.len()).unwrap_or(0) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+/// Forward INCREMENTAL de UM token na posição `pos`, usando/atualizando o KV cache.
+/// Retorna os logits [vocab] para predizer o PRÓXIMO token. Custo O(seq) por passo
+/// (atende ao histórico cacheado) em vez de O(seq²) do recompute total.
+pub fn forward_step(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cache: &mut CpuKvCache) -> Option<Vec<f32>> {
+    let h = cfg.hidden;
+    let hd = cfg.head_dim;
+    let nq = cfg.n_heads;
+    let nkv = cfg.n_kv_heads.max(1);
+    let group = (nq / nkv).max(1);
+    let q_dim = nq * hd;
+    let kv_dim = nkv * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    let tok_embd = weight(wb, "token_embd.weight")?;
+    let s = (token as usize) * h;
+    let mut x: Vec<f32> = tok_embd.get(s..s + h).map(|r| r.to_vec()).unwrap_or_else(|| vec![0.0; h]);
+
+    for layer in 0..cfg.n_layers {
+        let attn_norm = weight(wb, &format!("blk.{}.attn_norm.weight", layer))?;
+        let wq = weight(wb, &format!("blk.{}.attn_q.weight", layer))?;
+        let wk = weight(wb, &format!("blk.{}.attn_k.weight", layer))?;
+        let wv = weight(wb, &format!("blk.{}.attn_v.weight", layer))?;
+        let wo = weight(wb, &format!("blk.{}.attn_output.weight", layer))?;
+        let ffn_norm = weight(wb, &format!("blk.{}.ffn_norm.weight", layer))?;
+        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer))?;
+        let wup = weight(wb, &format!("blk.{}.ffn_up.weight", layer))?;
+        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer))?;
+
+        let normed = rmsnorm(&x, attn_norm, cfg.eps);
+        let mut q = matvec(wq, &normed, q_dim, h);
+        let mut k = matvec(wk, &normed, kv_dim, h);
+        let vv = matvec(wv, &normed, kv_dim, h);
+        rope_neox(&mut q, nq, hd, pos, cfg.rope_base);
+        rope_neox(&mut k, nkv, hd, pos, cfg.rope_base);
+
+        // Anexa K,V desta posição ao cache da camada.
+        cache.k[layer].push(k);
+        cache.v[layer].push(vv);
+        let klen = cache.k[layer].len();
+
+        // Atenção: Q atual atende a TODAS as posições cacheadas (causal por construção).
+        let mut attn_out = vec![0.0f32; q_dim];
+        for head in 0..nq {
+            let kvh = head / group;
+            let mut scores = vec![0.0f32; klen];
+            for sp in 0..klen {
+                let kc = &cache.k[layer][sp];
+                let mut dot = 0.0f32;
+                for d in 0..hd { dot += q[head * hd + d] * kc[kvh * hd + d]; }
+                scores[sp] = dot * scale;
+            }
+            softmax(&mut scores);
+            for d in 0..hd {
+                let mut acc = 0.0f32;
+                for sp in 0..klen { acc += scores[sp] * cache.v[layer][sp][kvh * hd + d]; }
+                attn_out[head * hd + d] = acc;
+            }
+        }
+
+        let proj = matvec(wo, &attn_out, h, q_dim);
+        for i in 0..h { x[i] += proj[i]; }
+
+        let normed2 = rmsnorm(&x, ffn_norm, cfg.eps);
+        let gate = matvec(wgate, &normed2, cfg.intermediate, h);
+        let up = matvec(wup, &normed2, cfg.intermediate, h);
+        let mut swiglu = vec![0.0f32; cfg.intermediate];
+        for i in 0..cfg.intermediate { swiglu[i] = silu(gate[i]) * up[i]; }
+        let down = matvec(wdown, &swiglu, h, cfg.intermediate);
+        for i in 0..h { x[i] += down[i]; }
+    }
+
+    let final_norm = weight(wb, "output_norm.weight")?;
+    let normed = rmsnorm(&x, final_norm, cfg.eps);
+    let lm_head = weight(wb, "output.weight").unwrap_or(tok_embd);
+    Some(matvec(lm_head, &normed, cfg.vocab, h))
+}

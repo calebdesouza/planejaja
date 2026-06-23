@@ -472,55 +472,45 @@ impl InferencePipeline {
             cpu_cfg.n_layers, cpu_cfg.hidden, cpu_cfg.n_heads, cpu_cfg.n_kv_heads,
             cpu_cfg.head_dim, cpu_cfg.intermediate, cpu_cfg.vocab, cpu_cfg.rope_base, eos_token);
 
-        let mut step = 0;
-        while step < max_tokens {
-            // Forward CORRETO (referência CPU): processa TODA a sequência
-            // (prompt + tokens já gerados) com atenção causal + RoPE NeoX +
-            // layout GGUF [out,in], e prediz o PRÓXIMO token. É a base de coerência;
-            // a especulação (COBER) e o compute GPU entram POR CIMA deste forward.
-            let mut seq_ids: Vec<u32> = input_tokens.clone();
-            seq_ids.extend(generated_tokens.iter().copied());
-            let mut logits = match crate::cpu_reference::forward_last_logits(&seq_ids, &cpu_cfg, &weight_bank) {
-                Some(l) => l,
-                None => break, // pesos ausentes (modelo sintético) → encerra
-            };
-            // Motores disponíveis (especulação/probes/GPU), fora do loop quente por ora.
-            let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled);
+        // ─── Forward INCREMENTAL com KV cache (reuso): O(seq) por token ─────────
+        // Prefill: processa cada token do prompt UMA vez, preenchendo o cache.
+        // Decode: processa só o token NOVO, atendendo ao histórico cacheado —
+        // evita recomputar a sequência inteira a cada passo (O(seq²) → O(seq)).
+        // É também a base para a especulação (COBER/EAGLE) render de verdade.
+        let mut kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
+        let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token);
 
-            // Amostra o próximo token dos logits do forward correto (conformal).
+        let mut cur_logits: Option<Vec<f32>> = None;
+        for (p, &tok) in input_tokens.iter().enumerate() {
+            match crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut kv) {
+                Some(l) => cur_logits = Some(l),
+                None => break, // pesos ausentes (modelo sintético) → encerra
+            }
+        }
+
+        let mut next_pos = input_tokens.len();
+        while generated_tokens.len() < max_tokens {
+            let mut logits = match cur_logits.take() {
+                Some(l) => l,
+                None => break,
+            };
             let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
                 .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
             let next_tok = (sampled_token as u32) % vocab_size;
             if Some(next_tok) == eos_token { break; }
-            let accepted_round = vec![next_tok];
 
-            for &t in &accepted_round {
-                generated_tokens.push(t);
-                
-                // Stream o token convertido para string (fallback simples para tokenizer mock)
-                if let Some(ref tx_stream) = tx {
-                    let token_str = tokenizer.decode(&[t], true).unwrap_or_default();
-                    if !token_str.is_empty() {
-                        // `generate` roda como task async → usa o send assíncrono.
-                        // (`blocking_send` panica dentro do runtime Tokio.)
-                        let _ = tx_stream.send(Ok(token_str)).await;
-                    }
+            generated_tokens.push(next_tok);
+            tokens_done += 1;
+            if let Some(ref tx_stream) = tx {
+                let token_str = tokenizer.decode(&[next_tok], true).unwrap_or_default();
+                if !token_str.is_empty() {
+                    let _ = tx_stream.send(Ok(token_str)).await;
                 }
             }
 
-            // Paginação KV (contexto → SSD). Escrita direta, sem depender do
-            // prefetch streaming (cujo `next_tensor().await` podia bloquear o loop
-            // de geração indefinidamente). O streaming especulativo de pesos é
-            // orquestrado pelo APEX em paralelo; aqui só persistimos o KV.
-            let logit_bytes = logits.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
-            for layer_idx in 0..layers_per_token {
-                if let Err(e) = kv_cache.allocate_block(layer_idx, &logit_bytes, &*self.transport) {
-                    debug!("KV Cache alloc layer {}: {}", layer_idx, e);
-                }
-            }
-            
-            step += accepted_round.len();
-            tokens_done += accepted_round.len();
+            // Avança: processa o token recém-gerado e obtém os logits do próximo.
+            cur_logits = crate::cpu_reference::forward_step(next_tok, next_pos, &cpu_cfg, &weight_bank, &mut kv);
+            next_pos += 1;
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM
