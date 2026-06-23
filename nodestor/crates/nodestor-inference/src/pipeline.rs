@@ -486,8 +486,9 @@ impl InferencePipeline {
         // (rollback do cache). Em texto repetitivo (código/JSON/listas) a aceitação
         // é alta → "K tokens no tempo de 1" na placa limitada por banda.
         const NGRAM: usize = 2;
-        const DRAFT_K: usize = 8;
-        let prompt_lookup = |seq: &[u32]| -> Vec<u32> {
+        const DRAFT_K_MAX: usize = 16;
+        let mut draft_k = 4usize; // K-DINÂMICO: calibra-se sozinho pela aceitação
+        let prompt_lookup = |seq: &[u32], k: usize| -> Vec<u32> {
             let n = seq.len();
             if n <= NGRAM { return Vec::new(); }
             let suffix = &seq[n - NGRAM..];
@@ -496,7 +497,7 @@ impl InferencePipeline {
                 i -= 1;
                 if &seq[i..i + NGRAM] == suffix {
                     let start = i + NGRAM;
-                    let end = (start + DRAFT_K).min(n);
+                    let end = (start + k).min(n);
                     if start < n { return seq[start..end].to_vec(); }
                 }
             }
@@ -524,7 +525,7 @@ impl InferencePipeline {
             let logits = match cur_logits.take() { Some(l) => l, None => break };
 
             // 1+2+3. Rascunho n-gram → verificação batched → aceita prefixo.
-            let draft = prompt_lookup(&full_seq);
+            let draft = prompt_lookup(&full_seq, draft_k);
             if !draft.is_empty() {
                 spec_rounds += 1;
                 spec_drafted += draft.len();
@@ -552,6 +553,10 @@ impl InferencePipeline {
                 }
                 cur_logits = Some(if m > 0 { vlogits[m - 1].clone() } else { logits.clone() });
                 pos += m;
+                // K-DINÂMICO: cresce se aceitou tudo (banda bem aproveitada),
+                // encolhe se rejeitou cedo (evita desperdício de verificação).
+                if m == draft.len() { draft_k = (draft_k + 2).min(DRAFT_K_MAX); }
+                else if m == 0 { draft_k = draft_k.saturating_sub(1).max(1); }
             } else {
                 cur_logits = Some(logits);
             }
@@ -572,8 +577,8 @@ impl InferencePipeline {
             pos += 1;
         }
         if spec_rounds > 0 {
-            debug!("Especulação SEM CABEÇA (n-gram K={}): {}/{} rascunhos aceitos ({:.0}%), {:.2} tokens/rodada — na GPU = K tokens por weight-load",
-                DRAFT_K, spec_accepted, spec_drafted,
+            debug!("Especulação SEM CABEÇA (n-gram, K-dinâmico→{}): {}/{} rascunhos aceitos ({:.0}%), {:.2} tokens/rodada — na GPU = K tokens por weight-load",
+                draft_k, spec_accepted, spec_drafted,
                 100.0 * spec_accepted as f64 / spec_drafted.max(1) as f64,
                 (spec_accepted + spec_rounds) as f64 / spec_rounds as f64);
         }
