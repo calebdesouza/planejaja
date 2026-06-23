@@ -488,29 +488,76 @@ impl InferencePipeline {
             }
         }
 
-        let mut next_pos = input_tokens.len();
-        while generated_tokens.len() < max_tokens {
-            let mut logits = match cur_logits.take() {
-                Some(l) => l,
-                None => break,
-            };
-            let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
-                .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
-            let next_tok = (sampled_token as u32) % vocab_size;
-            if Some(next_tok) == eos_token { break; }
-
-            generated_tokens.push(next_tok);
-            tokens_done += 1;
-            if let Some(ref tx_stream) = tx {
-                let token_str = tokenizer.decode(&[next_tok], true).unwrap_or_default();
-                if !token_str.is_empty() {
-                    let _ = tx_stream.send(Ok(token_str)).await;
+        // ─── Decode GREEDY com ESPECULAÇÃO (prompt-lookup, lossless) ────────────
+        // Greedy ⇒ saída determinística e idêntica à autoregressiva (lossless por
+        // construção). A especulação propõe rascunhos GRÁTIS a partir de repetições
+        // no contexto e os VERIFICA contra o modelo; medimos a ACEITAÇÃO — que, no
+        // caminho GPU (memory-bound), vira o multiplicador de tok/s (verificar K
+        // rascunhos num ÚNICO forward). Em CPU (compute-bound) prova o mecanismo.
+        const SPEC_NGRAM: usize = 2;
+        const SPEC_K: usize = 4;
+        let prompt_lookup = |seq: &[u32]| -> Vec<u32> {
+            let n = seq.len();
+            if n <= SPEC_NGRAM { return Vec::new(); }
+            let suffix = &seq[n - SPEC_NGRAM..];
+            let mut i = n - SPEC_NGRAM;
+            while i > 0 {
+                i -= 1;
+                if &seq[i..i + SPEC_NGRAM] == suffix {
+                    let start = i + SPEC_NGRAM;
+                    let end = (start + SPEC_K).min(n);
+                    if start < n { return seq[start..end].to_vec(); }
                 }
             }
+            Vec::new()
+        };
+        let _ = &sampler; // amostragem estocástica disponível; demo usa greedy lossless
 
-            // Avança: processa o token recém-gerado e obtém os logits do próximo.
-            cur_logits = crate::cpu_reference::forward_step(next_tok, next_pos, &cpu_cfg, &weight_bank, &mut kv);
+        let mut full_seq: Vec<u32> = input_tokens.clone();
+        let mut next_pos = input_tokens.len();
+        let mut spec_drafted = 0usize;
+        let mut spec_accepted = 0usize;
+
+        'outer: while generated_tokens.len() < max_tokens {
+            let logits = match cur_logits.take() { Some(l) => l, None => break };
+            // Âncora: escolha greedy do modelo (sempre commitada; lossless).
+            let anchor = crate::cpu_reference::argmax(&logits);
+            if Some(anchor) == eos_token { break; }
+            generated_tokens.push(anchor);
+            full_seq.push(anchor);
+            tokens_done += 1;
+            if let Some(ref tx_stream) = tx {
+                let s = tokenizer.decode(&[anchor], true).unwrap_or_default();
+                if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
+            }
+            cur_logits = crate::cpu_reference::forward_step(anchor, next_pos, &cpu_cfg, &weight_bank, &mut kv);
             next_pos += 1;
+            if generated_tokens.len() >= max_tokens { break; }
+
+            // Especulação: rascunho via prompt-lookup; verifica/aceita prefixo greedy.
+            let draft = prompt_lookup(&full_seq);
+            if !draft.is_empty() {
+                spec_drafted += draft.len();
+                for &d in &draft {
+                    let want = match &cur_logits { Some(l) => crate::cpu_reference::argmax(l), None => break };
+                    if want != d { break; } // rascunho rejeitado → para a rodada
+                    generated_tokens.push(d);
+                    full_seq.push(d);
+                    tokens_done += 1;
+                    spec_accepted += 1;
+                    if let Some(ref tx_stream) = tx {
+                        let s = tokenizer.decode(&[d], true).unwrap_or_default();
+                        if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
+                    }
+                    cur_logits = crate::cpu_reference::forward_step(d, next_pos, &cpu_cfg, &weight_bank, &mut kv);
+                    next_pos += 1;
+                    if generated_tokens.len() >= max_tokens { break 'outer; }
+                }
+            }
+        }
+        if spec_drafted > 0 {
+            debug!("Especulação (prompt-lookup): {}/{} rascunhos aceitos ({:.0}%) — na GPU vira multiplicador de tok/s",
+                spec_accepted, spec_drafted, 100.0 * spec_accepted as f64 / spec_drafted as f64);
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM

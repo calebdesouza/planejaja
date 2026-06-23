@@ -203,6 +203,23 @@ impl CpuKvCache {
     /// Número de posições já cacheadas (idêntico em todas as camadas).
     pub fn len(&self) -> usize { self.k.first().map(|l| l.len()).unwrap_or(0) }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Reverte o cache para `len` posições (rollback de rascunhos REJEITADOS na
+    /// decodificação especulativa). Mantém o histórico aceito intacto.
+    pub fn truncate(&mut self, len: usize) {
+        for l in self.k.iter_mut() { l.truncate(len); }
+        for l in self.v.iter_mut() { l.truncate(len); }
+    }
+}
+
+/// Índice do maior elemento (argmax) — escolha greedy (lossless por construção).
+pub fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > bv { bv = v; best = i; }
+    }
+    best as u32
 }
 
 /// Forward INCREMENTAL de UM token na posição `pos`, usando/atualizando o KV cache.
