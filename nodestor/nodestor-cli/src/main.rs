@@ -112,6 +112,12 @@ enum Commands {
         /// Máximo de tokens a gerar
         #[arg(long, default_value = "128")]
         max_tokens: usize,
+        /// Prompt de Sistema (a "constituição" do modelo: tom, regras, persona)
+        #[arg(long)]
+        system: Option<String>,
+        /// Perfil pronto (cientista, programador, advogado, professor, conciso, security)
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -148,7 +154,7 @@ async fn main() -> Result<()> {
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
-            Commands::Run { prompt, model, max_tokens } => cmd_run(&model, &prompt, max_tokens).await,
+            Commands::Run { prompt, model, max_tokens, system, profile } => cmd_run(&model, &prompt, max_tokens, system, profile).await,
         },
         None => {
             if cli.quiet {
@@ -391,15 +397,55 @@ fn autodetect_model() -> Option<String> {
 
 /// Inferência local direta: carrega o modelo no pipeline e gera, medindo
 /// TTFT e tokens/s REAIS em tempo de execução (nada estimado/hardcoded).
-async fn cmd_run(model: &str, prompt: &str, max_tokens: usize) -> Result<()> {
+/// Biblioteca de Perfis — Prompts de Sistema prontos (o "Editor de Personalidades").
+fn profile_prompt(name: &str) -> Option<&'static str> {
+    Some(match name.to_lowercase().as_str() {
+        "cientista" | "scientist" => "You are a rigorous scientist. Reason step by step, cite evidence, and clearly separate fact from hypothesis.",
+        "programador" | "programmer" | "dev" => "You are a senior software engineer. Write clean, correct, idiomatic code and explain trade-offs concisely.",
+        "advogado" | "lawyer" => "You are a careful legal analyst. Be precise, cite principles, and flag uncertainties and jurisdiction limits.",
+        "professor" | "teacher" => "You are a patient teacher. Explain clearly with simple examples, then check understanding.",
+        "conciso" | "concise" => "You are concise. Answer directly in as few words as possible, with no preamble.",
+        "security" | "seguranca" => "You are a security researcher performing AUTHORIZED review. Analyze code for vulnerabilities and explain mitigations.",
+        _ => return None,
+    })
+}
+
+/// Resolve o Prompt de Sistema: texto livre (`--system`) tem prioridade; senão um
+/// perfil pronto (`--profile`); senão o próprio nome do perfil como texto cru.
+fn resolve_system(system: Option<String>, profile: Option<String>) -> Option<String> {
+    if let Some(s) = system { return Some(s); }
+    profile.map(|p| profile_prompt(&p).map(|s| s.to_string()).unwrap_or(p))
+}
+
+/// Monta o prompt no template de chat ChatML (SmolLM2/Qwen/…). Sem Prompt de
+/// Sistema, mantém o modo completion cru (compatível com modelos base).
+fn build_chat_prompt(system: Option<&str>, user: &str) -> String {
+    match system {
+        Some(sys) => format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            sys, user
+        ),
+        None => user.to_string(),
+    }
+}
+
+async fn cmd_run(model: &str, prompt: &str, max_tokens: usize, system: Option<String>, profile: Option<String>) -> Result<()> {
     use nodestor_inference::pipeline::{InferenceConfig, InferencePipeline};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::time::Instant;
     use std::io::Write;
 
+    // System Prompt = "Bloco Zero" que governa a forma de pensar do modelo.
+    let system_prompt = resolve_system(system, profile);
+    let effective_prompt = build_chat_prompt(system_prompt.as_deref(), prompt);
+
     println!("\n🚀 NodeStor Run — Inferência local direta (sem servidor)\n{}", "─".repeat(60));
     println!("📂 Modelo : {}", model);
+    if let Some(ref sys) = system_prompt {
+        let short: String = sys.chars().take(60).collect();
+        println!("🧠 Sistema: {}{}", short, if sys.chars().count() > 60 { "…" } else { "" });
+    }
     println!("💬 Prompt : {}", prompt);
     println!("🎯 Tokens : {}", max_tokens);
 
@@ -423,7 +469,7 @@ async fn cmd_run(model: &str, prompt: &str, max_tokens: usize) -> Result<()> {
 
     // Stream real token-a-token, cronometrando o primeiro token (TTFT).
     let gen_start = Instant::now();
-    let mut stream = pipeline.clone().generate_stream(prompt.to_string(), max_tokens).await;
+    let mut stream = pipeline.clone().generate_stream(effective_prompt, max_tokens).await;
 
     print!("\n🤖 ");
     std::io::stdout().flush().ok();
@@ -466,7 +512,7 @@ async fn cmd_latency(model_path: Option<String>) -> Result<()> {
     };
 
     // Mede com um prompt curto padrão (32 tokens). Reaproveita o caminho real.
-    cmd_run(&model, "The quick brown fox", 32).await
+    cmd_run(&model, "The quick brown fox", 32, None, None).await
 }
 
 fn print_logo() {
