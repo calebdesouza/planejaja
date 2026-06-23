@@ -694,6 +694,70 @@ impl CoberEngine {
         self.eagle2_head_weights = Some(weights);
     }
 
+    /// TREINA (destila) a cabeça de rascunho EAGLE-2 por descida de gradiente.
+    ///
+    /// Dado um conjunto de pares `(hidden_state, token_alvo)` coletados do modelo
+    /// mestre, aprende `W` (hidden×vocab) que prediz o token a partir do hidden,
+    /// minimizando cross-entropy: `L = -log softmax(W·h)[alvo]`. Esta é a "cabeça
+    /// de rascunho treinada" que o EAGLE-2 exige — sem treino, a especulação
+    /// extrema (alta aceitação) NÃO existe; é da natureza do método.
+    ///
+    /// Retorna a perda média da última época. NOTA HONESTA: aceitação alta (~90%)
+    /// exige treino em CORPUS (muitos forwards do modelo-alvo). Com poucos pares,
+    /// a cabeça apenas memoriza o contexto local.
+    pub fn train_eagle2_head(
+        &mut self,
+        pairs: &[(Vec<f32>, u32)],
+        hidden_dim: usize,
+        vocab_size: usize,
+        epochs: usize,
+        lr: f32,
+    ) -> f32 {
+        let (h, v) = (hidden_dim, vocab_size);
+        let mut w = match self.eagle2_head_weights.take() {
+            Some(w) if w.len() == h * v => w,
+            _ => vec![0.0f32; h * v],
+        };
+        let mut last_loss = 0.0f32;
+        for _ in 0..epochs.max(1) {
+            let mut epoch_loss = 0.0f32;
+            let mut count = 0usize;
+            for (hidden, target) in pairs {
+                if hidden.len() < h { continue; }
+                let target = *target as usize;
+                if target >= v { continue; }
+                // forward: logits = W·hidden  →  softmax  →  p
+                let mut p = vec![0.0f32; v];
+                for vi in 0..v {
+                    let mut acc = 0.0f32;
+                    for hi in 0..h { acc += hidden[hi] * w[hi * v + vi]; }
+                    p[vi] = acc;
+                }
+                let m = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for x in p.iter_mut() { *x = (*x - m).exp(); sum += *x; }
+                if sum > 0.0 { for x in p.iter_mut() { *x /= sum; } }
+                epoch_loss += -(p[target].max(1e-9)).ln();
+                count += 1;
+                // grad/update: dL/dW[hi,vi] = hidden[hi]·(p[vi] − 1{vi=alvo})
+                for hi in 0..h {
+                    let hv = hidden[hi];
+                    if hv == 0.0 { continue; }
+                    let base = hi * v;
+                    for vi in 0..v {
+                        let g = hv * (p[vi] - if vi == target { 1.0 } else { 0.0 });
+                        w[base + vi] -= lr * g;
+                    }
+                }
+            }
+            last_loss = epoch_loss / count.max(1) as f32;
+        }
+        self.eagle2_hidden_dim = h;
+        self.eagle2_vocab_size = v;
+        self.eagle2_head_weights = Some(w);
+        last_loss
+    }
+
     /// Gera probabilidades e Top-K tokens via EAGLE-2.
     /// Retorna `(probs, tokens)`.
     pub fn eagle2_predict_probs(&self, hidden_state: &[f32], k: usize) -> (Vec<f32>, Vec<u32>) {
@@ -1199,5 +1263,27 @@ mod tests {
         assert!(report.contains("EAGLE-2"), "Report deve mencionar EAGLE-2");
         assert!(report.contains("EASD"), "Report deve mencionar EASD");
         assert!(report.contains("Pre-gate"), "Report deve mencionar Pre-gate");
+    }
+
+    #[test]
+    fn test_eagle2_head_learns_by_distillation() {
+        // Prova que a maquinaria de TREINO da cabeça EAGLE-2 funciona: o SGD reduz
+        // a perda e a cabeça passa a prever o token-alvo a partir do hidden.
+        let mut engine = CoberEngine::new_dense(make_budget_dense(8 * 1024));
+        let (h, v) = (4usize, 8usize);
+        let pairs = vec![
+            (vec![1.0, 0.0, 0.0, 0.0], 2u32),
+            (vec![0.0, 1.0, 0.0, 0.0], 5u32),
+            (vec![0.0, 0.0, 1.0, 0.0], 7u32),
+            (vec![0.0, 0.0, 0.0, 1.0], 1u32),
+        ];
+        let loss_inicial = engine.train_eagle2_head(&pairs, h, v, 1, 0.5);
+        let loss_final = engine.train_eagle2_head(&pairs, h, v, 300, 0.5);
+        assert!(loss_final < loss_inicial, "a perda deve CAIR com o treino: {} -> {}", loss_inicial, loss_final);
+        assert!(loss_final < 0.05, "a cabeça deve aprender (perda baixa), got {}", loss_final);
+        for (hid, tok) in &pairs {
+            let toks = engine.eagle2_draft_from_hidden(hid, 1);
+            assert_eq!(toks.first().copied(), Some(*tok), "cabeça treinada deve prever {} para {:?}", tok, hid);
+        }
     }
 }

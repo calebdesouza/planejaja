@@ -486,10 +486,9 @@ impl InferencePipeline {
         // rascunhador (mais barato e mais preciso) — ver `cober.eagle2_*`.
         let draft_layers = (cpu_cfg.n_layers / 4).max(1);
         const SPEC_K: usize = 4;
-        let eagle_active = cober.eagle2_head_weights.is_some();
         let mut main_kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
         let mut draft_kv = crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers);
-        let _ = (&cheby, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
+        let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
 
         // Prefill: preenche AMBAS as caches (alvo e rascunhador) com o prompt.
         let mut cur_logits: Option<Vec<f32>> = None;
@@ -506,14 +505,13 @@ impl InferencePipeline {
         let mut spec_drafted = 0usize;
         let mut spec_accepted = 0usize;
 
-        // Rascunho do próximo token: EAGLE-2 (se treinada) ou early-exit.
-        let draft_next = |draft_logits: &Option<Vec<f32>>, cober: &crate::cober::CoberEngine| -> Option<u32> {
-            if eagle_active {
-                if let Some(dl) = draft_logits {
-                    let toks = cober.eagle2_draft_from_hidden(dl, 1);
-                    return toks.first().copied();
-                }
-            }
+        // Rascunho do próximo token via early-exit (argmax dos logits truncados).
+        // (B) A cabeça EAGLE-2 TREINADA — ver `cober::train_eagle2_head`, já testada —
+        // substituiria isto como rascunhador, lendo o HIDDEN do modelo (h-dim). O
+        // wiring de inferência do EAGLE precisa capturar esse hidden no loop
+        // (forward que retorne o hidden), passo claro e pequeno. Aqui usamos o
+        // rascunhador early-exit (treino-zero) para medir o mecanismo.
+        let draft_next = |draft_logits: &Option<Vec<f32>>| -> Option<u32> {
             draft_logits.as_ref().map(|l| crate::cpu_reference::argmax(l))
         };
 
@@ -534,7 +532,7 @@ impl InferencePipeline {
 
             // Self-speculation: rascunhador propõe; o ALVO verifica (greedy, lossless).
             for _ in 0..SPEC_K {
-                let d = match draft_next(&draft_logits, &cober) { Some(d) => d, None => break };
+                let d = match draft_next(&draft_logits) { Some(d) => d, None => break };
                 spec_drafted += 1;
                 let want = match &cur_logits { Some(l) => crate::cpu_reference::argmax(l), None => break };
                 if want != d { break; } // alvo discorda → rejeita, encerra a rodada
@@ -552,9 +550,8 @@ impl InferencePipeline {
             }
         }
         if spec_drafted > 0 {
-            let src = if eagle_active { "EAGLE-2 treinada" } else { "early-exit" };
-            debug!("Self-speculation ({}, rascunho={}/{} camadas): {}/{} aceitos ({:.0}%) — na GPU vira multiplicador de tok/s",
-                src, draft_layers, cpu_cfg.n_layers, spec_accepted, spec_drafted, 100.0 * spec_accepted as f64 / spec_drafted as f64);
+            debug!("Self-speculation (early-exit, rascunho={}/{} camadas): {}/{} aceitos ({:.0}%) — na GPU vira multiplicador de tok/s",
+                draft_layers, cpu_cfg.n_layers, spec_accepted, spec_drafted, 100.0 * spec_accepted as f64 / spec_drafted as f64);
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM
