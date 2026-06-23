@@ -458,11 +458,16 @@ impl InferencePipeline {
                     .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
                 vec![(sampled_token as u32) % vocab_size]
             } else {
-                // Modo decoding: Especulação Ativa
+                // Modo decoding: Especulação Ativa.
+                // NOTA: o MCTS (busca profunda) é caro — N simulações × profundidade,
+                // centenas de forwards por token. NÃO é para o caminho interativo
+                // padrão; fica opt-in (deep reasoning). Aqui, alta entropia cai na
+                // amostragem direta do modelo mestre (rápida e correta).
+                let _ = &_mcts_engine; // mantém o motor disponível sem invocá-lo no loop quente
                 if entropy > 2.0 {
-                    // MCTS Engine (Busca Profunda)
-                    let best_token = _mcts_engine.simulate(64, &drafter, &embed_data, 5);
-                    vec![best_token % vocab_size]
+                    let (sampled_token, _) = sampler.sample_with_conformal(&mut logits, &generated_tokens)
+                        .map_err(|e| nodestor_core::NodeStorError::VulkanError(format!("Sampler error: {:?}", e)))?;
+                    vec![(sampled_token as u32) % vocab_size]
                 } else {
                     // COBER Engine (Lossless)
                     let (tree_k, _) = cober.easd_compute_tree_params(&current_probs);
