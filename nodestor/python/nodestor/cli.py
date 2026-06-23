@@ -149,6 +149,7 @@ def print_logo() -> None:
 # ─────────────────────────────── catálogo de comandos ───────────────────────────
 # Poucos comandos, claros. (nome, uso, descrição)
 COMMANDS = [
+    ("models",  "nodestor models",                              "Lista os modelos JÁ instalados no computador"),
     ("pull",    "nodestor pull <repo> --filename <arquivo>",    "Baixa um modelo do HuggingFace para ~/.nodestor/models"),
     ("run",     "nodestor run \"<prompt>\" --model <arquivo>", "Roda um prompt num modelo local e mostra TTFT e tok/s reais"),
     ("chat",    "nodestor chat --model <arquivo>",              "Conversa interativa contínua com o modelo"),
@@ -256,6 +257,76 @@ def cmd_profiles() -> int:
     out()
     out("Uso: " + _c('nodestor run "pergunta" --model X --profile cientista', "cyan"))
     return 0
+
+
+# ── Descoberta de modelos já instalados no computador ──
+def _model_dirs() -> "list[str]":
+    home = os.path.expanduser("~")
+    return [
+        os.path.join(home, ".nodestor", "models"),
+        os.path.join(home, ".cache", "huggingface", "hub"),
+        os.path.join(home, ".cache", "lm-studio", "models"),
+        os.path.join(home, ".ollama", "models"),
+        os.getcwd(),
+    ]
+
+
+def find_installed_models() -> "list[tuple[str, int]]":
+    """Varre os diretórios comuns e retorna [(caminho, bytes)] de modelos GGUF/ST."""
+    found, seen = [], set()
+    for base in _model_dirs():
+        if not os.path.isdir(base):
+            continue
+        base_depth = base.rstrip(os.sep).count(os.sep)
+        for root, dirs, files in os.walk(base):
+            if root.count(os.sep) - base_depth > 5:  # limita profundidade (evita lentidão)
+                dirs[:] = []
+                continue
+            for f in files:
+                if f.endswith((".gguf", ".safetensors")):
+                    p = os.path.join(root, f)
+                    rp = os.path.realpath(p)
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    try:
+                        found.append((p, os.path.getsize(p)))
+                    except OSError:
+                        pass
+    found.sort(key=lambda t: t[1], reverse=True)
+    return found
+
+
+def cmd_models() -> int:
+    header("Modelos instalados", "GGUF / SafeTensors encontrados no computador")
+    models = find_installed_models()
+    if not models:
+        out(_c("Nenhum modelo encontrado.", "yellow"))
+        out("  Baixe um com: " + _c("nodestor pull <repo> --filename <arquivo.gguf>", "cyan"))
+        return 0
+    for i, (p, size) in enumerate(models, 1):
+        out("  " + _c(f"[{i}]", "cyan", "bold") + f" {os.path.basename(p)}  "
+            + _c(f"({size / 1e9:.2f} GB)", "dim"))
+        out("       " + _c(p, "dim"))
+    out()
+    out("Rode um com: " + _c('nodestor run "prompt" --model <caminho>', "cyan"))
+    return 0
+
+
+def pick_model(label: str = "modelo") -> "str | None":
+    """Lista os modelos instalados e deixa escolher por NÚMERO — ou digitar um caminho."""
+    models = find_installed_models()
+    if models:
+        out(_c(f"  Modelos instalados ({len(models)}):", "dim"))
+        for i, (p, size) in enumerate(models, 1):
+            out("    " + _c(f"[{i}]", "cyan", "bold") + f" {os.path.basename(p)} "
+                + _c(f"({size / 1e9:.2f} GB)", "dim"))
+    raw = input(_c(f"  número ou caminho do {label}: ", "cyan")).strip().strip('"')
+    if not raw:
+        return None
+    if raw.isdigit() and models and 1 <= int(raw) <= len(models):
+        return models[int(raw) - 1][0]
+    return raw
 
 
 def cmd_run(model: str, prompt: str, max_tokens: int, system=None, profile=None) -> int:
@@ -483,7 +554,19 @@ def cmd_connect() -> int:
 # ─────────────────────────────── painel interativo ─────────────────────────────
 def interactive_menu() -> int:
     print_logo()
+    # Mostra de cara os modelos JÁ instalados no computador (descoberta automática).
+    _installed = find_installed_models()
+    if _installed:
+        out(_c(f"📦 {len(_installed)} modelo(s) instalado(s):", "green", "bold"))
+        for p, size in _installed[:5]:
+            out("   • " + os.path.basename(p) + _c(f"  ({size / 1e9:.2f} GB)", "dim"))
+        if len(_installed) > 5:
+            out(_c(f"   …e mais {len(_installed) - 5}. Veja todos com a opção 'models'.", "dim"))
+    else:
+        out(_c("📦 Nenhum modelo instalado ainda — use 'Baixar um modelo (pull)'.", "yellow"))
+    out()
     options = [
+        ("Ver modelos instalados (models)", "models"),
         ("Baixar um modelo (pull)", "pull"),
         ("Rodar um prompt (run)", "run"),
         ("Conversar (chat)", "chat"),
@@ -519,6 +602,9 @@ def interactive_menu() -> int:
         if action == "help":
             cmd_help()
             continue
+        if action == "models":
+            cmd_models()
+            continue
         if action == "scan":
             cmd_scan()
             continue
@@ -534,14 +620,14 @@ def interactive_menu() -> int:
                 out(_c("  cancelado", "dim"))
             continue
         if action == "inspect":
-            path = input(_c("  caminho do modelo: ", "cyan")).strip().strip('"')
+            path = pick_model("modelo")
             if path:
                 cmd_inspect(path)
             else:
                 out(_c("  cancelado", "dim"))
             continue
         # run / chat / serve precisam de um modelo existente
-        model = input(_c("  caminho do modelo (.gguf): ", "cyan")).strip().strip('"')
+        model = pick_model()
         if not model:
             out(_c("  cancelado", "dim"))
             continue
@@ -596,6 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("-m", "--model", required=True)
     ps.add_argument("--port", type=int, default=8080)
 
+    sub.add_parser("models", help="Lista os modelos já instalados no computador")
     sub.add_parser("scan", help="Detecta hardware (GPU/VRAM/SSD)")
     sub.add_parser("profiles", help="Lista os perfis de sistema (personas)")
     sub.add_parser("connect", help="Como ligar Claude Code/Cursor/etc.")
@@ -624,6 +711,8 @@ def main(argv: "list[str] | None" = None) -> int:
         return cmd_serve(args.model, args.port)
     if args.command == "inspect":
         return cmd_inspect(args.path)
+    if args.command == "models":
+        return cmd_models()
     if args.command == "scan":
         return cmd_scan()
     if args.command == "profiles":
