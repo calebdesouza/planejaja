@@ -234,6 +234,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_infinite_context_recall_of_evicted_fact() {
+        // CONTEXTO INFINITO: histórico longo, janela pequena. Os blocos antigos
+        // "saem da janela deslizante" e são INDEXADOS aqui; uma pergunta MUITO depois
+        // os RECUPERA via HNSW+BM25, mesmo já não estando na atenção ativa.
+        let vs = VectorSearch::new("history", "/tmp/nodestor_infctx_test");
+        // Turnos antigos, já despejados da janela ativa:
+        vs.add_document("turn_01", "Decision: the fiscal API endpoint is /v2/nfe with a 30 second timeout.").await.unwrap();
+        vs.add_document("turn_02", "The user's cat is named Pixel and their favorite color is teal.").await.unwrap();
+        vs.add_document("turn_03", "Deployment runs Docker on port 8080 behind nginx with TLS.").await.unwrap();
+        vs.add_document("turn_04", "Lunch was pizza; the standup moved to 3pm on Fridays.").await.unwrap();
+        vs.add_document("turn_05", "We chose Rust for the engine and Python for the CLI wrapper.").await.unwrap();
+
+        // Pergunta posterior sobre um fato ANTIGO (fora da janela): o loop o traz de volta.
+        let results = vs.search_text("What did we decide about the fiscal API endpoint?", 1).await.unwrap();
+        assert!(!results.is_empty(), "deve recuperar o bloco despejado");
+        assert_eq!(results[0].id, "turn_01", "recupera o turno da decisão da API fiscal");
+        assert!(results[0].payload.as_deref().unwrap_or("").contains("/v2/nfe"),
+            "o fato exato volta no payload recuperado");
+    }
+
+    #[tokio::test]
     async fn test_search_knn_with_embedding() {
         let vs = VectorSearch::new("kb", "/tmp/nodestor_vs_knn_test");
         vs.add_document("x", "vulkan gpu compute shaders and pipelines").await.unwrap();

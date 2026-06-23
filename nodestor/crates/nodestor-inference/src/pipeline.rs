@@ -575,6 +575,11 @@ impl InferencePipeline {
 
         let mut full_seq: Vec<u32> = input_tokens.clone();
         let mut pos = input_tokens.len();
+        // Loop do CONTEXTO INFINITO: o que sai da janela deslizante é INDEXADO no
+        // vector DB (em blocos), para o retrieval híbrido trazer de volta em queries
+        // futuras. `window_start` rastreia o início da janela em `full_seq`.
+        let mut window_start = 0usize;
+        let mut evict_buf: Vec<u32> = Vec::new();
         let mut spec_drafted = 0usize;
         let mut spec_accepted = 0usize;
         let mut spec_rounds = 0usize;
@@ -645,7 +650,22 @@ impl InferencePipeline {
             pos += 1;
             // Aplica a janela deslizante por rodada (fora da verificação especulativa,
             // para não conflitar com o rollback): memória limitada, nunca OOM.
-            main_kv.enforce_window();
+            let evicted = main_kv.enforce_window();
+            if evicted > 0 {
+                for j in 0..evicted {
+                    if let Some(&t) = full_seq.get(window_start + j) { evict_buf.push(t); }
+                }
+                window_start += evicted;
+                // Indexa em blocos de ~48 tokens (chunk coerente p/ recuperação).
+                if evict_buf.len() >= 48 {
+                    let text = tokenizer.decode(&evict_buf, true).unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        let id = format!("ctx_{}", window_start);
+                        let _ = self.vector_db.add_document(&id, &text).await;
+                    }
+                    evict_buf.clear();
+                }
+            }
         }
         if spec_rounds > 0 {
             debug!("Especulação SEM CABEÇA (n-gram, K-dinâmico→{}): {}/{} rascunhos aceitos ({:.0}%), {:.2} tokens/rodada — na GPU = K tokens por weight-load",
