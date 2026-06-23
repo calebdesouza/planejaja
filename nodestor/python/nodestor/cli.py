@@ -549,11 +549,15 @@ def interactive_menu() -> int:
             out(_c(f"  Modelo não encontrado: {model}", "red"))
             out(_c("  Baixe um primeiro pela opção 'Baixar um modelo (pull)'.", "dim"))
             continue
+        # Perfil/persona opcional (Enter pula). Lista: nodestor profiles.
+        profile = None
+        if action in ("run", "chat"):
+            profile = input(_c("  perfil (cientista/programador/.../Enter p/ nenhum): ", "cyan")).strip() or None
         if action == "run":
             prompt = input(_c("  prompt: ", "cyan")).strip()
-            cmd_run(model, prompt or "Olá", 128)
+            cmd_run(model, prompt or "Olá", 128, None, profile)
         elif action == "chat":
-            cmd_chat(model, 256)
+            cmd_chat(model, 256, None, profile)
         elif action == "serve":
             cmd_serve(model, 8080)
     # inalcançável
