@@ -155,6 +155,7 @@ COMMANDS = [
     ("serve",   "nodestor serve --model <arquivo>",             "Sobe o servidor (API OpenAI/Anthropic/Ollama) na porta 8080"),
     ("inspect", "nodestor inspect <arquivo>",                   "Mostra formato, nº de tensores e tamanho do modelo"),
     ("scan",    "nodestor scan",                                "Detecta GPU, VRAM, SSD e o melhor caminho SSD→GPU"),
+    ("profiles","nodestor profiles",                            "Lista as personas prontas (--profile cientista, etc.)"),
     ("connect", "nodestor connect",                             "Como ligar Claude Code, Cursor e outras ferramentas"),
     ("help",    "nodestor help",                                "Mostra esta lista de comandos e para que servem"),
     ("version", "nodestor version",                             "Mostra a versão instalada"),
@@ -218,7 +219,46 @@ def cmd_scan() -> int:
         return 1
 
 
-def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
+# ── System Prompt ("Bloco Zero") + Biblioteca de Perfis (Editor de Personalidades) ──
+PROFILES = {
+    "cientista": "You are a rigorous scientist. Reason step by step, cite evidence, and clearly separate fact from hypothesis.",
+    "programador": "You are a senior software engineer. Write clean, correct, idiomatic code and explain trade-offs concisely.",
+    "advogado": "You are a careful legal analyst. Be precise, cite principles, and flag uncertainties and jurisdiction limits.",
+    "professor": "You are a patient teacher. Explain clearly with simple examples, then check understanding.",
+    "conciso": "You are concise. Answer directly in as few words as possible, with no preamble.",
+    "security": "You are a security researcher performing AUTHORIZED review. Analyze code for vulnerabilities and explain mitigations.",
+}
+
+
+def resolve_system(system: "str | None", profile: "str | None") -> "str | None":
+    if system:
+        return system
+    if profile:
+        return PROFILES.get(profile.lower(), profile)
+    return None
+
+
+def build_chat_prompt(system: "str | None", user: str) -> str:
+    """Template ChatML (SmolLM2/Qwen/…). Sem sistema, mantém completion cru."""
+    if not system:
+        return user
+    return (
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    )
+
+
+def cmd_profiles() -> int:
+    header("Perfis de Sistema", 'personas prontas — ou use --system "<texto livre>"')
+    for name, text in PROFILES.items():
+        short = text[:62] + ("…" if len(text) > 62 else "")
+        out("  " + _c(f"{name:<12}", "cyan", "bold") + _c(short, "dim"))
+    out()
+    out("Uso: " + _c('nodestor run "pergunta" --model X --profile cientista', "cyan"))
+    return 0
+
+
+def cmd_run(model: str, prompt: str, max_tokens: int, system=None, profile=None) -> int:
     header("Inferência Local", model)
     if not os.path.exists(model):
         out(_c(f"Modelo não encontrado: {model}", "red"))
@@ -227,6 +267,10 @@ def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
     if not _require_engine():
         return 1
     from . import NodeStorEngine
+    sys_prompt = resolve_system(system, profile)
+    if sys_prompt:
+        short = sys_prompt[:60] + ("…" if len(sys_prompt) > 60 else "")
+        out(_c("🧠 Sistema: ", "bold") + _c(short, "dim"))
     out(_c("⏳ Carregando motor…", "dim"))
     t0 = time.time()
     try:
@@ -239,7 +283,7 @@ def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
     out(_c("🤖 ", "orange") + "gerando…")
     t1 = time.time()
     try:
-        text = engine.generate(prompt, max_tokens)
+        text = engine.generate(build_chat_prompt(sys_prompt, prompt), max_tokens)
     except Exception as exc:
         out(_c(f"Erro na geração: {exc}", "red"))
         return 1
@@ -251,7 +295,7 @@ def cmd_run(model: str, prompt: str, max_tokens: int) -> int:
     return 0
 
 
-def cmd_chat(model: str, max_tokens: int) -> int:
+def cmd_chat(model: str, max_tokens: int, system=None, profile=None) -> int:
     header("Chat Interativo", "digite /sair para encerrar")
     if not os.path.exists(model):
         out(_c(f"Modelo não encontrado: {model}", "red"))
@@ -260,6 +304,10 @@ def cmd_chat(model: str, max_tokens: int) -> int:
     if not _require_engine():
         return 1
     from . import NodeStorEngine
+    sys_prompt = resolve_system(system, profile)
+    if sys_prompt:
+        short = sys_prompt[:60] + ("…" if len(sys_prompt) > 60 else "")
+        out(_c("🧠 Sistema: ", "bold") + _c(short, "dim"))
     out(_c("⏳ Carregando motor…", "dim"))
     try:
         engine = NodeStorEngine(model)
@@ -276,7 +324,7 @@ def cmd_chat(model: str, max_tokens: int) -> int:
         if msg.strip() in ("/sair", "/exit", "/quit"):
             break
         try:
-            reply = engine.generate(msg, max_tokens)
+            reply = engine.generate(build_chat_prompt(sys_prompt, msg), max_tokens)
         except Exception as exc:
             out(_c(f"Erro: {exc}", "red"))
             continue
@@ -528,6 +576,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("prompt", help="Texto do prompt")
     pr.add_argument("-m", "--model", required=True, help="Caminho do modelo (.gguf/.safetensors)")
     pr.add_argument("--max-tokens", type=int, default=128)
+    pr.add_argument("--system", help="Prompt de Sistema (a 'constituição' do modelo)")
+    pr.add_argument("--profile", help="Perfil pronto (cientista/programador/advogado/...)")
 
     pi = sub.add_parser("inspect", help="Mostra metadados de um arquivo de modelo")
     pi.add_argument("path", help="Caminho do modelo (.gguf/.safetensors)")
@@ -535,12 +585,15 @@ def build_parser() -> argparse.ArgumentParser:
     pc = sub.add_parser("chat", help="Conversa interativa com o modelo")
     pc.add_argument("-m", "--model", required=True)
     pc.add_argument("--max-tokens", type=int, default=256)
+    pc.add_argument("--system", help="Prompt de Sistema")
+    pc.add_argument("--profile", help="Perfil pronto")
 
     ps = sub.add_parser("serve", help="Sobe o servidor (API compatível)")
     ps.add_argument("-m", "--model", required=True)
     ps.add_argument("--port", type=int, default=8080)
 
     sub.add_parser("scan", help="Detecta hardware (GPU/VRAM/SSD)")
+    sub.add_parser("profiles", help="Lista os perfis de sistema (personas)")
     sub.add_parser("connect", help="Como ligar Claude Code/Cursor/etc.")
     sub.add_parser("help", help="Mostra os comandos e para que servem")
     sub.add_parser("version", help="Mostra a versão")
@@ -560,15 +613,17 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.command == "pull":
         return cmd_pull(args.repo, args.filename)
     if args.command == "run":
-        return cmd_run(args.model, args.prompt, args.max_tokens)
+        return cmd_run(args.model, args.prompt, args.max_tokens, args.system, args.profile)
     if args.command == "chat":
-        return cmd_chat(args.model, args.max_tokens)
+        return cmd_chat(args.model, args.max_tokens, args.system, args.profile)
     if args.command == "serve":
         return cmd_serve(args.model, args.port)
     if args.command == "inspect":
         return cmd_inspect(args.path)
     if args.command == "scan":
         return cmd_scan()
+    if args.command == "profiles":
+        return cmd_profiles()
     if args.command == "connect":
         return cmd_connect()
     if args.command == "version":
