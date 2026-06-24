@@ -1029,17 +1029,62 @@ async fn cmd_run(
 
         // Handler: DAVI Dream Engine (ativo com --dream)
         if dream {
-            registry.register_dream(|domains| {
-                // Integração com DreamingEngine (nodestor-davi) via instância em memória
-                // O CLI cria a engine localmente para não precisar de IPC
-                format!(
-                    "[DAVI Dream] Cruzando domínios: {}\n\
-                     Hipótese gerada: Existe uma correspondência estrutural entre os \
-                     sistemas mencionados que pode levar a propriedades emergentes \
-                     não presentes em nenhum dos domínios individualmente.\n\
-                     Confiança Nash: 0.78 | Temperatura DAVI: adaptativa",
-                    domains
-                )
+            use nodestor_davi::dreaming_engine::{DreamConfig, DreamingEngine};
+            use nodestor_davi::functors::Insight;
+            use std::sync::Mutex;
+            let dream_engine = Arc::new(Mutex::new(DreamingEngine::new(&DreamConfig {
+                max_duration_ms: 0,
+                max_hypotheses: 8,
+                initial_temperature: 5.0,
+                min_topological_persistence: 0.2,
+            })));
+            registry.register_dream(move |domains_str| {
+                let domains: Vec<&str> = domains_str.split(['+', ',', '\n'])
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if domains.is_empty() {
+                    return "[DAVI] Nenhum domínio especificado.".into();
+                }
+                let knowledge_embeddings: Vec<Vec<f32>> = domains.iter().enumerate()
+                    .flat_map(|(di, domain)| {
+                        (0..4usize).map(move |seed| {
+                            let mut hash: u64 = 14695981039346656037u64;
+                            for b in domain.as_bytes() {
+                                hash ^= *b as u64;
+                                hash = hash.wrapping_mul(1099511628211);
+                            }
+                            hash ^= (di as u64).wrapping_mul(seed as u64 + 1).wrapping_add(0xdeadbeef);
+                            (0..64).map(|i| {
+                                let h = hash.wrapping_mul(i as u64 + 1);
+                                ((h & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0
+                            }).collect()
+                        }).collect::<Vec<_>>()
+                    })
+                    .collect();
+                let domain_insights: Vec<Insight> = domains.iter().enumerate().map(|(i, domain)| {
+                    Insight {
+                        id: i as u64,
+                        domain: domain.to_string(),
+                        statement: format!("O domínio '{}' exibe propriedades emergentes não triviais.", domain),
+                        embedding: knowledge_embeddings.get(i * 4).cloned().unwrap_or_default(),
+                        relations: vec![],
+                    }
+                }).collect();
+                let discoveries = match dream_engine.lock() {
+                    Ok(mut eng) => eng.dream_cycle(&knowledge_embeddings, &domain_insights),
+                    Err(_) => return "[DAVI] Erro interno: engine bloqueada.".into(),
+                };
+                if discoveries.is_empty() {
+                    format!("[DAVI Dream] Domínios: {} — Nenhuma hipótese superou o Nash Tribunal neste ciclo. Aumente a temperatura ou tente domínios mais distantes.", domains_str)
+                } else {
+                    let hyps: String = discoveries.iter().enumerate()
+                        .map(|(i, d)| format!("[{}] {} (confiança: {:.0}%)", i + 1, d.statement, d.confidence * 100.0))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("[DAVI Dream] Domínios cruzados: {}\n{}\nNash Tribunal: {} hipótese(s) validada(s).",
+                        domains_str, hyps, discoveries.len())
+                }
             });
         } else {
             registry.register_dream(|domains| {
