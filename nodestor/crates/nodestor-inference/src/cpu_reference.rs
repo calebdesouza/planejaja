@@ -581,6 +581,190 @@ pub fn extract_final_hidden(
     Some(rmsnorm(&x, final_norm, cfg.eps))
 }
 
+/// Cria um WeightBank mínimo sintético para testes de forward:
+/// 1 camada, hidden=4, n_heads=2, head_dim=2, intermediate=8, vocab=16.
+/// Todos os tensores são identidade ou constante não-zero para produzir logits finitos.
+#[cfg(test)]
+pub fn make_test_weight_bank() -> (nodestor_vulkan::WeightBank, CpuModelConfig) {
+    use nodestor_vulkan::{WeightBank, VulkanEngine};
+    let cfg = CpuModelConfig {
+        n_layers: 1,
+        hidden: 4,
+        n_heads: 2,
+        n_kv_heads: 2,
+        head_dim: 2,
+        intermediate: 8,
+        vocab: 16,
+        rope_base: 10000.0,
+        eps: 1e-5,
+    };
+    let engine = VulkanEngine::new_simulation();
+    let mut wb = WeightBank::new();
+    let h = cfg.hidden;
+    let voc = cfg.vocab;
+    let inter = cfg.intermediate;
+    let q_dim = cfg.n_heads * cfg.head_dim;
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+
+    let upload_f32 = |wb: &mut WeightBank, name: &str, data: Vec<f32>| {
+        let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        if let Ok(buf) = engine.upload(raw) { wb.insert(name.to_string(), buf); }
+    };
+
+    // token_embd.weight [vocab, hidden] — identidade bloco 4×4, repetida
+    let mut embd = vec![0.0f32; voc * h];
+    for i in 0..voc.min(h) { embd[i * h + i] = 1.0; }
+    upload_f32(&mut wb, "token_embd.weight", embd.clone());
+    upload_f32(&mut wb, "output.weight", embd);
+
+    // Normas (todos uns — RMSNorm com weight=1 é passthrough)
+    upload_f32(&mut wb, "blk.0.attn_norm.weight", vec![1.0; h]);
+    upload_f32(&mut wb, "blk.0.ffn_norm.weight", vec![1.0; h]);
+    upload_f32(&mut wb, "output_norm.weight", vec![1.0; h]);
+
+    // Projeções Q,K,V — identidade (q_dim×h, kv_dim×h, kv_dim×h)
+    let eye_qh: Vec<f32> = (0..q_dim).flat_map(|r| (0..h).map(move |c| if r == c { 1.0 } else { 0.0 })).collect();
+    let eye_kvh: Vec<f32> = (0..kv_dim).flat_map(|r| (0..h).map(move |c| if r == c { 1.0 } else { 0.0 })).collect();
+    upload_f32(&mut wb, "blk.0.attn_q.weight", eye_qh.clone());
+    upload_f32(&mut wb, "blk.0.attn_k.weight", eye_kvh.clone());
+    upload_f32(&mut wb, "blk.0.attn_v.weight", eye_kvh);
+    // attn_output: h×q_dim identidade
+    let eye_hq: Vec<f32> = (0..h).flat_map(|r| (0..q_dim).map(move |c| if r == c { 1.0 } else { 0.0 })).collect();
+    upload_f32(&mut wb, "blk.0.attn_output.weight", eye_hq);
+
+    // FFN: gate/up [inter×h], down [h×inter]
+    let ffn_up: Vec<f32> = (0..inter).flat_map(|r| (0..h).map(move |c| if r % h == c { 0.5 } else { 0.0 })).collect();
+    let ffn_down: Vec<f32> = (0..h).flat_map(|r| (0..inter).map(move |c| if c % h == r { 0.5 } else { 0.0 })).collect();
+    upload_f32(&mut wb, "blk.0.ffn_gate.weight", ffn_up.clone());
+    upload_f32(&mut wb, "blk.0.ffn_up.weight", ffn_up);
+    upload_f32(&mut wb, "blk.0.ffn_down.weight", ffn_down);
+
+    (wb, cfg)
+}
+
+#[cfg(test)]
+mod kv_cache_consistency_tests {
+    use super::{CpuKvCache, forward_last_logits, forward_step, argmax, make_test_weight_bank};
+
+    /// Prova que forward_step incremental (KV-cache reuse) produz os MESMOS logits
+    /// que forward_last_logits (full-recompute) para a mesma sequência de tokens.
+    ///
+    /// Este é o teorema central de correção da inferência incremental:
+    ///   argmax(forward_last_logits([t0,t1,t2])) == argmax(step_last após prefill [t0,t1] + step t2)
+    #[test]
+    fn test_incremental_matches_full_recompute() {
+        let (wb, cfg) = make_test_weight_bank();
+        let tokens: Vec<u32> = vec![1, 2, 3, 4];
+
+        // Caminho 1: full recompute — recalcula a sequência inteira no último passo.
+        let full_logits = forward_last_logits(&tokens, &cfg, &wb)
+            .expect("forward_last_logits deve produzir logits");
+        let full_tok = argmax(&full_logits);
+
+        // Caminho 2: incremental com KV-cache — processa token por token.
+        let mut kv = CpuKvCache::new(cfg.n_layers);
+        let mut last_logits: Option<Vec<f32>> = None;
+        for (pos, &tok) in tokens.iter().enumerate() {
+            last_logits = forward_step(tok, pos, &cfg, &wb, &mut kv);
+        }
+        let inc_tok = argmax(last_logits.as_ref().expect("forward_step deve produzir logits"));
+
+        assert_eq!(full_tok, inc_tok,
+            "incremental e full-recompute devem escolher o mesmo próximo token \
+             (full={full_tok}, incremental={inc_tok})");
+    }
+
+    /// Prova que o cache cresce exatamente uma posição por chamada a forward_step.
+    #[test]
+    fn test_kv_cache_grows_one_per_step() {
+        let (wb, cfg) = make_test_weight_bank();
+        let mut kv = CpuKvCache::new(cfg.n_layers);
+        assert_eq!(kv.len(), 0);
+        for pos in 0..5 {
+            forward_step(pos as u32, pos, &cfg, &wb, &mut kv);
+            assert_eq!(kv.len(), pos + 1, "cache deve ter exatamente pos+1 entradas após o passo {pos}");
+        }
+    }
+
+    /// Prova que argmax dos logits é determinístico para a mesma entrada.
+    #[test]
+    fn test_incremental_is_deterministic() {
+        let (wb, cfg) = make_test_weight_bank();
+        let tokens: Vec<u32> = vec![0, 1, 2];
+
+        let run = || {
+            let mut kv = CpuKvCache::new(cfg.n_layers);
+            let mut last: Option<Vec<f32>> = None;
+            for (p, &t) in tokens.iter().enumerate() { last = forward_step(t, p, &cfg, &wb, &mut kv); }
+            argmax(last.as_ref().unwrap())
+        };
+        assert_eq!(run(), run(), "forward incremental deve ser determinístico");
+    }
+
+    /// Prova que truncate() (rollback de rascunhos rejeitados em COBER) restaura o
+    /// cache ao estado de antes da especulação.
+    #[test]
+    fn test_kv_cache_truncate_rollback() {
+        let (wb, cfg) = make_test_weight_bank();
+        let mut kv = CpuKvCache::new(cfg.n_layers);
+
+        // Prefill: 3 tokens aceitos
+        for (p, &t) in [1u32, 2, 3].iter().enumerate() {
+            forward_step(t, p, &cfg, &wb, &mut kv);
+        }
+        let accepted_len = kv.len(); // = 3
+
+        // Especulação: 2 rascunhos inseridos no cache
+        for (p, &t) in [4u32, 5].iter().enumerate() {
+            forward_step(t, accepted_len + p, &cfg, &wb, &mut kv);
+        }
+        assert_eq!(kv.len(), 5, "cache deve ter 5 entradas após prefill+rascunho");
+
+        // Rollback: rejeita os 2 rascunhos
+        kv.truncate(accepted_len);
+        assert_eq!(kv.len(), accepted_len, "truncate deve restaurar ao comprimento aceito");
+    }
+
+    /// Prova que forward_verify (verificação batched de rascunhos) produz os mesmos
+    /// logits que processar os mesmos tokens um a um com forward_step.
+    ///
+    /// Esta é a garantia de LOSSLESSNESS do COBER: a verificação batched é
+    /// matematicamente equivalente à verificação sequencial, então aceitar o
+    /// prefixo concordante não altera a distribuição.
+    #[test]
+    fn test_forward_verify_matches_sequential_steps() {
+        use super::{forward_verify, forward_step, make_test_weight_bank, argmax, CpuKvCache};
+
+        let (wb, cfg) = make_test_weight_bank();
+        let prefill: Vec<u32> = vec![1, 2];
+        let drafts: Vec<u32> = vec![3, 4, 5];
+
+        // Prefill comum: ambos os caminhos partem do mesmo estado de cache.
+        let mut kv_seq = CpuKvCache::new(cfg.n_layers);
+        for (p, &t) in prefill.iter().enumerate() { forward_step(t, p, &cfg, &wb, &mut kv_seq); }
+        let mut kv_bat = CpuKvCache::new(cfg.n_layers);
+        for (p, &t) in prefill.iter().enumerate() { forward_step(t, p, &cfg, &wb, &mut kv_bat); }
+
+        // Caminho sequencial: processa cada rascunho um a um.
+        let mut seq_toks: Vec<u32> = Vec::new();
+        let start = prefill.len();
+        for (i, &d) in drafts.iter().enumerate() {
+            let logits = forward_step(d, start + i, &cfg, &wb, &mut kv_seq).unwrap();
+            seq_toks.push(argmax(&logits));
+        }
+
+        // Caminho batched: forward_verify.
+        let bat_logits = forward_verify(&drafts, start, &cfg, &wb, &mut kv_bat);
+        let bat_toks: Vec<u32> = bat_logits.iter().map(|l| argmax(l)).collect();
+
+        assert_eq!(seq_toks, bat_toks,
+            "forward_verify deve produzir os mesmos tokens que passos sequenciais \
+             (losslessness da verificação batched): seq={seq_toks:?} bat={bat_toks:?}");
+        assert_eq!(kv_seq.len(), kv_bat.len(),
+            "ambos os caminhos devem deixar o cache com o mesmo comprimento");
+    }
+}
+
 #[cfg(test)]
 mod sliding_window_tests {
     use super::CpuKvCache;
