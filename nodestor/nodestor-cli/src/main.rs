@@ -1092,15 +1092,56 @@ async fn cmd_run(
             });
         }
 
-        // Handler: hipótese (validação Nash simulada)
+        // Handler: hipótese — validação via NashTribunal real (nodestor-davi)
         registry.register("call_hypothesis", move |hyp| {
+            use nodestor_davi::nash_tribunal::{DreamHypothesis, Evidence, NashTribunal};
+
+            // Confidence prior: FNV-1a da hipótese → [0.3, 0.9]
+            let mut hash: u64 = 14695981039346656037u64;
+            for b in hyp.as_bytes() { hash ^= *b as u64; hash = hash.wrapping_mul(1099511628211); }
+            let prior = 0.3 + (hash & 0xFFFF) as f32 / 65535.0 * 0.6;
+
+            let hypothesis = DreamHypothesis {
+                id: hash & 0xFFFFFFFF,
+                statement: hyp.chars().take(200).collect(),
+                embedding: (0..64).map(|i| {
+                    let h = hash.wrapping_mul(i as u64 + 1);
+                    ((h & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0
+                }).collect(),
+                domain: "cross-domain".into(),
+                confidence_prior: prior,
+            };
+
+            // Evidências sintéticas derivadas do prior (sem retrieval externo no loop)
+            let evidence = vec![
+                Evidence {
+                    source: "Base de Conhecimento Vetorial".into(),
+                    content: format!("Contexto semântico para: {}", hyp.chars().take(80).collect::<String>()),
+                    relevance_score: prior,
+                    supports_hypothesis: prior > 0.5,
+                },
+                Evidence {
+                    source: "Contraexemplo Estrutural".into(),
+                    content: "Domínios distintos podem não preservar morfismos".into(),
+                    relevance_score: 1.0 - prior,
+                    supports_hypothesis: false,
+                },
+            ];
+
+            let tribunal = NashTribunal::new(5);
+            let verdict = tribunal.verify_hypothesis(&hypothesis, &evidence, None);
+            let status = if verdict.accepted { "ACEITO" } else { "REJEITADO" };
             format!(
                 "[Nash Tribunal] Hipótese: \"{}\"\n\
-                 Agente Proponente: SUPORTA (confiança: 0.82)\n\
-                 Agente Cético: QUESTIONA — evidências adicionais necessárias\n\
-                 Agente Síntese: ACEITA com ressalvas\n\
-                 Veredicto: ACEITO | Confiança: 0.71",
-                hyp.chars().take(200).collect::<String>()
+                 Rounds de debate: {} | ELK honesty: N/A\n\
+                 Evidências a favor: {} | Contra: {}\n\
+                 Veredicto: {} | Confiança: {:.0}%",
+                hyp.chars().take(150).collect::<String>(),
+                verdict.debate_log.len(),
+                verdict.supporting_evidence,
+                verdict.opposing_evidence,
+                status,
+                verdict.confidence * 100.0
             )
         });
 
