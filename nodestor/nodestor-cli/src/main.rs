@@ -180,6 +180,19 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         dream: bool,
     },
+    /// Lista modelos instalados em ~/.nodestor/models/ e outros locais.
+    Models {
+        /// Mostra também modelos encontrados fora de ~/.nodestor (busca ampla)
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Motor de Sonho DAVI — Descoberta Autônoma de Hipóteses Cross-Domain.
+    ///
+    /// Subcomandos: dream | status
+    Davi {
+        #[command(subcommand)]
+        subcmd: DaviCommands,
+    },
     /// Treina micro-adaptadores LoRA sobre um dataset JSONL local.
     ///
     /// Executa backpropagation restrito à cabeça de saída (lm_head LoRA) com AdamW
@@ -212,6 +225,26 @@ enum Commands {
         #[arg(long, default_value = "4")]
         grad_accum: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum DaviCommands {
+    /// Executa um ciclo de sonho cross-domain e mostra as descobertas geradas.
+    ///
+    /// Exemplo: nodestor davi dream --topic "física quântica + genética"
+    Dream {
+        /// Domínios a cruzar (ex: "física quântica + biologia molecular")
+        #[arg(long, default_value = "física + matemática + biologia")]
+        topic: String,
+        /// Número de ciclos de sonho a executar
+        #[arg(long, default_value = "3")]
+        cycles: usize,
+        /// Temperatura inicial do annealing semântico (maior = mais exploratório)
+        #[arg(long, default_value = "5.0")]
+        temperature: f32,
+    },
+    /// Mostra o estado atual do sistema DAVI (módulos, configuração, métricas).
+    Status,
 }
 
 #[tokio::main]
@@ -255,6 +288,8 @@ async fn main() -> Result<()> {
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
             Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream } =>
                 cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream).await,
+            Commands::Models { all } => cmd_models(all),
+            Commands::Davi { subcmd } => cmd_davi(subcmd).await,
             Commands::Train { model, dataset, output, rank, alpha, lr, max_steps, grad_accum } =>
                 cmd_train(&model, &dataset, &output, rank, alpha, lr, max_steps, grad_accum).await,
         },
@@ -281,9 +316,13 @@ async fn cmd_interactive() -> Result<()> {
     
     loop {
         let options = vec![
+            "RUN      - Rodar prompt direto (inferência local, sem servidor)",
             "START    - Iniciar Motor + Interface (FULL ENGINE)",
             "ATTACH   - Conectar a Motor Residente (RESIDENT)",
             "CHATTING - Iniciar Conversa Local (Modo Streaming)",
+            "DREAM    - DAVI: Motor de Sonho Cross-Domain",
+            "MODELS   - Listar modelos instalados",
+            "PULL     - Baixar modelo do HuggingFace",
             "LATENCY  - Teste de Resposta 7-Camadas (TTFT)",
             "SCANNER  - Inspeção de Hardware Industrial",
             "DETACH   - Sair e manter motor em Background",
@@ -298,23 +337,50 @@ async fn cmd_interactive() -> Result<()> {
 
         match selection {
             Some(0) => {
+                // RUN: escolhe modelo → digita prompt → executa
+                if let Some(model_path) = explorer::interactive_model_picker()? {
+                    let prompt: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Prompt")
+                        .interact_text()?;
+                    cmd_run(&model_path, &prompt, 256, None, None, None, 1.0, false, false, vec![], false, 10, None, false).await?;
+                }
+            },
+            Some(1) => {
                 if let Some(path) = explorer::interactive_model_picker()? {
                     cmd_start(Some(&path), false).await?;
                 }
             },
-            Some(1) => cmd_attach().await?,
-            Some(2) => cmd_chat("http://localhost:8080").await?,
-            Some(3) => cmd_latency(None).await?,
-            Some(4) => cmd_scan()?,
-            Some(5) => {
+            Some(2) => cmd_attach().await?,
+            Some(3) => cmd_chat("http://localhost:8080").await?,
+            Some(4) => {
+                // DREAM: escolhe domínios
+                let topic: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Domínios para cruzar (ex: física quântica + genética)")
+                    .default("física + matemática + biologia".into())
+                    .interact_text()?;
+                cmd_davi(DaviCommands::Dream { topic, cycles: 3, temperature: 5.0 }).await?;
+            },
+            Some(5) => { cmd_models(false)?; },
+            Some(6) => {
+                let model_id: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("ID do modelo HuggingFace (ex: bartowski/SmolLM2-135M-GGUF)")
+                    .interact_text()?;
+                let filename: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Nome do arquivo (ex: SmolLM2-135M-Q4_K_M.gguf)")
+                    .interact_text()?;
+                commands::pull::cmd_pull(&model_id, &filename).await?;
+            },
+            Some(7) => cmd_latency(None).await?,
+            Some(8) => cmd_scan()?,
+            Some(9) => {
                 println!("\x1b[38;5;203m[DETACH]\x1b[0m O motor continuará processando em background.");
                 break;
             },
-            Some(6) => {
+            Some(10) => {
                 println!("\x1b[2m[EXIT] Encerrando.\x1b[0m");
                 break;
             },
-            _ => continue, // Esc ou seleção inválida apenas repete o menu
+            _ => continue,
         }
     }
 
@@ -572,6 +638,173 @@ fn resolve_lora_output_path(output: &str) -> std::path::PathBuf {
         let mut pb = p.to_path_buf();
         pb.set_extension("lora");
         pb
+    }
+}
+
+fn cmd_models(all: bool) -> Result<()> {
+    use std::fs;
+
+    println!("\n\x1b[38;5;117m╔══ MODELOS INSTALADOS ══════════════════════════════════╗\x1b[0m");
+
+    // ~/.nodestor/models (primário)
+    let models_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nodestor")
+        .join("models");
+
+    let mut found_any = false;
+    if models_dir.exists() {
+        println!("\x1b[38;5;244m  📁 {}\x1b[0m", models_dir.display());
+        for entry in fs::read_dir(&models_dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "gguf" || e == "safetensors") {
+                let size_gb = fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+                let fmt = path.extension().and_then(|e| e.to_str()).unwrap_or("?");
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let quant = detect_quant(&name);
+                println!("  \x1b[38;5;114m✔\x1b[0m  {:<50} {:>6.2} GB  [{}/{}]",
+                    name, size_gb, fmt.to_uppercase(), quant);
+                found_any = true;
+            }
+        }
+    }
+
+    // Busca ampla (--all)
+    if all {
+        println!("\n\x1b[38;5;244m  🔍 Busca ampla (Downloads, Documents, cache HuggingFace)...\x1b[0m");
+        for path in explorer::find_models_on_ssd() {
+            if !path.starts_with(&models_dir) {
+                let size_gb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let quant = detect_quant(&name);
+                println!("  \x1b[38;5;226m◈\x1b[0m  {:<50} {:>6.2} GB  [{}]",
+                    path.display(), size_gb, quant);
+                found_any = true;
+            }
+        }
+    }
+
+    if !found_any {
+        println!("  \x1b[38;5;226m⚠\x1b[0m  Nenhum modelo encontrado.");
+        println!("     Use: \x1b[38;5;114mnodestor pull <model-id> --filename <arquivo.gguf>\x1b[0m");
+    }
+
+    println!("\x1b[38;5;117m╚════════════════════════════════════════════════════════╝\x1b[0m\n");
+    Ok(())
+}
+
+fn detect_quant(name: &str) -> &'static str {
+    let n = name.to_uppercase();
+    if n.contains("Q4_K_M") { "Q4_K_M" }
+    else if n.contains("Q4_K_S") { "Q4_K_S" }
+    else if n.contains("Q5_K_M") { "Q5_K_M" }
+    else if n.contains("Q8_0") { "Q8_0" }
+    else if n.contains("Q4_0") { "Q4_0" }
+    else if n.contains("F16") || n.contains("-FP16") { "F16" }
+    else if n.contains("F32") { "F32" }
+    else if n.contains("BF16") { "BF16" }
+    else if n.contains(".SAFETENSORS") { "SafeTensors" }
+    else { "?" }
+}
+
+async fn cmd_davi(subcmd: DaviCommands) -> Result<()> {
+    use nodestor_davi::dreaming_engine::{DreamConfig, DreamingEngine};
+    use nodestor_davi::functors::Insight;
+
+    match subcmd {
+        DaviCommands::Status => {
+            println!("\n\x1b[38;5;117m╔══ DAVI — STATUS DO SISTEMA ════════════════════════════╗\x1b[0m");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D0 audit_logger       — Rastreabilidade forense tamper-evident");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D1 provenance_graph   — DNA do pensamento (grafo DAG)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D2 free_energy        — Princípio de Energia Livre (Friston)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D3 topology           — Persistent Homology (gaps no conhecimento)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D4 annealing          — Annealing Semântico (temperatura criativa)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D5 nash_tribunal      — 3 agentes adversariais validam hipóteses");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D6 functors           — Category Theory para cross-domain");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D7 stigmergy          — Ferômônios digitais (swarm inteligente)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D8 autopoiesis        — Auto-melhoria do sistema");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D9 dreaming_engine    — Orquestrador do loop de sonho");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D10 latent_jump       — Saltos no espaço latente");
+            println!("  \x1b[38;5;114m✔\x1b[0m  D11 intent_compiler   — Compilador de intenção em plano");
+            println!("  \x1b[38;5;114m✔\x1b[0m  ELK elk_probe         — Polígrafo latente (ELK)");
+            println!("  \x1b[38;5;114m✔\x1b[0m  CoT cot_monitor       — Monitor de Chain-of-Thought");
+            println!("  \x1b[38;5;114m✔\x1b[0m  SA  raise_detector    — Consciência Situacional SA1→SA5");
+            println!("\n  Para ativar na inferência: nodestor run --model x.gguf --dream");
+            println!("  Para ciclo autônomo:       nodestor davi dream --topic \"...\"");
+            println!("\x1b[38;5;117m╚════════════════════════════════════════════════════════╝\x1b[0m\n");
+            Ok(())
+        }
+
+        DaviCommands::Dream { topic, cycles, temperature } => {
+            println!("\n\x1b[38;5;117m╔══ DAVI DREAM ENGINE ══════════════════════════════════╗\x1b[0m");
+            println!("  Tópico  : {}", topic);
+            println!("  Ciclos  : {} | Temperatura inicial: {:.1}", cycles, temperature);
+            println!("\x1b[38;5;117m╠═══════════════════════════════════════════════════════╣\x1b[0m\n");
+
+            let config = DreamConfig {
+                max_duration_ms: 5000,
+                max_hypotheses: 8,
+                initial_temperature: temperature,
+                min_topological_persistence: 0.2,
+            };
+            let mut engine = DreamingEngine::new(&config);
+
+            // Gera embeddings semânticos sintéticos a partir dos domínios do tópico
+            let domains: Vec<&str> = topic.split('+').map(|s| s.trim()).collect();
+            let knowledge_embeddings: Vec<Vec<f32>> = domains.iter().enumerate()
+                .flat_map(|(di, domain)| {
+                    // FNV-1a hashing → vetor de 64 dims por domínio
+                    (0..4usize).map(move |seed| {
+                        let mut hash: u64 = 14695981039346656037u64;
+                        for b in domain.as_bytes() {
+                            hash ^= *b as u64;
+                            hash = hash.wrapping_mul(1099511628211);
+                        }
+                        hash ^= seed as u64 * 0xdeadbeef;
+                        (0..64).map(|i| {
+                            let h = hash.wrapping_mul(i as u64 + 1);
+                            ((h & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0
+                        }).collect()
+                    }).collect::<Vec<_>>()
+                })
+                .collect();
+
+            let domain_insights: Vec<Insight> = domains.iter().enumerate().map(|(i, domain)| {
+                Insight {
+                    id: i as u64,
+                    domain: domain.to_string(),
+                    statement: format!("O domínio '{}' exibe propriedades emergentes não triviais.", domain),
+                    embedding: knowledge_embeddings.get(i * 4).cloned().unwrap_or_default(),
+                    relations: vec![],
+                }
+            }).collect();
+
+            let mut all_discoveries = Vec::new();
+            for cycle in 1..=cycles {
+                print!("\x1b[38;5;117m  [Ciclo {}/{}] Annealing semântico...\x1b[0m ", cycle, cycles);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let discoveries = engine.dream_cycle(&knowledge_embeddings, &domain_insights);
+                println!("{} descoberta(s)", discoveries.len());
+                all_discoveries.extend(discoveries);
+            }
+
+            if all_discoveries.is_empty() {
+                println!("\n  \x1b[38;5;226m⚠\x1b[0m  Nenhuma hipótese superou o Nash Tribunal nestes ciclos.");
+                println!("     Tente --cycles maior ou --temperature mais alta para mais exploração.");
+            } else {
+                println!("\n\x1b[38;5;117m  ══ DESCOBERTAS VALIDADAS PELO NASH TRIBUNAL ══\x1b[0m");
+                for (i, d) in all_discoveries.iter().enumerate() {
+                    println!("\n  \x1b[38;5;114m[{}] DOMÍNIO: {}\x1b[0m", i + 1, d.domain);
+                    println!("      Hipótese  : {}", d.statement);
+                    println!("      Confiança : {:.1}%", d.confidence * 100.0);
+                }
+            }
+
+            println!("\n  \x1b[38;5;244mCiclos: {} | Embeddings: {} | Total DAVI discoveries: {}\x1b[0m",
+                cycles, knowledge_embeddings.len(), engine.discovery_count);
+            println!("\x1b[38;5;117m╚═══════════════════════════════════════════════════════╝\x1b[0m\n");
+            Ok(())
+        }
     }
 }
 

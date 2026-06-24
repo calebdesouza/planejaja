@@ -43,4 +43,5 @@ nodestor-streaming = { path = "../crates/nodestor-streaming" }
 walkdir = "2"
 zstd = { workspace = true }
 nodestor-gdeflate = { version = "0.1.0", path = "../crates/nodestor-gdeflate" }
+nodestor-davi = { path = "../crates/nodestor-davi" }
 indicatif = "0.18.4"
