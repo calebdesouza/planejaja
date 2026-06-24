@@ -123,7 +123,7 @@ mod tests {
         let mut pipeline = InferencePipeline::init(config).expect("Falha ao inicializar 7 camadas");
         
         // EXEC: Geração de Tokens com RAG e Streaming (Camada 2, 4, 5, 6)
-        let (output, stats) = pipeline.generate("Olá NodeStor!", 5, None).await
+        let (output, stats) = pipeline.generate("Olá NodeStor!", 5, None, 0.7).await
             .expect("Falha na geração via 7 camadas");
 
         // PROOF: Verificação de métricas e vitalidade

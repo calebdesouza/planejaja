@@ -270,7 +270,7 @@ async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InferenceRequest>,
 ) -> Json<Value> {
-    match state.pipeline.generate(&req.prompt, req.max_tokens, None).await {
+    match state.pipeline.generate(&req.prompt, req.max_tokens, None, 0.7).await {
         Ok((text, stats)) => Json(json!({
             "text": text,
             "generated_tokens": stats.generated_tokens,
@@ -285,7 +285,7 @@ async fn stream_handler(
     State(state): State<Arc<AppState>>,
     Query(req): Query<InferenceRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = state.pipeline.clone().generate_stream(req.prompt, req.max_tokens).await;
+    let stream = state.pipeline.clone().generate_stream(req.prompt, req.max_tokens, 0.7).await;
 
     let sse_stream = stream.map(|res| {
         match res {
@@ -306,7 +306,7 @@ async fn openai_chat_completions(
     let max_tokens = req.max_tokens.unwrap_or(256);
 
     if req.stream {
-        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), max_tokens).await;
+        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), max_tokens, 0.7).await;
         let id = format!("ns-{}", Uuid::new_v4());
         let model = req.model.clone();
 
@@ -332,7 +332,7 @@ async fn openai_chat_completions(
 
         Sse::new(sse_stream).into_response()
     } else {
-        match state.pipeline.generate(prompt, max_tokens, None).await {
+        match state.pipeline.generate(prompt, max_tokens, None, 0.7).await {
             Ok((text, _)) => Json(OpenAiResponse {
                 id: format!("ns-{}", Uuid::new_v4()),
                 object: "chat.completion".into(),
@@ -358,7 +358,7 @@ async fn anthropic_messages(
     let id = format!("ant-{}", Uuid::new_v4());
 
     if req.stream {
-        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), req.max_tokens).await;
+        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), req.max_tokens, 0.7).await;
         
         let id_base = id.clone();
         let model_base = req.model.clone();
@@ -418,7 +418,7 @@ async fn anthropic_messages(
 
         Sse::new(sse_stream).into_response()
     } else {
-        match state.pipeline.generate(prompt, req.max_tokens, None).await {
+        match state.pipeline.generate(prompt, req.max_tokens, None, 0.7).await {
             Ok((text, stats)) => Json(AnthropicResponse {
                 id,
                 msg_type: "message".into(),
@@ -445,7 +445,7 @@ async fn ollama_chat(
     let model = req.model.clone();
 
     if req.stream {
-        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), 256).await;
+        let stream = state.pipeline.clone().generate_stream(prompt.to_string(), 256, 0.7).await;
         
         // Ollama usa JSON por linha (não SSE, mas faremos compatível)
         let json_stream = stream.map(move |res| {
@@ -468,7 +468,7 @@ async fn ollama_chat(
             .body(axum::body::Body::from_stream(json_stream))
             .unwrap()
     } else {
-        match state.pipeline.generate(prompt, 256, None).await {
+        match state.pipeline.generate(prompt, 256, None, 0.7).await {
             Ok((text, _)) => Json(OllamaResponse {
                 model,
                 created_at: "2024-03-23T00:00:00Z".into(),

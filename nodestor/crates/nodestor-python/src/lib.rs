@@ -44,7 +44,7 @@ impl NodeStorEngine {
     fn generate(&self, prompt: String, max_tokens: usize) -> PyResult<String> {
         let pipeline = self.inner.clone();
         let (text, _stats) = self.rt.block_on(async move {
-            pipeline.generate(&prompt, max_tokens, None).await
+            pipeline.generate(&prompt, max_tokens, None, 0.7).await
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         
         Ok(text)

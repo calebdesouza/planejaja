@@ -1176,7 +1176,7 @@ async fn cmd_run(
             // Gera tokens do passo atual
             let mut step_text = String::new();
             let mut step_tokens = 0usize;
-            let mut stream = pipeline.clone().generate_stream(current_prompt.clone(), max_tokens).await;
+            let mut stream = pipeline.clone().generate_stream(current_prompt.clone(), max_tokens, agent.current_temperature()).await;
 
             print!("{}", CLR_RESET);
             let mut ttft_done = false;
@@ -1235,7 +1235,7 @@ async fn cmd_run(
 
     // ── MODO PADRÃO: Stream token-a-token ────────────────────────────────────
     let gen_start = Instant::now();
-    let mut stream = pipeline.clone().generate_stream(effective_prompt, max_tokens).await;
+    let mut stream = pipeline.clone().generate_stream(effective_prompt, max_tokens, 0.7).await;
 
     print!("\n🤖 ");
     std::io::stdout().flush().ok();

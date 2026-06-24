@@ -1308,7 +1308,7 @@ fn fase7_05_full_pipeline_init_and_generate() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let prompt = "Hello NodeStor! Tell me about Vulkan compute.";
     let (_output, stats) = rt.block_on(async {
-        pipeline.generate(prompt, 5).await
+        pipeline.generate(prompt, 5, None, 0.7).await
     }).expect("Geração deve funcionar");
 
     println!("\n  ✓ Geração concluída:");

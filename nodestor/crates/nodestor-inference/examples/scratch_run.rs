@@ -21,7 +21,7 @@ async fn main() {
     let mut pipeline = InferencePipeline::init(config).expect("Failed to init pipeline");
     
     println!("Model initialized! Starting generation...");
-    match pipeline.generate("O universo é", 10).await {
+    match pipeline.generate("O universo é", 10, None, 0.7).await {
         Ok((out, stats)) => {
             println!("Output: {}", out);
             println!("Tokens: {}", stats.generated_tokens);

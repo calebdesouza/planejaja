@@ -209,11 +209,16 @@ impl InferencePipeline {
 
     /// Loop principal de "Mecanismo de Atenção": prevê tensores e dispara
     /// kernels Vulkan para gerar tokens a alta voltagem (Modo Metralhadora).
+    ///
+    /// `temperature`: controla a aleatoriedade da amostragem (0.0 = greedy,
+    /// 1.0 = padrão, >1.0 = mais exploração). O Agent Loop passa valores
+    /// dinâmicos aqui após detectar estagnação.
     pub async fn generate(
         &self,
         prompt: &str,
         max_tokens: usize,
         tx: Option<tokio::sync::mpsc::Sender<Result<String, NodeStorError>>>,
+        temperature: f32,
     ) -> Result<(String, GenerationStats), NodeStorError> {
         let start_time = Instant::now();
         
@@ -431,7 +436,7 @@ impl InferencePipeline {
         let steering_intensity: f32 = self.steering.as_ref().map_or(1.0, |s| s.intensity);
 
         let mut sampler = crate::sampler::Sampler::new(crate::sampler::SamplerConfig {
-            temperature: 0.7,
+            temperature: temperature.max(0.0),
             top_k: 40,
             top_p: 0.9,
             repetition_penalty: 1.1,
@@ -964,12 +969,13 @@ impl InferencePipeline {
         self: Arc<Self>,
         prompt: String,
         max_tokens: usize,
+        temperature: f32,
     ) -> Pin<Box<dyn Stream<Item = Result<String, NodeStorError>> + Send>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let this = self.clone();
 
         tokio::spawn(async move {
-            match this.generate(&prompt, max_tokens, Some(tx.clone())).await {
+            match this.generate(&prompt, max_tokens, Some(tx.clone()), temperature).await {
                 Ok((_text, stats)) => {
                     // Os fragmentos são enviados pela generate() agora.
                     tracing::debug!(

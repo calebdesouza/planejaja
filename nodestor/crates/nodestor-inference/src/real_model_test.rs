@@ -22,7 +22,7 @@ mod tests {
 
         println!("Gerando tokens com modelo real...");
         let prompt = "A inteligência artificial é";
-        let (text, stats) = pipeline.generate(prompt, 10).await.expect("Falha na geração");
+        let (text, stats) = pipeline.generate(prompt, 10, None, 0.7).await.expect("Falha na geração");
         
         println!("--- RESULTADO DA GERAÇÃO ---");
         println!("Prompt: {}", prompt);

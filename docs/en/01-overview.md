@@ -207,19 +207,20 @@ The result: the model never loses access to previous context. When it needs info
 | Component | Status |
 |-----------|--------|
 | Crates in workspace | 14 |
-| Tests passing | 296 |
+| Tests passing | 528+ |
 | Real model tested | SmolLM2-135M (F16, 270MB) |
 | Coherent output | Yes (`" Paris"` for "The capital of France is") |
 | TTFT (CPU) | ~930ms |
 | Throughput (CPU) | ~5 tok/s |
 | Infinite context | Empirically proven |
-| Deep Research Engine | Complete (agent_loop + tool_registry) |
-| DAVI Dream | 12 modules, complete dream cycle functional |
-| CLI | 17 commands, interactive menu |
+| KV-cache reuse | Proven correct (5 tests: incremental == full-recompute) |
+| Deep Research Engine | Complete — all tool handlers use real DAVI modules |
+| DAVI Dream | 12 modules, dream cycle functional; `--dream` wired to DreamingEngine |
+| Nash Tribunal | Real adversarial validation in `call_hypothesis` handler |
+| CLI | 17 commands, interactive menu, dynamic temperature in agent loop |
 
 **What's still in development**:
 - Vulkan GPU compute shaders for real GPU inference (currently uses CPU fallback)
-- KV-cache reuse (currently rebuilds the full sequence at each step)
-- Target speed: thousands of tok/s with GPU + COBER
+- Target speed: thousands of tok/s with GPU + COBER speculation
 
-The mathematical foundation is correct. The sequence: **correctness ✓ → KV reuse → GPU → speculation**.
+The mathematical foundation is correct. The sequence: **correctness ✓ → KV reuse ✓ → GPU → speculation**.

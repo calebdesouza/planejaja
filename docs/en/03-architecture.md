@@ -260,17 +260,20 @@ fn adapt_temperature(&mut self, stagnated: bool) {
 
 ```
 loop i in 0..max_loops:
-  1. Call pipeline.generate_stream(context, max_tokens)
+  1. Call pipeline.generate_stream(context, max_tokens, agent.current_temperature())
+     └─ temperature is dynamically set — bumped on stagnation, cooled on progress
   2. Accumulate tokens → step_text
-  3. Check stagnation on all_tokens
-  4. Adapt temperature
-  5. ToolRegistry::scan_for_call(step_text)
+  3. detect_stagnation(all_tokens) || detect_stagnation_ngram(all_tokens)
+  4. adapt_temperature(stagnated) → new temperature used on NEXT call
+  5. ToolRegistry::try_invoke_from_text(step_text)
      ├── None: TerminationReason::DirectAnswer → return
-     └── Some(tag, query):
-           invoke(tag, query) → ToolResult
+     └── Some(ToolResult { tag, query, response }):
+           call_vector_db  → real pipeline.vector_db.search_text()
+           call_dream      → real DreamingEngine::dream_cycle()
+           call_hypothesis → real NashTribunal::verify_hypothesis()
            context += step_text + tool_result.to_context_block()
            continue loop
-6. If loop_i == max_loops: TerminationReason::MaxLoopsReached
+6. If i == max_loops: TerminationReason::MaxLoopsReached
 ```
 
 ---

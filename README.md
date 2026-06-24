@@ -89,11 +89,11 @@ When the KV window fills, evicted tokens are decoded to text and indexed in the 
 |-|-|
 | Language | Rust (edition 2021, MSRV 1.75) |
 | Crates | 14 |
-| Test suite | 296 passing, 0 failing |
+| Test suite | 528+ passing, 0 failing |
 | Real model | SmolLM2-135M F16 — coherent output, measured TTFT ~930ms |
 | CLI commands | 17 (run, models, davi, pull, train, calibrate, inspect, scan, ...) |
 | GPU | Vulkan (primary path, compute shaders in progress) |
-| CPU | Correct Llama forward with interleaved RoPE (simulation/compatibility path) |
+| CPU | Correct Llama forward with interleaved RoPE + incremental KV-cache reuse |
 
 ---
 

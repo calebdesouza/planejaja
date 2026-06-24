@@ -18,7 +18,7 @@ async fn test_real_qwen_model() {
 
     let prompt = "A inteligência artificial é";
     let start_gen = Instant::now();
-    let (text, stats) = pipeline.generate(prompt, 20, None).await.expect("Falha na geração");
+    let (text, stats) = pipeline.generate(prompt, 20, None, 0.7).await.expect("Falha na geração");
 
     println!("Output: {}", text);
     println!("TPS: {:.2}", stats.tokens_per_second);

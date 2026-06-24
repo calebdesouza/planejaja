@@ -207,19 +207,20 @@ O resultado: o modelo nunca perde acesso ao contexto anterior. Quando precisa de
 | Componente | Status |
 |-----------|--------|
 | Crates no workspace | 14 |
-| Testes passando | 296 |
+| Testes passando | 528+ |
 | Modelo real testado | SmolLM2-135M (F16, 270MB) |
 | Output coerente | Sim (`" Paris"` para "The capital of France is") |
 | TTFT (CPU) | ~930ms |
 | Throughput (CPU) | ~5 tok/s |
 | Contexto infinito | Provado empiricamente |
-| Deep Research Engine | Completo (agent_loop + tool_registry) |
-| DAVI Dream | 12 módulos, ciclo completo funcional |
-| CLI | 17 comandos, menu interativo |
+| KV-cache reuse | Provado correto (5 testes: incremental == recompute total) |
+| Deep Research Engine | Completo — todos os handlers usam módulos DAVI reais |
+| DAVI Dream | 12 módulos; `--dream` conectado ao DreamingEngine real |
+| Nash Tribunal | Validação adversarial real no handler `call_hypothesis` |
+| CLI | 17 comandos, menu interativo, temperatura dinâmica no agent loop |
 
 **O que ainda está em desenvolvimento**:
 - Shaders Vulkan GPU para inferência real na GPU (atualmente usa CPU fallback)
-- KV-cache reuse (atualmente reconstrói sequência completa a cada step)
-- Velocidade alvo: milhares de tok/s com GPU + COBER
+- Velocidade alvo: milhares de tok/s com GPU + especulação COBER
 
-A base matemática está correta. A sequência: **correção ✓ → reuso KV → GPU → especulação**.
+A base matemática está correta. A sequência: **correção ✓ → reuso KV ✓ → GPU → especulação**.
