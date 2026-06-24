@@ -1,141 +1,380 @@
-# NodeStor — Arquitetura
+# NodeStor — Arquitetura Técnica
 
-## Grafo de Dependências dos Crates
+Este documento explica como os 14 crates do NodeStor se organizam, como os dados fluem entre eles, e as decisões arquiteturais que tornam o sistema possível.
 
-```
-nodestor-cli  ──────────────────────────────────────────────┐
-    │                                                         │
-    ├── nodestor-inference  ←── TODA a lógica de inferência   │
-    │       ├── pipeline.rs        (orquestrador 7-camadas)   │
-    │       ├── cober.rs           (decodificação especulativa)│
-    │       ├── kv_cache.rs        (H2O + contexto infinito)  │
-    │       ├── agent_loop.rs      (Motor Deep Research)       │
-    │       ├── tool_registry.rs   (ferramentas por tag)      │
-    │       ├── cpu_reference.rs   (forward Llama correto)    │
-    │       ├── sampler.rs         (top-k, top-p, temp, rep)  │
-    │       ├── lora_core.rs       (injeção delta LoRA)       │
-    │       ├── steering_engine.rs (steering de ativação)     │
-    │       ├── persistent_memory.rs (memória episódica)      │
-    │       └── 50+ outros módulos                            │
-    │                                                         │
-    ├── nodestor-davi  ←── Inteligência Sonhante              │
-    │       ├── dreaming_engine.rs (orquestrador D9)          │
-    │       ├── topology.rs        (detecção de gaps TDA)     │
-    │       ├── free_energy.rs     (FEP de Friston)           │
-    │       ├── annealing.rs       (temperatura semântica)    │
-    │       ├── nash_tribunal.rs   (validação 3 agentes)      │
-    │       ├── functors.rs        (theory de categorias)     │
-    │       ├── stigmergy.rs       (ferômônios swarm)         │
-    │       ├── autopoiesis.rs     (auto-melhoria)            │
-    │       ├── elk_probe.rs       (detector de mentiras)     │
-    │       ├── cot_monitor.rs     (divergência CoT)          │
-    │       └── raise_detector.rs  (consciência situacional)  │
-    │                                                         │
-    ├── nodestor-metadata  ←── Banco Vetorial + RAG           │
-    │       ├── vector_store.rs    (HNSW + BM25 + RRF)        │
-    │       └── search.rs          (interface RAG)            │
-    │                                                         │
-    ├── nodestor-vulkan   ←── Compute na GPU                  │
-    ├── nodestor-streaming ←── Transporte APEX + COBER        │
-    ├── nodestor-formats  ←── Parsing GGUF + SafeTensors      │
-    ├── nodestor-scanner  ←── Detecção de hardware            │
-    └── nodestor-core     ←── Tipos compartilhados, erros     │
-                                                              │
-nodestor-server  ←── API HTTP (axum) ─────────────────────────┘
-```
+---
 
-## Regras de Dependência
-
-- `nodestor-inference` é o hub. Ele NÃO importa `nodestor-davi`.
-- `nodestor-davi` importa `nodestor-inference` (usa `semantic_attention`, tipos do pipeline).
-- PROBES se acopla ao pipeline via injeção de trait `ProbesTool` (sem dependência circular).
-- CLI importa tudo; é o ponto de integração.
-
-## Contexto Infinito
-
-Quando o KV cache enche, `enforce_window()` evicta os tokens mais antigos. Os IDs de tokens evictados são decodificados para texto e indexados no banco vetorial (`VectorSearch`). Na recuperação, conteúdo passado semanticamente similar é preposto ao prompt — dando ao modelo acesso a histórico de comprimento arbitrário dentro de um orçamento fixo de VRAM.
+## Estrutura de Crates
 
 ```
-loop de generate():
-  → passo forward (Vulkan ou CPU)
-  → amostra token
-  → verifica janela KV
-    → se evictou: decodifica tokens → vector_db.add_document()
-  → transmite token ao usuário
-  → verifica EOS
+nodestor/
+  nodestor-cli/           ← Binário principal (nodestor) + benchmarks
+  nodestor-server/        ← Servidor HTTP (axum) com API REST
+  nodestor-integration-tests/  ← Testes end-to-end
+  crates/
+    nodestor-core/        ← Tipos compartilhados, erros, config
+    nodestor-scanner/     ← Detecção de hardware (GPU, CPU, SSD, VRAM)
+    nodestor-formats/     ← Parser GGUF v1/v2/v3 + SafeTensors
+    nodestor-transport/   ← I/O assíncrono de alta performance
+    nodestor-vulkan/      ← Engine Vulkan (compute shaders + pipeline CPU)
+    nodestor-streaming/   ← APEX: BurstScheduler, BufferPool, prefetch
+    nodestor-metadata/    ← Banco vetorial HNSW+BM25 + indexação
+    nodestor-inference/   ← Pipeline completo de inferência (60+ módulos)
+    nodestor-davi/        ← Motor de sonho (12 módulos cognitivos)
+    nodestor-python/      ← Bindings Python via maturin/PyO3
+    nodestor-fabric/      ← Orchestração multi-nó (futuro)
+    nodestor-gdeflate/    ← Compressão GDeflate acelerada por GPU
 ```
 
-## Loop de Agente (Deep Research)
+---
+
+## Grafo de Dependências
+
+A regra fundamental: **nenhum crate base pode depender de um crate de aplicação.**
 
 ```
-AgentExecutionLoop::run()
-  loop (max_loops):
-    → gera texto (pipeline.generate_stream)
-    → ToolRegistry::scan_for_call(texto)
-      → None:  termina (DirectAnswer)
-      → Some:  invoke(tag, query) → ToolResult
-                → injeta tool_response no contexto
-                → adapt_temperature (verificação de estagnação)
-                → próximo loop
+nodestor-core  (sem deps internas)
+      ↑
+nodestor-scanner  nodestor-formats  nodestor-gdeflate
+      ↑                  ↑
+nodestor-transport
+      ↑
+nodestor-vulkan  nodestor-metadata
+      ↑                  ↑
+nodestor-streaming
+      ↑
+nodestor-inference  ←── hub central (60+ módulos)
+      ↑
+nodestor-davi  ←── depende de inference (não o contrário)
+      ↑
+nodestor-cli / nodestor-server  ←── integram tudo
 ```
 
-Tags de ferramenta emitidas pelo modelo:
-- `<call_vector_db>query</call_vector_db>` → busca semântica
-- `<call_dream>domínio1+domínio2</call_dream>` → síntese cross-domain DAVI
-- `<call_think>raciocínio</call_think>` → reflexão interna
-- `<call_hypothesis>hipótese</call_hypothesis>` → validação Nash Tribunal
+**Regra crítica PROBES**: `nodestor-inference` não importa `nodestor-davi`. PROBES é acoplado via trait injection:
 
-## Ciclo de Sonho DAVI
+```rust
+// Em nodestor-inference/src/pipeline.rs
+pub trait ProbesTool: Send + Sync {
+    fn inspect(&self, hidden: &[f32], step: usize);
+}
 
-```
-DreamingEngine::dream_cycle(embeddings, insights):
-  1. TopologicalGapDetector  → encontra lacunas no conhecimento (homologia persistente)
-  2. FreeEnergyObjective     → seleciona lacuna de maior surpresa
-  3. SemanticAnnealing       → aceita/rejeita salto cross-domain (temperatura)
-  4. NashTribunal            → 3 agentes debatem a hipótese
-  5. FunctorComposer         → mapeia descoberta para outros domínios
-  6. StigmergicSwarm         → deposita feromônio no caminho bem-sucedido
-  7. AutopoieticLoop         → atualiza saúde do sistema / viés de exploração
+pub struct InferencePipeline {
+    probes: Option<Arc<dyn ProbesTool>>,
+    ...
+}
 ```
 
-## Steering de Ativação
+`DaviProbesTool` (em `nodestor-davi`) implementa esse trait e é injetado pela CLI com `pipeline.with_probes_tool(davi_tool)`. Zero dependência circular.
 
-Quando `--steer-vector` é usado, o pipeline aplica Projeção Ortogonal Dinâmica em todo stream residual:
+---
 
-```
-h_novo = h - (h · d̂) * d̂ * intensity
-```
-
-Onde `d̂` é o vetor de direção normalizado extraído por `calibrate`. Isso modifica a geometria de todos os hidden states sem tocar nos pesos do modelo.
-
-DSCP (`--auto-steer`) gera o vetor de direção em runtime a partir de templates de ativação contrastivos — sem dataset externo necessário.
-
-## Especulação de Tokens (COBER)
+## Pipeline de Inferência (7 Camadas)
 
 ```
-COBER::verify_and_accept_probabilistic(draft_tokens, logits):
-  para cada token rascunhado t_d na posição i:
-    r ~ Uniforme(0, 1)
-    se r < p_modelo(t_d) / p_rascunho(t_d):
-      aceita t_d    ← lossless
-    senão:
-      amostra da distribuição corrigida
-      para
+Prompt (texto)
+      │
+      ▼ Camada 1: Tokenização
+  TokenizerManager::encode()
+  ┌─ GGUF tokenizer (BPE byte-level)
+  └─ HuggingFace tokenizers (fallback)
+      │
+      ▼ Camada 2: Carregamento de Pesos
+  WeightStore + GGUF/SafeTensors parser
+  ┌─ F32/F16/BF16 → f32 direto (lossless)
+  └─ Q8_0/Q4_K/Q5_K → DequantDispatcher
+      │
+      ▼ Camada 3: KV-Cache
+  KVCacheWindow (H2O eviction)
+  ┌─ Window deslizante com orçamento VRAM fixo
+  ├─ Evicção: heap(score) → FIFO → sink (último recurso)
+  └─ Tokens evictados → vector_db.add_document()
+      │
+      ▼ Camada 4: Forward Pass
+  [GPU] VulkanEngine::dispatch_attention() / dispatch_turbo_quant_attention()
+  [CPU] cpu_reference::forward_last_logits()
+  ┌─ RMSNorm → SwiGLU → RoPE → Causal Attention → Output
+  └─ GQA (Grouped Query Attention) quando num_kv_heads < num_heads
+      │
+      ▼ Camada 5: Amostragem
+  Sampler { temperature, top_k, top_p, repetition_penalty }
+  ┌─ Temperatura 0 → greedy (argmax)
+  └─ Top-K → Top-P (nucleus) → WeightedIndex sample
+      │
+      ▼ Camada 6: Streaming
+  mpsc::Sender<Result<String>>
+  ┌─ Tokens enviados via channel para o cliente
+  └─ Métricas: TTFT, tok/s, total
+      │
+      ▼ Camada 7: EOS Detection
+  token_id == eos_token_id → encerra
 ```
 
-Speedup = média de tokens aceitos por passo (tipicamente 2–4×).
+---
+
+## Contexto Infinito: Implementação Detalhada
+
+### O Problema
+
+KV-cache armazena vetores Key e Value para cada token do histórico. Com dimensão oculta `d` e `L` camadas, o custo de memória por token é `2 × L × d × sizeof(f32)` bytes. Para SmolLM2-135M (L=30, d=576): ~138 KB por token. Para 4096 tokens: ~543 MB. Para contexto de 100K tokens: o cache seria inviável.
+
+### A Solução
+
+```rust
+// Em kv_cache.rs — loop de geração
+let evicted = main_kv.enforce_window();
+if evicted > 0 {
+    for j in 0..evicted {
+        if let Some(&t) = full_seq.get(window_start + j) {
+            evict_buf.push(t);
+        }
+    }
+    window_start += evicted;
+    if evict_buf.len() >= 48 {
+        let text = tokenizer.decode(&evict_buf, true).unwrap_or_default();
+        if !text.trim().is_empty() {
+            let id = format!("ctx_{}", window_start);
+            let _ = self.vector_db.add_document(&id, &text).await;
+        }
+        evict_buf.clear();
+    }
+}
+```
+
+Quando o KV-cache enche, `enforce_window()` remove os tokens mais antigos do score heap. Os IDs desses tokens são acumulados no `evict_buf`. Quando o buffer atinge 48 tokens (~32 palavras), são decodificados para texto e indexados no banco vetorial.
+
+### Recuperação
+
+Quando o usuário faz uma pergunta relacionada a informação evictada, a busca HNSW+BM25 recupera o texto relevante e ele é preposto ao prompt:
+
+```
+[Contexto recuperado]: "A capital da França é Paris..."
+<|im_start|>user
+Qual país tem Paris como capital?
+```
+
+O modelo responde como se nunca tivesse "esquecido".
+
+**Prova**: `test_infinite_context_recall_of_evicted_fact` em `nodestor-metadata` verifica que um fato inserido antes da evição é recuperado após ela com similaridade > 0.9.
+
+---
+
+## Banco Vetorial Embutido (HNSW + BM25 + RRF)
+
+O `VectorStore` em `nodestor-metadata/src/vector_store.rs` é uma implementação pure-Rust, sem dependências pesadas.
+
+### HNSW (Hierarchical Navigable Small World)
+
+Estrutura de grafo multi-camada para busca aproximada de vizinhos mais próximos:
+- Camadas superiores: poucas conexões, saltos longos (busca rápida)
+- Camada 0: muitas conexões, busca local precisa
+
+Complexidade: O(log N) para busca, O(log N) para inserção.
+
+### BM25 (Best Match 25)
+
+Algoritmo clássico de recuperação de texto por relevância. Diferentemente do TF-IDF, BM25 tem saturação de frequência (documentos com 1000 ocorrências não são 1000× mais relevantes que documentos com 1):
+
+```
+score(d, q) = Σ_t IDF(t) × (TF(t,d) × (k1+1)) / (TF(t,d) + k1×(1-b+b×|d|/avgdl))
+```
+
+Onde `k1=1.2`, `b=0.75`.
+
+### RRF (Reciprocal Rank Fusion)
+
+Combina os rankings HNSW e BM25 de forma robusta:
+
+```
+RRF_score(d) = Σ_r 1/(k + rank_r(d))   onde k=60
+```
+
+Documentos bem rankeados em ambos os sistemas sobem ao topo. Documentos no topo de apenas um sistema ficam em posições médias.
+
+### Embed de Texto
+
+Sem modelo de embedding externo, usa FNV-1a hashing com feature hashing para gerar vetores de 64 dimensões por texto. Permite similaridade semântica aproximada baseada em n-gramas de tokens.
+
+---
+
+## Agent Loop (Deep Research Engine)
+
+### Configuração
+
+```rust
+pub struct AgentLoopConfig {
+    pub max_loops: usize,           // max ciclos (padrão: 10)
+    pub stagnation_window: usize,   // janela para detecção de estagnação (padrão: 20)
+    pub stagnation_threshold: f32,  // limiar de repetição (padrão: 0.5)
+    pub temperature_bump: f32,      // incremento de temperatura (padrão: 0.15)
+    pub temperature_max: f32,       // teto de temperatura (padrão: 1.8)
+    pub temperature_base: f32,      // temperatura base (padrão: 0.7)
+    pub max_tokens_per_step: usize, // tokens máximos por loop (padrão: 512)
+    pub verbose_steps: bool,
+}
+```
+
+### Detecção de Estagnação
+
+Dois métodos:
+
+**Por token overlap** — mede a fração de tokens da janela atual que já apareceram na janela anterior:
+```rust
+fn detect_stagnation(tokens: &[u32], window: usize, threshold: f32) -> bool {
+    let half = window / 2;
+    if tokens.len() < window { return false; }
+    let old = &tokens[tokens.len()-window..tokens.len()-half];
+    let new = &tokens[tokens.len()-half..];
+    let overlap = new.iter().filter(|t| old.contains(t)).count();
+    overlap as f32 / new.len() as f32 > threshold
+}
+```
+
+**Por n-gramas** — detecta repetição de padrões maiores (frases completas):
+```rust
+fn detect_stagnation_ngram(tokens: &[u32], n: usize, window: usize) -> bool {
+    // extrai n-gramas únicos de 2 metades da janela
+    // retorna true se >50% dos n-gramas são duplicados
+}
+```
+
+### Adaptação de Temperatura
+
+```rust
+fn adapt_temperature(&mut self, stagnated: bool) {
+    if stagnated {
+        self.stagnation_streak += 1;
+        let bump = self.config.temperature_bump * self.stagnation_streak as f32;
+        self.current_temperature = (self.current_temperature + bump)
+            .min(self.config.temperature_max);
+    } else if self.stagnation_streak > 0 {
+        self.stagnation_streak -= 1;
+        // Resfriamento gradual: cada step sem estagnação baixa 60% do bump
+        let cooling = self.config.temperature_bump * 0.6;
+        self.current_temperature = (self.current_temperature - cooling)
+            .max(self.config.temperature_base);
+    }
+}
+```
+
+### Fluxo de Execução
+
+```
+loop i em 0..max_loops:
+  1. Chama pipeline.generate_stream(contexto, max_tokens)
+  2. Acumula tokens → step_text
+  3. Verifica stagnation em all_tokens
+  4. Adapta temperatura
+  5. ToolRegistry::scan_for_call(step_text)
+     ├── None: TerminationReason::DirectAnswer → retorna
+     └── Some(tag, query):
+           invoke(tag, query) → ToolResult
+           contexto += step_text + tool_result.to_context_block()
+           continua loop
+6. Se loop_i == max_loops: TerminationReason::MaxLoopsReached
+```
+
+---
+
+## Steering de Ativação: A Matemática
+
+### O Vetor de Direção
+
+A calibração extrai hidden states `h+` (comportamento positivo) e `h-` (negativo) e computa:
+
+```
+d = mean(h+) - mean(h-)     # diferença de médias
+d̂ = d / ||d||              # normalizado
+```
+
+### Projeção Ortogonal Dinâmica
+
+A cada camada, durante a geração:
+
+```
+h_novo = h - (h · d̂) × d̂ × intensity
+```
+
+Geometricamente: remove a componente do hidden state na direção `d̂`. Se `d̂` representa "recusa", a recusa é retirada da geometria interna sem modificar pesos.
+
+**Por que funciona**: representações lineares de conceitos em espaços de embedding de alta dimensão (hipótese de linearidade de Mikolov et al., 2013) permitem que operações vetoriais simples modifiquem o comportamento do modelo.
+
+**Intensidade**: 0.0 = sem efeito, 1.0 = remoção completa da componente, >1.0 = amplificação da direção oposta.
+
+---
 
 ## Carregamento de Pesos Fiel ao Tipo
 
-O pipeline carrega pesos GGUF preservando tipo de dado:
-- **F32/F16/BF16** → conversão direta para F32 (sem perda)
-- **Q8_0** → dequantização via `DequantDispatcher::dequant_q8_0`
-- **Q4_K/Q5_K** → dequantização via `dequant_q4_k`/`dequant_q5_k`
-- **Pesos emprestados (tied)**: SmolLM2 não tem `output.weight` → amarra à `token_embd`
+O GGUF pode armazenar tensores em múltiplos formatos. NodeStor preserva a precisão máxima:
 
-## Regras de Build Críticas
+```rust
+fn tensor_to_f32(data: &[u8], dtype: u32, count: usize) -> Vec<f32> {
+    match dtype {
+        0 => { // F32: cópia direta
+            bytemuck::cast_slice(data).to_vec()
+        }
+        1 => { // F16: conversão half→f32
+            data.chunks(2).map(|b| f16::from_le_bytes([b[0],b[1]]).to_f32()).collect()
+        }
+        2 => { // BF16: conversão bfloat16→f32
+            data.chunks(2).map(|b| {
+                let bits = u16::from_le_bytes([b[0],b[1]]) as u32;
+                f32::from_bits(bits << 16)
+            }).collect()
+        }
+        8 => DequantDispatcher::dequant_q8_0(data, count),
+        12 => DequantDispatcher::dequant_q4_k(data, count),
+        13 => DequantDispatcher::dequant_q5_k(data, count),
+        _ => vec![0.0; count], // tipo desconhecido
+    }
+}
+```
 
-- **Sempre `-j1`** para `cargo test` e `cargo build`: a máquina de 16 GB tem o page file esgotado por múltiplas instâncias paralelas do rustc.
-- **`cargo check`** pode rodar em paralelo padrão (só gera `.rmeta`, menor uso de memória).
-- `tokio` fixo em 1.50.0 / `mio` em 1.1.1 — não atualizar.
-- `target/` é uma NTFS junction → `D:\nodestor-target` (Ventoy USB).
+**Pesos Emprestados (Tied Embeddings)**: SmolLM2 e alguns outros modelos não têm `output.weight` separado — a cabeça de linguagem usa os mesmos pesos que o embedding de entrada. Se `output.weight` não é encontrado no banco de pesos, o pipeline automaticamente empresta `token_embd.weight`.
+
+---
+
+## Arquitetura de Forward Correto (RoPE Interleaved)
+
+A implementação em `cpu_reference.rs` resolve um bug histórico em muitos motores de inferência.
+
+### O Bug do RoPE NeoX vs. Llama
+
+Os pesos GGUF do Llama usam **RoPE Interleaved** (formato Llama.cpp), não o RoPE NeoX. A diferença:
+
+**RoPE NeoX** (errado para Llama):
+```
+pos_emb = [q[0]*cos - q[d/2]*sin, q[1]*cos - q[d/2+1]*sin, ...]
+```
+
+**RoPE Interleaved** (correto para Llama):
+```
+for i in 0..d/2:
+  x = q[2*i],  y = q[2*i+1]
+  q[2*i]   = x*cos(θ_i) - y*sin(θ_i)
+  q[2*i+1] = x*sin(θ_i) + y*cos(θ_i)
+```
+
+A permutação incorreta resulta em logits distribuídos de forma errada, fazendo o modelo gerar tokens sem sentido mesmo com pesos corretos. NodeStor usa o formato interleaved, o que produz output coerente ("Paris" para "The capital of France is").
+
+---
+
+## Regras de Build
+
+```toml
+# Perfil de release otimizado
+[profile.release]
+lto = true          # Link-Time Optimization entre crates
+codegen-units = 1   # Um único unidade de compilação (máxima otimização)
+opt-level = 3       # Otimização máxima
+strip = true        # Remove símbolos de debug
+panic = "abort"     # Sem stack unwinding (menor binário, mais rápido)
+```
+
+**Restrições de build em desenvolvimento** (específicas desta máquina, 16 GB RAM):
+- `cargo test -j1`: serializa compilação para evitar OOM com rustc paralelo
+- `cargo check`: pode usar paralelismo padrão (apenas `.rmeta`)
+- `tokio`: fixo em 1.50.0 (1.52.3 requer `windows-0.57.0` que causa stack overflow no rustc)
+- `mio`: fixo em 1.1.1
+
+**`target/` em D:**  
+Junção NTFS de `nodestor/target/` para `D:\nodestor-target` (SSD USB Ventoy). Transparente para o cargo — builds escrevem em D: automaticamente, liberando C: para o sistema.
