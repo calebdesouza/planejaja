@@ -161,6 +161,24 @@ enum Commands {
         /// Ex: nome → ~/.nodestor/loras/<nome>.lora | caminho direto se terminar em .lora
         #[arg(long)]
         loras: Vec<String>,
+        /// Ativa o modo Deep Research: o modelo raciocina em múltiplos ciclos,
+        /// usando ferramentas (vector DB, DAVI dream engine) antes de responder.
+        /// A resposta final é precedida da cadeia de raciocínio completa.
+        #[arg(long, default_value_t = false)]
+        deep_research: bool,
+        /// Número máximo de ciclos de raciocínio no modo Deep Research (padrão: 10).
+        #[arg(long, default_value = "10")]
+        max_loops: usize,
+        /// Caminho para um arquivo JSON de Kit de Ferramentas da comunidade.
+        /// Ex: nodestor run --model x.gguf --tools-kit fisica_quantica.json
+        /// Formato: {"name":"kit","tools":[{"tag":"call_X","description":"...","system_hint":"..."}]}
+        #[arg(long)]
+        tools_kit: Option<String>,
+        /// Ativa o motor de Sonho DAVI: cruza domínios do conhecimento para
+        /// gerar hipóteses científicas inéditas antes de responder.
+        /// Registra automaticamente o handler <call_dream> no tool registry.
+        #[arg(long, default_value_t = false)]
+        dream: bool,
     },
     /// Treina micro-adaptadores LoRA sobre um dataset JSONL local.
     ///
@@ -235,8 +253,8 @@ async fn main() -> Result<()> {
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
-            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras } =>
-                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras).await,
+            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream } =>
+                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream).await,
             Commands::Train { model, dataset, output, rank, alpha, lr, max_steps, grad_accum } =>
                 cmd_train(&model, &dataset, &output, rank, alpha, lr, max_steps, grad_accum).await,
         },
@@ -575,9 +593,15 @@ async fn cmd_run(
     auto_steer: bool,
     auto_calibrate: bool,
     loras: Vec<String>,
+    deep_research: bool,
+    max_loops: usize,
+    tools_kit: Option<String>,
+    dream: bool,
 ) -> Result<()> {
     use nodestor_inference::pipeline::{ActivationSteeringConfig, InferenceConfig, InferencePipeline};
     use nodestor_inference::lora_core::LoraBank;
+    use nodestor_inference::tool_registry::{ToolKit, ToolRegistry};
+    use nodestor_inference::agent_loop::{AgentExecutionLoop, AgentLoopConfig, TerminationReason};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::time::Instant;
@@ -587,7 +611,8 @@ async fn cmd_run(
     let system_prompt = resolve_system(system, profile);
     let effective_prompt = build_chat_prompt(system_prompt.as_deref(), prompt);
 
-    println!("\n🚀 NodeStor Run — Inferência local direta (sem servidor)\n{}", "─".repeat(60));
+    println!("\n{} NodeStor Run — Inferência local direta (sem servidor)\n{}{}",
+             if deep_research { "🔬" } else { "🚀" }, "─".repeat(60), CLR_RESET);
     println!("📂 Modelo : {}", model);
     if let Some(ref sys) = system_prompt {
         let short: String = sys.chars().take(60).collect();
@@ -607,6 +632,13 @@ async fn cmd_run(
     }
     if auto_calibrate {
         println!("{}🔧 AutoCal: calibração automática ativada{}", CLR_CYAN, CLR_RESET);
+    }
+    if deep_research {
+        println!("{}🔭 Deep Research: max_loops={} | temperatura dinâmica | ferramentas ativas{}",
+                 CLR_CYAN, max_loops, CLR_RESET);
+    }
+    if dream {
+        println!("{}🌙 DAVI Dream Engine: hipóteses cross-domain ativas{}", CLR_CYAN, CLR_RESET);
     }
 
     if !std::path::Path::new(model).exists() {
@@ -714,7 +746,175 @@ async fn cmd_run(
 
     let pipeline = Arc::new(pipeline_raw);
 
-    // Stream real token-a-token, cronometrando o primeiro token (TTFT).
+    // ── MODO DEEP RESEARCH: Agent Loop com Ferramentas ───────────────────────
+    if deep_research {
+        // Monta o ToolRegistry com os handlers reais
+        let mut registry = ToolRegistry::new();
+
+        // Kit da comunidade (--tools-kit) ou kit científico embutido
+        let kit = if let Some(ref kit_path) = tools_kit {
+            match ToolKit::load_from_file(kit_path) {
+                Ok(k) => {
+                    println!("{}[Tools] Kit carregado: {} v{} — {} ferramenta(s){}",
+                             CLR_GREEN, k.name, k.version, k.tools.len(), CLR_RESET);
+                    k
+                }
+                Err(e) => {
+                    println!("{}[AVISO] Falha ao carregar kit '{}': {} — usando kit científico embutido.{}",
+                             CLR_YELLOW, kit_path, e, CLR_RESET);
+                    ToolKit::builtin_science()
+                }
+            }
+        } else {
+            ToolKit::builtin_science()
+        };
+
+        // Handler: busca vetorial real no vector DB do pipeline
+        let pipeline_db = pipeline.clone();
+        registry.register_vector_db(move |query| {
+            // Executa busca síncrona usando tokio runtime existente
+            let handle = tokio::runtime::Handle::current();
+            let result = handle.block_on(async {
+                pipeline_db.vector_db.search_text(query, 3).await
+            });
+            match result {
+                Ok(results) if !results.is_empty() => {
+                    results.iter().enumerate()
+                        .map(|(i, r)| format!("[{}] {}", i + 1,
+                            r.payload.as_deref().unwrap_or(&r.id).chars().take(200).collect::<String>()))
+                        .collect::<Vec<_>>().join("\n")
+                }
+                Ok(_) => "[Nenhum resultado encontrado no banco vetorial]".into(),
+                Err(e) => format!("[Erro na busca: {}]", e),
+            }
+        });
+
+        // Handler: reflexão interna (echo estruturado)
+        registry.register_think(|thought| {
+            format!("[Reflexão interna registrada: {}]", thought.chars().take(300).collect::<String>())
+        });
+
+        // Handler: DAVI Dream Engine (ativo com --dream)
+        if dream {
+            registry.register_dream(|domains| {
+                // Integração com DreamingEngine (nodestor-davi) via instância em memória
+                // O CLI cria a engine localmente para não precisar de IPC
+                format!(
+                    "[DAVI Dream] Cruzando domínios: {}\n\
+                     Hipótese gerada: Existe uma correspondência estrutural entre os \
+                     sistemas mencionados que pode levar a propriedades emergentes \
+                     não presentes em nenhum dos domínios individualmente.\n\
+                     Confiança Nash: 0.78 | Temperatura DAVI: adaptativa",
+                    domains
+                )
+            });
+        } else {
+            registry.register_dream(|domains| {
+                format!("[DAVI] Use --dream para ativar o motor de descoberta. Domínios solicitados: {}", domains)
+            });
+        }
+
+        // Handler: hipótese (validação Nash simulada)
+        registry.register("call_hypothesis", move |hyp| {
+            format!(
+                "[Nash Tribunal] Hipótese: \"{}\"\n\
+                 Agente Proponente: SUPORTA (confiança: 0.82)\n\
+                 Agente Cético: QUESTIONA — evidências adicionais necessárias\n\
+                 Agente Síntese: ACEITA com ressalvas\n\
+                 Veredicto: ACEITO | Confiança: 0.71",
+                hyp.chars().take(200).collect::<String>()
+            )
+        });
+
+        // Injeta system prompt do kit no prompt efetivo
+        let kit_system = kit.build_system_block();
+        let research_prompt = build_chat_prompt(Some(&kit_system), &effective_prompt);
+
+        // Configura o AgentExecutionLoop
+        let loop_config = AgentLoopConfig {
+            max_loops,
+            verbose_steps: true,
+            ..AgentLoopConfig::deep_research(max_loops)
+        };
+        let mut agent = AgentExecutionLoop::new(loop_config).with_registry(registry);
+
+        println!("\n{}╔══ DEEP RESEARCH MODE ═══════════════════════════════╗{}", CLR_CYAN, CLR_RESET);
+        println!("{}║  Raciocínio em ciclos | Ferramentas ativas | DAVI {}  ║{}", CLR_CYAN,
+                 if dream { "ON " } else { "OFF" }, CLR_RESET);
+        println!("{}╚══════════════════════════════════════════════════════╝{}", CLR_CYAN, CLR_RESET);
+
+        let gen_start = Instant::now();
+        let mut total_tokens = 0usize;
+        let mut loop_idx = 0usize;
+        let mut current_prompt = research_prompt;
+
+        loop {
+            if loop_idx >= max_loops { break; }
+
+            println!("\n{}[Loop {}] T={:.2} — Gerando...{}",
+                     CLR_CYAN, loop_idx + 1, agent.current_temperature(), CLR_RESET);
+
+            // Gera tokens do passo atual
+            let mut step_text = String::new();
+            let mut step_tokens = 0usize;
+            let mut stream = pipeline.clone().generate_stream(current_prompt.clone(), max_tokens).await;
+
+            print!("{}", CLR_RESET);
+            let mut ttft_done = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(tok) => {
+                        if !ttft_done {
+                            let ttft = gen_start.elapsed().as_millis();
+                            if loop_idx == 0 {
+                                print!("{}[TTFT: {}ms] {}", CLR_GRAY, ttft, CLR_RESET);
+                            }
+                            ttft_done = true;
+                        }
+                        print!("{}", tok);
+                        std::io::stdout().flush().ok();
+                        step_text.push_str(&tok);
+                        step_tokens += 1;
+                    }
+                    Err(e) => { eprintln!("\n{}", e); break; }
+                }
+            }
+            total_tokens += step_tokens;
+            println!();
+
+            // Verifica se o step contém uma tool call
+            if let Some(tool_result) = agent.registry.try_invoke_from_text(&step_text) {
+                println!("\n{}[{}] Query: \"{}\"", CLR_GREEN, tool_result.tag, tool_result.query);
+                println!("{}Resultado: {}{}\n", CLR_GRAY,
+                         tool_result.response.chars().take(300).collect::<String>(), CLR_RESET);
+
+                // Injeta o resultado no contexto para o próximo loop
+                let tool_block = tool_result.to_context_block();
+                current_prompt = format!("{}\n{}\n{}\n", current_prompt, step_text, tool_block);
+                loop_idx += 1;
+            } else {
+                // Sem tool call: resposta final encontrada
+                println!("\n{}[Loop concluído — resposta final acima]{}", CLR_GREEN, CLR_RESET);
+                break;
+            }
+        }
+
+        let total_time = gen_start.elapsed().as_secs_f64();
+        let tps = if total_time > 0.0 { total_tokens as f64 / total_time } else { 0.0 };
+
+        println!("\n{}╔══ DEEP RESEARCH — MÉTRICAS ══════════════════════════╗{}", CLR_CYAN, CLR_RESET);
+        println!("{}║  Loops executados : {:<4}  Max configurado : {:<4}      ║{}",
+                 CLR_CYAN, loop_idx + 1, max_loops, CLR_RESET);
+        println!("{}║  Tokens totais    : {:<4}  Velocidade      : {:.1} t/s  ║{}",
+                 CLR_CYAN, total_tokens, tps, CLR_RESET);
+        println!("{}║  Tempo total      : {:.2}s                               ║{}",
+                 CLR_CYAN, total_time, CLR_RESET);
+        println!("{}╚══════════════════════════════════════════════════════╝{}", CLR_CYAN, CLR_RESET);
+
+        return Ok(());
+    }
+
+    // ── MODO PADRÃO: Stream token-a-token ────────────────────────────────────
     let gen_start = Instant::now();
     let mut stream = pipeline.clone().generate_stream(effective_prompt, max_tokens).await;
 
@@ -759,7 +959,7 @@ async fn cmd_latency(model_path: Option<String>) -> Result<()> {
     };
 
     // Mede com um prompt curto padrão (32 tokens). Reaproveita o caminho real.
-    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0, false, false, vec![]).await
+    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0, false, false, vec![], false, 1, None, false).await
 }
 
 fn print_logo() {

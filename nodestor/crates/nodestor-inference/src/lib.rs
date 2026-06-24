@@ -73,6 +73,10 @@ pub mod radix_cache;
 // --- Lossless Compression Mechanics ---
 pub mod entropy_analyzer;
 
+// --- Deep Research Engine: Auto-Loop + Tool Registry ---
+pub mod tool_registry;
+pub mod agent_loop;
+
 
 #[cfg(test)]
 mod tests {

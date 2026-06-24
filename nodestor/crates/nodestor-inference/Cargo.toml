@@ -20,6 +20,7 @@ nodestor-vulkan = { path = "../nodestor-vulkan" }
 tokenizers = "0.19.1"
 rand = "0.8"
 serde_json = { workspace = true }
+serde = { workspace = true }
 memmap2 = "0.9"
 rayon.workspace = true
 anyhow.workspace = true
