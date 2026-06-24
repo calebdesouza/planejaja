@@ -57,6 +57,9 @@ pub mod refusal_mapper;
 pub mod lora_core;
 pub mod trainer;
 
+// --- System Prompt Builder: Editor Dinâmico Empresarial ---
+pub mod system_prompt_builder;
+
 // --- K-Quants: Dequantização Universal (Crítico para modelos 70B+) ---
 pub mod dequant;
 

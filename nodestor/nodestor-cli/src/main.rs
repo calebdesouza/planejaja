@@ -179,6 +179,11 @@ enum Commands {
         /// Registra automaticamente o handler <call_dream> no tool registry.
         #[arg(long, default_value_t = false)]
         dream: bool,
+        /// Arquivo .sp de system prompt (Editor Dinâmico Empresarial).
+        /// Nome lógico ou caminho .sp. Tem prioridade menor que --system.
+        /// Ex: minha_empresa → ~/.nodestor/prompts/minha_empresa.sp
+        #[arg(long)]
+        system_file: Option<String>,
     },
     /// Lista modelos instalados em ~/.nodestor/models/ e outros locais.
     Models {
@@ -225,6 +230,21 @@ enum Commands {
         #[arg(long, default_value = "4")]
         grad_accum: usize,
     },
+    /// Editor Dinâmico de Prompts de Sistema Empresariais.
+    ///
+    /// Cria, edita e compila system prompts estruturados em XML com 6 templates prontos.
+    /// Os arquivos .sp (JSON) são salvos em ~/.nodestor/prompts/.
+    ///
+    /// Exemplos:
+    ///   nodestor prompt new --template enterprise --name acme --company "ACME Corp"
+    ///   nodestor prompt show acme
+    ///   nodestor prompt edit acme --section tone --content "Seja direto e técnico."
+    ///   nodestor prompt compile acme
+    ///   nodestor prompt enhance acme --section identity --model modelo.gguf
+    Prompt {
+        #[command(subcommand)]
+        subcmd: PromptCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -245,6 +265,112 @@ enum DaviCommands {
     },
     /// Mostra o estado atual do sistema DAVI (módulos, configuração, métricas).
     Status,
+}
+
+#[derive(Subcommand)]
+enum PromptCommands {
+    /// Cria um novo system prompt a partir de um template.
+    New {
+        /// Template: enterprise | minimal | technical | customer_support | creative | security
+        #[arg(long, short, default_value = "enterprise")]
+        template: String,
+        /// Nome lógico do prompt (ex: minha_empresa → ~/.nodestor/prompts/minha_empresa.sp)
+        #[arg(long, short)]
+        name: String,
+        /// Nome da empresa — substitui [EMPRESA] nos templates
+        #[arg(long, short)]
+        company: Option<String>,
+        /// Caminho de saída explícito (padrão: ~/.nodestor/prompts/<name>.sp)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
+    /// Exibe o .sp com seções, status e estatísticas.
+    Show {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// Exibe o texto compilado ao invés da lista de seções
+        #[arg(long)]
+        compiled: bool,
+    },
+    /// Compila o .sp para texto puro (pronto para uso como system prompt).
+    Compile {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// Arquivo de saída (padrão: imprime no terminal)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
+    /// Edita o conteúdo de uma seção existente.
+    Edit {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// ID da seção a editar (listados por `prompt show <name>`)
+        #[arg(long, short)]
+        section: String,
+        /// Novo conteúdo da seção
+        #[arg(long, short)]
+        content: String,
+    },
+    /// Ativa ou desativa uma seção sem removê-la.
+    Toggle {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// ID da seção
+        #[arg(long, short)]
+        section: String,
+        /// true para ativar, false para desativar
+        #[arg(long)]
+        enable: bool,
+    },
+    /// Remove uma seção permanentemente do .sp.
+    Remove {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// ID da seção a remover
+        #[arg(long, short)]
+        section: String,
+    },
+    /// Adiciona uma nova seção customizada ao .sp.
+    Add {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// ID único da nova seção
+        #[arg(long)]
+        id: String,
+        /// Tag XML — deixe vazio para seção sem wrapper
+        #[arg(long, default_value = "")]
+        tag: String,
+        /// Título legível (para o editor CLI)
+        #[arg(long)]
+        title: String,
+        /// Conteúdo da instrução
+        #[arg(long)]
+        content: String,
+        /// Prioridade (maior = aparece primeiro; padrão: 50)
+        #[arg(long, default_value = "50")]
+        priority: u32,
+    },
+    /// Lista todos os templates disponíveis com descrição.
+    Templates,
+    /// Analisa o .sp: cobertura, estimativa de tokens e recomendações.
+    Analyze {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+    },
+    /// Aprimora uma seção usando inferência local (o modelo melhora o conteúdo).
+    Enhance {
+        /// Nome ou caminho do arquivo .sp
+        file: String,
+        /// ID da seção a aprimorar
+        #[arg(long, short)]
+        section: String,
+        /// Modelo local GGUF para geração da melhoria
+        #[arg(long, short)]
+        model: String,
+        /// Temperatura criativa (0.1-0.9; padrão: 0.4)
+        #[arg(long, default_value = "0.4")]
+        temperature: f32,
+    },
 }
 
 #[tokio::main]
@@ -286,12 +412,13 @@ async fn main() -> Result<()> {
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
-            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream } =>
-                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream).await,
+            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream, system_file } =>
+                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream, system_file).await,
             Commands::Models { all } => cmd_models(all),
             Commands::Davi { subcmd } => cmd_davi(subcmd).await,
             Commands::Train { model, dataset, output, rank, alpha, lr, max_steps, grad_accum } =>
                 cmd_train(&model, &dataset, &output, rank, alpha, lr, max_steps, grad_accum).await,
+            Commands::Prompt { subcmd } => cmd_prompt(subcmd).await,
         },
         None => {
             if cli.quiet {
@@ -342,7 +469,7 @@ async fn cmd_interactive() -> Result<()> {
                     let prompt: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
                         .with_prompt("Prompt")
                         .interact_text()?;
-                    cmd_run(&model_path, &prompt, 256, None, None, None, 1.0, false, false, vec![], false, 10, None, false).await?;
+                    cmd_run(&model_path, &prompt, 256, None, None, None, 1.0, false, false, vec![], false, 10, None, false, None).await?;
                 }
             },
             Some(1) => {
@@ -830,18 +957,43 @@ async fn cmd_run(
     max_loops: usize,
     tools_kit: Option<String>,
     dream: bool,
+    system_file: Option<String>,
 ) -> Result<()> {
     use nodestor_inference::pipeline::{ActivationSteeringConfig, InferenceConfig, InferencePipeline};
     use nodestor_inference::lora_core::LoraBank;
     use nodestor_inference::tool_registry::{ToolKit, ToolRegistry};
     use nodestor_inference::agent_loop::{AgentExecutionLoop, AgentLoopConfig, TerminationReason};
+    use nodestor_inference::system_prompt_builder::{SystemPrompt, resolve_prompt_path};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::time::Instant;
     use std::io::Write;
 
+    // System Prompt resolution: --system > --system-file > --profile
+    // --system-file carrega um .sp compilado como system prompt
+    let file_system: Option<String> = if system.is_none() {
+        system_file.and_then(|name| {
+            let path = resolve_prompt_path(&name);
+            match SystemPrompt::load(&path) {
+                Ok(sp) => {
+                    let compiled = sp.compile();
+                    println!("{}📄 System file: '{}' carregado ({} tokens estimados){}",
+                             CLR_CYAN, sp.name, compiled.len() / 4, CLR_RESET);
+                    Some(compiled)
+                }
+                Err(e) => {
+                    eprintln!("{}[WARN] Erro ao carregar --system-file: {}{}",
+                              CLR_YELLOW, e, CLR_RESET);
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+
     // System Prompt = "Bloco Zero" que governa a forma de pensar do modelo.
-    let system_prompt = resolve_system(system, profile);
+    let system_prompt = resolve_system(system, profile).or(file_system);
     let effective_prompt = build_chat_prompt(system_prompt.as_deref(), prompt);
 
     println!("\n{} NodeStor Run — Inferência local direta (sem servidor)\n{}{}",
@@ -1278,7 +1430,7 @@ async fn cmd_latency(model_path: Option<String>) -> Result<()> {
     };
 
     // Mede com um prompt curto padrão (32 tokens). Reaproveita o caminho real.
-    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0, false, false, vec![], false, 1, None, false).await
+    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0, false, false, vec![], false, 1, None, false, None).await
 }
 
 fn print_logo() {
@@ -1988,5 +2140,333 @@ async fn cmd_bench_sts(path: &str) -> Result<()> {
     println!("⏱️ Tempo: {:.2} ms", elapsed.as_secs_f64() * 1000.0);
     println!("📦 Tensores pré-carregados entregues: {}", num_blocks);
     println!("\n✅ STS finalizado com sucesso!");
+    Ok(())
+}
+
+// ─── cmd_prompt: Editor Dinâmico de System Prompts Empresariais ──────────────
+
+async fn cmd_prompt(subcmd: PromptCommands) -> Result<()> {
+    use nodestor_inference::system_prompt_builder::{
+        PromptSection, PromptTemplate, SystemPrompt, resolve_prompt_path,
+    };
+
+    match subcmd {
+        PromptCommands::New { template, name, company, output } => {
+            let tmpl = PromptTemplate::from_str(&template).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Template '{}' não encontrado. Use: nodestor prompt templates",
+                    template
+                )
+            })?;
+
+            let mut sp = tmpl.build(company.as_deref());
+
+            let out_path = output
+                .map(|p| std::path::PathBuf::from(p))
+                .unwrap_or_else(|| resolve_prompt_path(&name));
+
+            sp.save(&out_path)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let (active, total) = sp.section_stats();
+            println!(
+                "\n{}╔══════════════════════════════════════════════════════════════════╗{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!(
+                "{}║  System Prompt criado com sucesso!                               ║{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!(
+                "{}╚══════════════════════════════════════════════════════════════════╝{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!("\n  {}Nome     :{} {}", CLR_GRAY, CLR_RESET, sp.name);
+            println!("  {}Template :{} {}", CLR_GRAY, CLR_RESET, template);
+            println!("  {}Seções   :{} {}/{} ativas", CLR_GRAY, CLR_RESET, active, total);
+            println!("  {}Tokens   :{} ~{} estimados", CLR_GRAY, CLR_RESET, sp.estimated_tokens());
+            println!("  {}Arquivo  :{} {}", CLR_GRAY, CLR_RESET, out_path.display());
+            println!("\n  Próximos passos:");
+            println!("    nodestor prompt show {}", name);
+            println!("    nodestor prompt edit {} --section identity --content \"...\"", name);
+            println!("    nodestor prompt compile {}", name);
+            println!("    nodestor run --model modelo.gguf --system-file {} \"Olá!\"", name);
+        }
+
+        PromptCommands::Show { file, compiled } => {
+            let path = resolve_prompt_path(&file);
+            let sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if compiled {
+                println!("{}", sp.compile());
+                return Ok(());
+            }
+
+            let (active, total) = sp.section_stats();
+            println!(
+                "\n{}╔══════════════════════════════════════════════════════════════════════╗{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!("{}║  {:<68}║{}", CLR_CYAN, sp.name, CLR_RESET);
+            println!(
+                "{}║  {:<68}║{}",
+                CLR_CYAN,
+                format!(
+                    "use_case: {} | model: {}",
+                    sp.meta.use_case, sp.meta.target_model
+                ),
+                CLR_RESET
+            );
+            println!(
+                "{}╚══════════════════════════════════════════════════════════════════════╝{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!(
+                "\n  {}Seções{}: {}/{} ativas  |  ~{} tokens estimados",
+                CLR_GRAY, CLR_RESET,
+                active, total,
+                sp.estimated_tokens()
+            );
+            if let Some(budget) = sp.meta.token_budget {
+                println!("  {}Orçamento de tokens:{} {}", CLR_GRAY, CLR_RESET, budget);
+            }
+            println!();
+            println!("  {}Prio  ID{:<22} Tag{:<28} Status  Título{}", CLR_GRAY, "", "", CLR_RESET);
+            println!("  {}", "─".repeat(80));
+            for section in sp.sections_sorted() {
+                let status = if section.enabled {
+                    format!("{}● ATIVA{}", CLR_GREEN, CLR_RESET)
+                } else {
+                    format!("{}○ DESAB{}", CLR_YELLOW, CLR_RESET)
+                };
+                println!(
+                    "  {:>4}  {:<24} {:<30} {}  {}",
+                    section.priority,
+                    section.id,
+                    if section.tag.is_empty() { "(sem tag)" } else { &section.tag },
+                    status,
+                    section.title
+                );
+            }
+            println!();
+        }
+
+        PromptCommands::Compile { file, output } => {
+            let path = resolve_prompt_path(&file);
+            let sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let compiled = sp.compile();
+
+            if let Some(out) = output {
+                std::fs::write(&out, &compiled)
+                    .map_err(|e| anyhow::anyhow!("Erro ao salvar: {}", e))?;
+                println!("{}✓ Compilado para:{} {} ({} chars, ~{} tokens)",
+                         CLR_GREEN, CLR_RESET, out, compiled.len(), compiled.len() / 4);
+            } else {
+                println!("{}", compiled);
+            }
+        }
+
+        PromptCommands::Edit { file, section, content } => {
+            let path = resolve_prompt_path(&file);
+            let mut sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if let Some(s) = sp.get_section_mut(&section) {
+                s.content = content;
+                sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+                println!("{}✓ Seção '{}' atualizada em '{}'.{}",
+                         CLR_GREEN, section, path.display(), CLR_RESET);
+            } else {
+                anyhow::bail!(
+                    "Seção '{}' não encontrada. IDs disponíveis: {}",
+                    section,
+                    sp.sections.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+
+        PromptCommands::Toggle { file, section, enable } => {
+            let path = resolve_prompt_path(&file);
+            let mut sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if sp.toggle_section(&section, enable) {
+                sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let status = if enable {
+                    format!("{}ATIVADA{}", CLR_GREEN, CLR_RESET)
+                } else {
+                    format!("{}DESATIVADA{}", CLR_YELLOW, CLR_RESET)
+                };
+                println!("✓ Seção '{}' → {}", section, status);
+            } else {
+                anyhow::bail!("Seção '{}' não encontrada.", section);
+            }
+        }
+
+        PromptCommands::Remove { file, section } => {
+            let path = resolve_prompt_path(&file);
+            let mut sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if sp.remove_section(&section) {
+                sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+                println!("{}✓ Seção '{}' removida.{}", CLR_GREEN, section, CLR_RESET);
+            } else {
+                anyhow::bail!("Seção '{}' não encontrada.", section);
+            }
+        }
+
+        PromptCommands::Add { file, id, tag, title, content, priority } => {
+            let path = resolve_prompt_path(&file);
+            let mut sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            sp.upsert_section(PromptSection::new(&id, &tag, &title, &content, priority));
+            sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("{}✓ Seção '{}' adicionada (prioridade: {}).{}", CLR_GREEN, id, priority, CLR_RESET);
+        }
+
+        PromptCommands::Templates => {
+            println!("\n{}  TEMPLATES DISPONÍVEIS — nodestor prompt new --template <nome>{}", CLR_CYAN, CLR_RESET);
+            println!("  {}", "─".repeat(70));
+            for (name, desc) in PromptTemplate::all_names() {
+                println!("  {}{}:{:<20}{} {}", CLR_GREEN, name, "", CLR_RESET, desc);
+            }
+            println!("\n  Uso: nodestor prompt new --template enterprise --name minha_empresa --company \"ACME\"");
+        }
+
+        PromptCommands::Analyze { file } => {
+            let path = resolve_prompt_path(&file);
+            let sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let (active, total) = sp.section_stats();
+            let tokens = sp.estimated_tokens();
+            let budget = sp.meta.token_budget.unwrap_or(200_000);
+            let budget_pct = (tokens as f64 / budget as f64 * 100.0).min(100.0);
+
+            println!(
+                "\n{}╔══════════════════════════════════════════════════════════════╗{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!("{}║  ANÁLISE: {:<51}║{}", CLR_CYAN, sp.name, CLR_RESET);
+            println!(
+                "{}╚══════════════════════════════════════════════════════════════╝{}",
+                CLR_CYAN, CLR_RESET
+            );
+            println!("\n  {}Seções ativas  :{} {}/{}", CLR_GRAY, CLR_RESET, active, total);
+            println!("  {}Tokens estimados:{} {} / {} ({:.1}% do orçamento)",
+                     CLR_GRAY, CLR_RESET, tokens, budget, budget_pct);
+            println!("  {}Criado em       :{} {}", CLR_GRAY, CLR_RESET, sp.meta.created);
+            println!("  {}Modelo alvo     :{} {}", CLR_GRAY, CLR_RESET, sp.meta.target_model);
+            println!("  {}Caso de uso     :{} {}", CLR_GRAY, CLR_RESET, sp.meta.use_case);
+
+            // Cobertura de seções críticas
+            let critical_ids = ["identity", "behavioral_rules", "refusal_policy", "knowledge_limits"];
+            let section_ids: Vec<&str> = sp.sections.iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.id.as_str())
+                .collect();
+
+            println!("\n  {}Cobertura de seções críticas:{}", CLR_GRAY, CLR_RESET);
+            for cid in &critical_ids {
+                if section_ids.contains(cid) {
+                    println!("    {}[✓]{} {}", CLR_GREEN, CLR_RESET, cid);
+                } else {
+                    println!("    {}[✗]{} {} — {}FALTANDO{}", CLR_YELLOW, CLR_RESET, cid, CLR_YELLOW, CLR_RESET);
+                }
+            }
+
+            // Recomendações
+            let mut recs: Vec<&str> = Vec::new();
+            if !section_ids.contains(&"knowledge_limits") {
+                recs.push("Adicione uma seção 'knowledge_limits' para gerenciar expectativas sobre limitações do modelo");
+            }
+            if !section_ids.contains(&"output_format") {
+                recs.push("Adicione uma seção 'output_format' para controlar formato e estrutura das respostas");
+            }
+            if tokens > 2000 {
+                recs.push("Prompt longo (>2000 tokens) — considere desativar seções não essenciais para modelos locais menores");
+            }
+
+            if !recs.is_empty() {
+                println!("\n  {}Recomendações:{}", CLR_YELLOW, CLR_RESET);
+                for r in recs {
+                    println!("    → {}", r);
+                }
+            } else {
+                println!("\n  {}✓ Cobertura completa — nenhuma recomendação crítica.{}", CLR_GREEN, CLR_RESET);
+            }
+            println!();
+        }
+
+        PromptCommands::Enhance { file, section: section_id, model, temperature } => {
+            let path = resolve_prompt_path(&file);
+            let mut sp = SystemPrompt::load(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let original_content = sp.get_section(&section_id)
+                .map(|s| s.content.clone())
+                .ok_or_else(|| anyhow::anyhow!("Seção '{}' não encontrada.", section_id))?;
+
+            let enhancement_prompt = format!(
+                "You are an expert at writing enterprise-grade AI system prompts. \
+Your task is to improve the following system prompt section to be more specific, \
+professional, unambiguous, and effective for enterprise deployment.\n\n\
+Current section content:\n{}\n\n\
+Write ONLY the improved section content. No introduction, no explanation, no extra text. \
+Preserve the formatting style (bullet points if present). Make it more specific and actionable.",
+                original_content
+            );
+
+            println!("{}🤖 Aprimorando seção '{}' com o modelo local...{}", CLR_CYAN, section_id, CLR_RESET);
+            println!("{}   Modelo: {} | Temperatura: {:.2}{}", CLR_GRAY, model, temperature, CLR_RESET);
+
+            // Reutiliza cmd_run como gerador — captura a saída e atualiza a seção
+            // Abordagem inline: gera via pipeline diretamente
+            use nodestor_inference::pipeline::{InferenceConfig, InferencePipeline};
+            use nodestor_inference::cpu_reference::CpuModelConfig;
+
+            let model_path = if std::path::Path::new(&model).exists() {
+                model.clone()
+            } else {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".nodestor")
+                    .join("models")
+                    .join(&model)
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            let config = InferenceConfig {
+                model_path: model_path.clone(),
+                prefetch_depth: 2,
+                buffer_size: 512,
+            };
+
+            match InferencePipeline::init(config) {
+                Ok(mut pipeline) => {
+                    match pipeline.generate(&enhancement_prompt, 512, None, temperature).await {
+                        Ok((enhanced_text, _stats)) => {
+                            if let Some(s) = sp.get_section_mut(&section_id) {
+                                s.content = enhanced_text.trim().to_string();
+                            }
+                            sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
+                            println!("{}✓ Seção '{}' aprimorada e salva.{}", CLR_GREEN, section_id, CLR_RESET);
+                            println!("  Use 'nodestor prompt show {}' para revisar.", file);
+                        }
+                        Err(e) => {
+                            eprintln!("{}[ERRO] Falha na geração: {}{}",
+                                      CLR_YELLOW, e, CLR_RESET);
+                            eprintln!("  A seção original foi preservada.");
+                        }
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "Falha ao inicializar pipeline com '{}': {}. \
+Verifique se o modelo está em ~/.nodestor/models/ ou forneça o caminho completo.",
+                        model, e
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
