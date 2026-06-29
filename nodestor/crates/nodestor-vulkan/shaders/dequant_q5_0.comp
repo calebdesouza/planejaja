@@ -1,0 +1,69 @@
+#version 450
+
+// Q5_0 Dequantization Shader
+// Block format: [d:FP16 2B][qh:4B][qs:16B] = 22 bytes per 32 weights
+// out[j]    = ((qs[j]&0xF | (qh>>j    &1)<<4) - 16) * d   j=0..15
+// out[j+16] = ((qs[j]>>4  | (qh>>(j+16)&1)<<4) - 16) * d
+
+// One invocation per (block, pair): gid = block_idx*16 + j, j in 0..15
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint NUM_BLOCKS;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    uint q5_0_data[];
+};
+
+layout(set = 0, binding = 1) buffer OutputBuffer {
+    float f32_data[];
+};
+
+uint get_byte(uint byte_idx) {
+    uint word = q5_0_data[byte_idx / 4u];
+    return (word >> (8u * (byte_idx % 4u))) & 0xFFu;
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return 0.0;
+        return (s != 0u ? -1.0 : 1.0) * 5.960464477539063e-8 * float(m);
+    } else if (e == 31u) {
+        return (m == 0u) ? ((s != 0u) ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    }
+    return (s != 0u ? -1.0 : 1.0) * pow(2.0, float(e) - 15.0) * (1.0 + float(m) / 1024.0);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint block_idx = gid / 16u;
+    uint j = gid % 16u;
+
+    if (block_idx >= pc.NUM_BLOCKS) return;
+
+    uint byte_offset = block_idx * 22u;
+
+    uint d_bits = get_byte(byte_offset) | (get_byte(byte_offset + 1u) << 8u);
+    float d = f16_to_f32(d_bits);
+
+    uint qh = get_byte(byte_offset + 2u)
+            | (get_byte(byte_offset + 3u) << 8u)
+            | (get_byte(byte_offset + 4u) << 16u)
+            | (get_byte(byte_offset + 5u) << 24u);
+
+    uint qs_byte = get_byte(byte_offset + 6u + j);
+
+    uint xh_lo = (qh >> j)         & 1u;
+    uint xh_hi = (qh >> (j + 16u)) & 1u;
+
+    int x0 = int((qs_byte & 0x0Fu) | (xh_lo << 4u)) - 16;
+    int x1 = int((qs_byte >> 4u)   | (xh_hi << 4u)) - 16;
+
+    uint out_offset = block_idx * 32u;
+    f32_data[out_offset + j]        = float(x0) * d;
+    f32_data[out_offset + j + 16u]  = float(x1) * d;
+}

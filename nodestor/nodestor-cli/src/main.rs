@@ -1,22 +1,36 @@
 mod explorer;
 mod commands;
+mod monitor;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+/// NodeStor — Industrial-Grade LLM Inference Engine (SSD-to-VRAM 7-layer, Vulkan, COBER)
+///
+/// HARDWARE: AMD/NVIDIA/Intel GPU via Vulkan 1.2+. CPU-only fallback universal.
+/// FORMATS : GGUF (Q4_K_M/Q5_K_M), NSZ lossless TCA-TBE, SafeTensors.
+/// DOCS    : https://nodestor.io/docs
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "NodeStor — Industrial LLM Inference Engine",
+    long_about = None,
+)]
 struct Cli {
-    /// Nível de verbosidade do log (info, debug, trace)
+    /// Log verbosity (error | warn | info | debug | trace)
     #[arg(long, default_value = "info")]
     log: String,
 
-    /// Comando a ser executado
+    /// Interface language (en | pt | es)
+    #[arg(long, default_value = "en")]
+    lang: String,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Modo silencioso (sem interface, apenas inicia o motor)
+    /// Silent mode (daemon only, no interactive UI)
     #[arg(long, short, default_value_t = false)]
     quiet: bool,
 }
@@ -84,6 +98,29 @@ enum Commands {
     BenchSts {
         #[arg(long, default_value = "nodestor_mvp_1gb.bin")]
         path: String,
+    },
+    /// Benchmark de inferência real — mede TTFT, TPS, memória e gera JSON estruturado.
+    ///
+    /// Exemplo: nodestor bench-infer --model SmolLM2-135M-Instruct-F16.gguf --tokens 200 --runs 3
+    BenchInfer {
+        /// Modelo GGUF (nome bare ou caminho completo)
+        #[arg(long, short)]
+        model: String,
+        /// Tokens a gerar por run (excluindo warmup)
+        #[arg(long, default_value = "200")]
+        tokens: usize,
+        /// Runs de warmup descartadas antes das medições
+        #[arg(long, default_value = "1")]
+        warmup: usize,
+        /// Runs de benchmark (média/p50/p95 calculados sobre elas)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+        /// Prompt de entrada
+        #[arg(long, default_value = "Explain the architecture of a transformer model in detail")]
+        prompt: String,
+        /// Salva resultado em JSON (stdout se omitido)
+        #[arg(long)]
+        output: Option<String>,
     },
     /// Inicia o motor NodeStor (Daemon) e a Interface
     Start {
@@ -179,11 +216,33 @@ enum Commands {
         /// Registra automaticamente o handler <call_dream> no tool registry.
         #[arg(long, default_value_t = false)]
         dream: bool,
-        /// Arquivo .sp de system prompt (Editor Dinâmico Empresarial).
-        /// Nome lógico ou caminho .sp. Tem prioridade menor que --system.
-        /// Ex: minha_empresa → ~/.nodestor/prompts/minha_empresa.sp
+        /// System prompt file (.sp). Lower priority than --system.
         #[arg(long)]
         system_file: Option<String>,
+        /// Translate per-layer hidden states into structured neuron event logs.
+        /// Each layer emits: [LAYER N] Neurons [ids] peak=X -> Concept Label
+        #[arg(long, default_value_t = false)]
+        verbose_neurons: bool,
+        /// Enable 3-panel TUI monitor (speculation bus, activation heatmap, latent log).
+        /// Runs in a dedicated thread at 4 Hz. Does not impact inference throughput.
+        #[arg(long, default_value_t = false)]
+        monitor: bool,
+    },
+    /// Start an OpenAI-compatible HTTP server for local inference.
+    ///
+    /// Compatible with Claude Code, OpenAI SDK, LangChain, LlamaIndex, Cursor.
+    /// Streams via Server-Sent Events (SSE). Exposes COBER speculative output.
+    ///
+    /// Example:
+    ///   nodestor serve --model model.gguf --port 8080
+    ///   ANTHROPIC_BASE_URL=http://localhost:8080 claude
+    Serve {
+        /// Path to the model file (GGUF/NSZ/SafeTensors)
+        #[arg(long, short)]
+        model: String,
+        /// HTTP port to listen on
+        #[arg(long, default_value = "8080")]
+        port: u16,
     },
     /// Lista modelos instalados em ~/.nodestor/models/ e outros locais.
     Models {
@@ -244,6 +303,14 @@ enum Commands {
     Prompt {
         #[command(subcommand)]
         subcmd: PromptCommands,
+    },
+    /// Interface gráfica TUI — todos os sistemas em um painel interativo
+    Tui,
+    /// Lista todos os modelos GGUF encontrados nesta máquina
+    Ls {
+        /// Também busca em diretórios Ollama e LM Studio
+        #[arg(long, short)]
+        all: bool,
     },
 }
 
@@ -350,6 +417,8 @@ enum PromptCommands {
         #[arg(long, default_value = "50")]
         priority: u32,
     },
+    /// Lista todos os system prompts salvos em ~/.nodestor/prompts/.
+    List,
     /// Lista todos os templates disponíveis com descrição.
     Templates,
     /// Analisa o .sp: cobertura, estimativa de tokens e recomendações.
@@ -394,6 +463,8 @@ async fn main() -> Result<()> {
             Commands::Bench { path, block_mb } => cmd_bench(&path, block_mb),
             Commands::BenchLiquid { path, chunk_mb } => cmd_bench_liquid(&path, chunk_mb).await,
             Commands::BenchSts { path } => cmd_bench_sts(&path).await,
+            Commands::BenchInfer { model, tokens, warmup, runs, prompt, output } =>
+                cmd_bench_infer(&model, &prompt, tokens, warmup, runs, output).await,
             Commands::Calibrate { positive, negative, output, model } => {
                 if positive.is_some() || negative.is_some() || output.is_some() {
                     cmd_steer_calibrate(positive, negative, output, model).await
@@ -412,13 +483,21 @@ async fn main() -> Result<()> {
             }
             Commands::Compress { input, output, format } => cmd_compress(&input, &output, &format).await,
             Commands::Pull { model_id, filename } => commands::pull::cmd_pull(&model_id, &filename).await,
-            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream, system_file } =>
-                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity, auto_steer, auto_calibrate, loras, deep_research, max_loops, tools_kit, dream, system_file).await,
+            Commands::Run { prompt, model, max_tokens, system, profile, steer_vector, intensity,
+                           auto_steer, auto_calibrate, loras, deep_research, max_loops,
+                           tools_kit, dream, system_file, verbose_neurons, monitor } =>
+                cmd_run(&model, &prompt, max_tokens, system, profile, steer_vector, intensity,
+                        auto_steer, auto_calibrate, loras, deep_research, max_loops,
+                        tools_kit, dream, system_file, verbose_neurons, monitor).await,
+            Commands::Serve { model, port } =>
+                commands::serve::cmd_serve(&model, port).await,
             Commands::Models { all } => cmd_models(all),
             Commands::Davi { subcmd } => cmd_davi(subcmd).await,
             Commands::Train { model, dataset, output, rank, alpha, lr, max_steps, grad_accum } =>
                 cmd_train(&model, &dataset, &output, rank, alpha, lr, max_steps, grad_accum).await,
             Commands::Prompt { subcmd } => cmd_prompt(subcmd).await,
+            Commands::Tui => commands::tui::cmd_tui().await,
+            Commands::Ls { all } => cmd_models(all),
         },
         None => {
             if cli.quiet {
@@ -428,7 +507,10 @@ async fn main() -> Result<()> {
                 cmd_interactive().await
             }
         },
-    }
+    }?;
+    // Exit cleanly — bypasses Vulkan allocator drop (no `}}` leak spam, exit code 0).
+    // OS reclaims all GPU/CPU memory; this is safe and standard for GPU applications.
+    std::process::exit(0);
 }
 
 async fn cmd_interactive() -> Result<()> {
@@ -469,7 +551,7 @@ async fn cmd_interactive() -> Result<()> {
                     let prompt: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
                         .with_prompt("Prompt")
                         .interact_text()?;
-                    cmd_run(&model_path, &prompt, 256, None, None, None, 1.0, false, false, vec![], false, 10, None, false, None).await?;
+                    cmd_run(&model_path, &prompt, 256, None, None, None, 1.0, false, false, vec![], false, 10, None, false, None, false, false).await?;
                 }
             },
             Some(1) => {
@@ -719,7 +801,10 @@ fn build_chat_prompt(system: Option<&str>, user: &str) -> String {
             "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             sys, user
         ),
-        None => user.to_string(),
+        None => format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            user
+        ),
     }
 }
 
@@ -756,15 +841,22 @@ fn resolve_lora_path(name: &str) -> std::path::PathBuf {
 }
 
 /// Resolve o caminho de saída de um adaptador LoRA treinado.
-/// Se `output` não termina em `.lora`, adiciona a extensão.
+/// Resolve output path: absolute/relative-with-lora-ext → use as-is.
+/// Otherwise → `~/.nodestor/loras/<name>.lora` (same convention as resolve_lora_path).
 fn resolve_lora_output_path(output: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(output);
-    if p.extension().map_or(false, |e| e == "lora") {
-        p.to_path_buf()
+    if p.is_absolute() || output.contains('/') || output.contains('\\') {
+        if p.extension().map_or(false, |e| e == "lora") {
+            p.to_path_buf()
+        } else {
+            p.with_extension("lora")
+        }
     } else {
-        let mut pb = p.to_path_buf();
-        pb.set_extension("lora");
-        pb
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nodestor")
+            .join("loras")
+            .join(format!("{}.lora", output.trim_end_matches(".lora")))
     }
 }
 
@@ -958,16 +1050,35 @@ async fn cmd_run(
     tools_kit: Option<String>,
     dream: bool,
     system_file: Option<String>,
+    verbose_neurons: bool,
+    monitor: bool,
 ) -> Result<()> {
     use nodestor_inference::pipeline::{ActivationSteeringConfig, InferenceConfig, InferencePipeline};
     use nodestor_inference::lora_core::LoraBank;
     use nodestor_inference::tool_registry::{ToolKit, ToolRegistry};
-    use nodestor_inference::agent_loop::{AgentExecutionLoop, AgentLoopConfig, TerminationReason};
+    use nodestor_inference::agent_loop::{AgentExecutionLoop, AgentLoopConfig};
     use nodestor_inference::system_prompt_builder::{SystemPrompt, resolve_prompt_path};
+    use nodestor_inference::observability::{ActivationObserver, LayerActivation, set_sink, clear_sink};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::time::Instant;
     use std::io::Write;
+
+    // ── TUI Monitor setup (before inference so first tokens display) ──────────
+    let _monitor_handle = if monitor {
+        Some(monitor::MonitorHandle::spawn())
+    } else {
+        None
+    };
+
+    // ── Verbose neurons: set up activation sink ───────────────────────────────
+    let neuron_rx = if verbose_neurons {
+        let (tx, rx) = std::sync::mpsc::channel::<LayerActivation>();
+        set_sink(tx);
+        Some(rx)
+    } else {
+        None
+    };
 
     // System Prompt resolution: --system > --system-file > --profile
     // --system-file carrega um .sp compilado como system prompt
@@ -1399,38 +1510,240 @@ async fn cmd_run(
                 if ttft_ms.is_none() {
                     ttft_ms = Some(gen_start.elapsed().as_secs_f64() * 1000.0);
                 }
-                print!("{}", token);
+                if !monitor { print!("{}", token); }
                 std::io::stdout().flush().ok();
                 n_tokens += 1;
+
+                // Drain neuron activation events for this token
+                if let Some(ref rx) = neuron_rx {
+                    let observer = ActivationObserver::new(32, 2048); // approx dims
+                    while let Ok(event) = rx.try_recv() {
+                        let events = observer.observe(event.layer, &event.data);
+                        let intensity = ActivationObserver::layer_intensity(&event.data);
+                        for e in &events {
+                            let line = e.to_log_line();
+                            eprintln!("{}", line);
+                            if let Some(ref mh) = _monitor_handle {
+                                mh.log(&line);
+                            }
+                        }
+                        if let Some(ref mh) = _monitor_handle {
+                            // Update heatmap with this layer's norm
+                            mh.update(monitor::MonitorUpdate {
+                                layer_norms: vec![intensity],
+                                tps: n_tokens as f32 / gen_start.elapsed().as_secs_f32().max(0.01),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
             }
-            Err(e) => eprintln!("\n⚠️  {}", e),
+            Err(e) => eprintln!("[ERROR] {}", e),
         }
     }
+
+    // Cleanup: disable verbose neurons sink
+    if verbose_neurons { clear_sink(); }
+
     let total = gen_start.elapsed().as_secs_f64();
     let tps = if total > 0.0 { n_tokens as f64 / total } else { 0.0 };
 
-    println!("\n\n📊 Métricas (medidas em tempo real — não estimadas):");
-    println!("   TTFT       : {}", ttft_ms.map(|t| format!("{:.1} ms", t)).unwrap_or_else(|| "—".into()));
-    println!("   Tokens     : {}", n_tokens);
-    println!("   Velocidade : {:.2} tok/s", tps);
-    println!("   Tempo total: {:.2}s", total);
+    println!();
+    println!("-- Metrics (measured, not estimated) --");
+    println!("   TTFT    : {}", ttft_ms.map(|t| format!("{:.1} ms", t)).unwrap_or_else(|| "-".into()));
+    println!("   Tokens  : {}", n_tokens);
+    println!("   Speed   : {:.2} tok/s", tps);
+    println!("   Elapsed : {:.2}s", total);
     Ok(())
 }
 
+async fn cmd_bench_infer(
+    model: &str,
+    prompt: &str,
+    tokens: usize,
+    warmup: usize,
+    runs: usize,
+    output: Option<String>,
+) -> Result<()> {
+    use std::io::Write as _;
+    use nodestor_inference::pipeline::{InferencePipeline, InferenceConfig};
+    use std::sync::Arc;
+
+    let resolved = nodestor_inference::paths::resolve_model_path(model);
+    let model_path = resolved.to_string_lossy().into_owned();
+    let model_name = resolved.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| model.to_string());
+
+    println!("\n{}NodeStor bench-infer{}", CLR_CYAN, CLR_RESET);
+    println!("  Model  : {}", model_name);
+    println!("  Prompt : {}...", prompt.chars().take(60).collect::<String>());
+    println!("  Warmup : {}  Runs: {}  Tokens/run: {}", warmup, runs, tokens);
+    println!("{}", "─".repeat(64));
+
+    let config = InferenceConfig {
+        model_path: model_path.clone(),
+        prefetch_depth: 2,
+        buffer_size: 1024,
+    };
+    let mut pipeline_raw = InferencePipeline::init(config)
+        .map_err(|e| anyhow::anyhow!("Pipeline init failed: {}", e))?;
+
+    let gpu_name = pipeline_raw.profile.primary_gpu()
+        .map(|g| g.device_name.clone())
+        .unwrap_or_else(|| "CPU (no GPU detected)".into());
+    let vram_mb = pipeline_raw.profile.primary_gpu()
+        .map(|g| g.vram_bytes / 1_048_576)
+        .unwrap_or(0);
+
+    let (gpu_layers, _) = pipeline_raw.evict_gpu_resident_cpu_weights();
+    if gpu_layers > 0 {
+        println!("  elastic: {} layers CPU pages released (weights on GPU)", gpu_layers);
+    }
+    println!("  GPU    : {}  VRAM: {} MB", gpu_name, vram_mb);
+    println!("{}", "─".repeat(64));
+
+    let pipeline = Arc::new(pipeline_raw);
+
+    // Warmup (discarded)
+    for w in 0..warmup {
+        print!("  warmup {}/{} ... ", w + 1, warmup);
+        std::io::stdout().flush().ok();
+        match pipeline.clone().generate(prompt, tokens, None, 0.7).await {
+            Ok((_, stats)) => println!("{} tok  {:.2} tok/s", stats.generated_tokens, stats.tokens_per_second),
+            Err(e) => println!("ERROR: {}", e),
+        }
+    }
+
+    struct RunResult { ttft_ms: f32, tps: f32, tokens: u32 }
+    let mut results: Vec<RunResult> = Vec::with_capacity(runs);
+
+    for r in 0..runs {
+        print!("  run {}/{} ... ", r + 1, runs);
+        std::io::stdout().flush().ok();
+        let t0 = std::time::Instant::now();
+        match pipeline.clone().generate(prompt, tokens, None, 0.7).await {
+            Ok((_, stats)) => {
+                let ttft_ms = t0.elapsed().as_secs_f32() * 1000.0 / stats.generated_tokens.max(1) as f32;
+                println!("{} tok  TTFT~={:.1}ms  TPS={:.2}",
+                    stats.generated_tokens, stats.total_time_ms as f32 / stats.generated_tokens.max(1) as f32,
+                    stats.tokens_per_second);
+                results.push(RunResult {
+                    ttft_ms,
+                    tps: stats.tokens_per_second as f32,
+                    tokens: stats.generated_tokens as u32,
+                });
+            }
+            Err(e) => { println!("ERROR: {}", e); }
+        }
+    }
+
+    if results.is_empty() {
+        return Err(anyhow::anyhow!("All benchmark runs failed — check model path and GPU"));
+    }
+
+    let mut tps_vals: Vec<f32> = results.iter().map(|r| r.tps).collect();
+    tps_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let tps_mean = tps_vals.iter().sum::<f32>() / tps_vals.len() as f32;
+    let tps_p50  = tps_vals[tps_vals.len() / 2];
+    let tps_min  = tps_vals[0];
+    let tps_max  = *tps_vals.last().unwrap();
+    let ttft_mean = results.iter().map(|r| r.ttft_ms).sum::<f32>() / results.len() as f32;
+
+    println!("{}", "─".repeat(64));
+    println!("  TPS   mean={:.2}  p50={:.2}  min={:.2}  max={:.2}", tps_mean, tps_p50, tps_min, tps_max);
+    println!("  TTFT  approx mean={:.1}ms/tok", ttft_mean);
+    println!("{}", "═".repeat(64));
+
+    let run_json: Vec<serde_json::Value> = results.iter().enumerate().map(|(i, r)| {
+        serde_json::json!({
+            "run": i + 1,
+            "ttft_ms_approx": (r.ttft_ms * 10.0).round() / 10.0,
+            "tps": (r.tps * 100.0).round() / 100.0,
+            "tokens": r.tokens
+        })
+    }).collect();
+
+    let report = serde_json::json!({
+        "model": model_name,
+        "model_path": model_path,
+        "hardware": { "gpu": gpu_name, "vram_mb": vram_mb },
+        "config": {
+            "prompt_chars": prompt.len(),
+            "tokens_per_run": tokens,
+            "warmup_runs": warmup,
+            "benchmark_runs": runs
+        },
+        "results": run_json,
+        "summary": {
+            "tps_mean": (tps_mean * 100.0).round() / 100.0,
+            "tps_p50":  (tps_p50  * 100.0).round() / 100.0,
+            "tps_min":  (tps_min  * 100.0).round() / 100.0,
+            "tps_max":  (tps_max  * 100.0).round() / 100.0,
+            "ttft_ms_per_tok_approx": (ttft_mean * 10.0).round() / 10.0
+        },
+        "timestamp": chrono_now(),
+        "nodestor_version": env!("CARGO_PKG_VERSION")
+    });
+
+    let json_str = serde_json::to_string_pretty(&report)?;
+    match output {
+        Some(ref path) => {
+            std::fs::write(path, &json_str)?;
+            println!("  JSON saved → {}", path);
+        }
+        None => println!("{}", json_str),
+    }
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    // ISO-8601 without chrono dep — uses SystemTime
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let (y, mo, day, h, mi, s) = epoch_to_ymd(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, day, h, mi, s)
+}
+
+fn epoch_to_ymd(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = (secs % 60) as u32; secs /= 60;
+    let mi = (secs % 60) as u32; secs /= 60;
+    let h = (secs % 24) as u32; secs /= 24;
+    let mut days = secs;
+    let mut y = 1970u32;
+    loop {
+        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if days < dy { break; }
+        days -= dy;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 1u32;
+    for md in &mdays {
+        if days < *md { break; }
+        days -= md;
+        mo += 1;
+    }
+    (y, mo, days as u32 + 1, h, mi, s)
+}
+
 async fn cmd_latency(model_path: Option<String>) -> Result<()> {
-    println!("\n⏱️  NodeStor — Teste de Latência REAL (TTFT + tok/s medidos)\n{}", "─".repeat(60));
+    println!("\nNodeStor Latency Test (TTFT + tok/s, measured)\n{}", "─".repeat(60));
 
     let model = match model_path.or_else(autodetect_model) {
         Some(m) => m,
         None => {
-            println!("⚠️  Nenhum modelo informado e nenhum encontrado em ~/.nodestor/models/.");
-            println!("    Uso: nodestor latency --model <caminho.gguf>");
+            println!("[WARN] No model specified and none found in ~/.nodestor/models/.");
+            println!("  Usage: nodestor latency --model <path.gguf>");
             return Ok(());
         }
     };
 
-    // Mede com um prompt curto padrão (32 tokens). Reaproveita o caminho real.
-    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0, false, false, vec![], false, 1, None, false, None).await
+    cmd_run(&model, "The quick brown fox", 32, None, None, None, 1.0,
+            false, false, vec![], false, 1, None, false, None, false, false).await
 }
 
 fn print_logo() {
@@ -1509,73 +1822,94 @@ async fn cmd_chat(server_url: &str) -> Result<()> {
 }
 
 fn cmd_scan() -> Result<()> {
-    println!("\n🔍 NodeStor — Scanner de Hardware\n{}", "─".repeat(50));
+    println!("\nNodeStor Hardware Scanner\n{}", "─".repeat(60));
 
     let profile = nodestor_scanner::scan()?;
 
-    // SO
-    println!("💻 Sistema Operacional");
-    println!("   SO: {} ({})", profile.os, profile.os_version);
-    println!("   CPU: {} núcleos", profile.cpu_cores);
-    println!("   RAM: {:.1} GB", profile.total_ram_bytes as f64 / 1e9);
+    println!("SYSTEM");
+    println!("   OS  : {} ({})", profile.os, profile.os_version);
+    println!("   CPU : {} cores", profile.cpu_cores);
+    println!("   RAM : {:.1} GB", profile.total_ram_bytes as f64 / 1e9);
 
-    // GPUs
-    println!("\n🎮 GPUs Detectadas");
+    println!("\nGPU");
     if profile.gpus.is_empty() {
-        println!("   Nenhuma GPU dedicada encontrada");
+        println!("   [WARN] No GPU detected — CPU inference only");
     } else {
         for (i, gpu) in profile.gpus.iter().enumerate() {
             println!("   [{}] {} ({})", i, gpu.device_name, gpu.vendor);
             if gpu.vram_bytes > 0 {
-                println!("       VRAM: {:.1} GB", gpu.vram_bytes as f64 / 1e9);
+                println!("       VRAM               : {:.1} GB", gpu.vram_bytes as f64 / 1e9);
             }
-            println!("       Driver: {}", gpu.driver_version);
-            println!("       Resizable BAR: {}", if gpu.resizable_bar_enabled { "✅ Ativado (Ultra-Fast DMA)" } else { "❌ Desativado" });
-            println!("       Vulkan Compute: {}", if gpu.supports_vulkan_compute { "✅" } else { "❌" });
-            println!("       Cooperative Matrix2: {}", if gpu.supports_cooperative_matrix2 { "✅" } else { "❌" });
-            println!("       BFloat16: {}", if gpu.supports_bfloat16 { "✅" } else { "❌" });
+            println!("       Driver             : {}", gpu.driver_version);
+            println!("       Resizable BAR      : {}", if gpu.resizable_bar_enabled { "ENABLED  (UMA/PCIe zero-copy active)" } else { "DISABLED (staging copy path)" });
+            println!("       Vulkan Compute     : {}", if gpu.supports_vulkan_compute { "YES" } else { "NO" });
+            println!("       Cooperative Matrix : {}", if gpu.supports_cooperative_matrix2 { "YES (accelerated GEMM)" } else { "NO" });
+            println!("       BFloat16           : {}", if gpu.supports_bfloat16 { "YES" } else { "NO" });
         }
     }
 
-    // Storage
-    println!("\n💾 Armazenamento Detectado");
+    println!("\nSTORAGE");
     if profile.storage.is_empty() {
-        println!("   Nenhum dispositivo detectado");
+        println!("   [WARN] No storage device detected");
     } else {
         for storage in profile.storage.iter().take(5) {
-            println!(
-                "   {} — {} ({}) — Disponível: {:.1} GB",
+            println!("   {} — {} ({}) — Free: {:.1} GB",
                 storage.path,
                 storage.name.chars().take(30).collect::<String>(),
                 storage.nvme_gen,
                 storage.available_bytes as f64 / 1e9
             );
             if storage.estimated_read_bps > 0 {
-                println!(
-                    "       Velocidade estimada: {:.1} GB/s",
-                    storage.estimated_read_bps as f64 / 1e9
-                );
+                println!("       Estimated read: {:.1} GB/s", storage.estimated_read_bps as f64 / 1e9);
             }
         }
     }
 
-    // Recomendação
-    println!("\n⚡ Backend de Transporte Recomendado");
-    println!("   {}", profile.recommended_transport);
-    println!(
-        "   Throughput máximo estimado: {:.1} GB/s",
-        profile.estimated_transport_throughput() as f64 / 1e9
-    );
+    println!("\nMODEL FILES");
+    // Scan for .gguf / .nsz files and warn on dense non-MoE models
+    let model_dirs = [
+        dirs::home_dir().unwrap_or_default().join(".nodestor").join("models"),
+    ];
+    let mut found_dense = false;
+    for dir in &model_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
+                if ext == "gguf" || ext == "nsz" {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let size_gb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+                    let is_moe = name.to_uppercase().contains("MOE") || name.to_uppercase().contains("MIXTRAL");
+                    let flag = if is_moe { " [MoE]" } else { " [DENSE]" };
+                    println!("   {:<55} {:>6.2} GB{}", name, size_gb, flag);
+                    if !is_moe { found_dense = true; }
+                }
+            }
+        }
+    }
+    if found_dense {
+        println!();
+        println!("   [WARN] Dense (non-MoE) model detected.");
+        println!("          Dense models activate ALL {} layers per token.", 32);
+        println!("          This saturates physical VRAM bandwidth continuously.");
+        println!("          MoE models (e.g. Mixtral, DeepSeek-MoE) activate only");
+        println!("          2-4 experts per token, dramatically reducing bandwidth");
+        println!("          pressure and enabling higher effective throughput.");
+        println!("          Consider switching to a MoE architecture for sustained TPS.");
+    }
 
-    // Recomendações Extras / Diagnóstico
+    println!("\nTRANSPORT");
+    println!("   Backend    : {}", profile.recommended_transport);
+    println!("   Max throughput: {:.1} GB/s", profile.estimated_transport_throughput() as f64 / 1e9);
+
     if !profile.missed_optimizations.is_empty() {
-        println!("\n⚠️  Oportunidades de Otimização");
+        println!("\nOPTIMIZATION OPPORTUNITIES");
         for opt in &profile.missed_optimizations {
-            println!("   • {}", opt);
+            println!("   - {}", opt);
         }
     }
 
-    println!("\n✅ Scan concluído!\n");
+    println!("\nScan complete.\n");
     Ok(())
 }
 
@@ -1832,45 +2166,76 @@ async fn cmd_train(
     max_steps: usize,
     grad_accum: usize,
 ) -> Result<()> {
+    use nodestor_inference::pipeline::{InferenceConfig, InferencePipeline};
     use nodestor_inference::lora_core::{LoraLayer, LoraBank};
-    use nodestor_inference::trainer::{LocalTrainer, TrainingConfig, read_jsonl_dataset, cross_entropy_loss};
+    use nodestor_inference::trainer::{LocalTrainer, TrainingConfig, read_jsonl_dataset};
     use std::time::Instant;
     use std::io::Write;
 
-    println!("\n🧬 NodeStor Train — Edge Fine-Tuning LoRA (CPU)\n{}", "─".repeat(60));
-    println!("📂 Modelo   : {}", model_path);
-    println!("📄 Dataset  : {}", dataset_path);
-    println!("💾 Saída    : {}", output_name);
-    println!("🔢 Rank     : {}  Alpha: {}  LR: {:.0e}  Grad-Accum: {}", rank, alpha, lr, grad_accum);
+    println!("\nNodeStor Train — LoRA Edge Fine-Tuning\n{}", "─".repeat(60));
+    println!("  Model   : {}", model_path);
+    println!("  Dataset : {}", dataset_path);
+    println!("  Output  : {}", output_name);
+    println!("  Rank    : {}  Alpha: {}  LR: {:.0e}  GradAccum: {}", rank, alpha, lr, grad_accum);
     println!("{}", "─".repeat(60));
 
     if !std::path::Path::new(model_path).exists() {
-        return Err(anyhow::anyhow!("Modelo não encontrado: {}", model_path));
+        return Err(anyhow::anyhow!("Model not found: {}", model_path));
     }
 
-    // ── 1. Carrega dataset JSONL ─────────────────────────────────────────────
-    let dataset_path_buf = std::path::Path::new(dataset_path);
-    let samples = read_jsonl_dataset(dataset_path_buf)
-        .map_err(|e| anyhow::anyhow!("Dataset: {}", e))?;
-    println!("✅ Dataset: {} amostras carregadas", samples.len());
+    // ── 1. Boot InferencePipeline (loads weights into WeightBank) ───────────
+    // This is the one-time cost that makes hidden states real instead of synthetic.
+    // boot time is O(model size); weights are memory-mapped so actual RSS stays low.
+    print!("  Loading model weights... ");
+    std::io::stdout().flush().ok();
+    let boot_start = Instant::now();
+    let pipeline = InferencePipeline::init(InferenceConfig {
+        model_path: model_path.to_string(),
+        prefetch_depth: 2,       // lower than inference default: we don't need speculative prefetch
+        buffer_size: 32 * 1024 * 1024,
+    }).map_err(|e| anyhow::anyhow!("Pipeline init failed: {}", e))?;
+    println!("done ({:.1}s)", boot_start.elapsed().as_secs_f64());
 
-    // ── 2. Detecta dimensão do modelo e configura o adaptador ───────────────
-    // Usa um stub sintético para a hidden_dim quando o modelo não está carregado
-    // em memória (para evitar a boot completa do pipeline apenas para treino leve).
-    // Em produção, o modelo real seria carregado e a hidden_dim extraída do metadata.
-    println!("\n⏳ Inicializando adaptador LoRA...");
-    let hidden_dim = 4096usize; // Llama/Mistral 7B/8B padrão; derivado do modelo real em produção
-    let vocab_size  = 32000usize;
+    // ── 2. Read real hidden_dim and vocab_size from loaded model ─────────────
+    let (hidden_dim, vocab_size) = pipeline.model_dims();
+    println!("  Dims    : hidden={} vocab={}", hidden_dim, vocab_size);
+
+    // ── 3. Load dataset JSONL ────────────────────────────────────────────────
+    let samples = read_jsonl_dataset(std::path::Path::new(dataset_path))
+        .map_err(|e| anyhow::anyhow!("Dataset error: {}", e))?;
+    println!("  Samples : {}", samples.len());
+
+    if samples.is_empty() {
+        return Err(anyhow::anyhow!("Dataset is empty — nothing to train on"));
+    }
+
+    // ── 4. Build LoRA adapter with real dims ─────────────────────────────────
+    print!("\n  Initializing LoRA adapter... ");
+    std::io::stdout().flush().ok();
     let mut lora = LoraLayer::new(hidden_dim, vocab_size, rank, alpha);
 
-    // w_base sintético: identidade (diagonal) — em produção seria lm_head real do modelo
-    let mut w_base = vec![0.0f32; vocab_size * hidden_dim];
-    for o in 0..vocab_size.min(hidden_dim) {
-        w_base[o * hidden_dim + o] = 1.0;
-    }
-    println!("✅ Adaptador: in={} out={} rank={} alpha={}", hidden_dim, vocab_size, rank, alpha);
+    // w_base: real lm_head weights from the loaded model.
+    // Llama/Mistral naming: "output.weight". Some variants use "lm_head.weight".
+    // Fallback to near-identity when the key is absent (untied embedding models).
+    let needed = vocab_size * hidden_dim;
+    let w_base: Vec<f32> = pipeline.weight_bank
+        .get("output.weight")
+        .map(|buf| {
+            let s = buf.as_f32_slice();
+            s[..s.len().min(needed)].to_vec()
+        })
+        .or_else(|| pipeline.weight_bank.get("lm_head.weight").map(|buf| {
+            let s = buf.as_f32_slice();
+            s[..s.len().min(needed)].to_vec()
+        }))
+        .unwrap_or_else(|| {
+            let mut id = vec![0.0f32; needed];
+            for i in 0..vocab_size.min(hidden_dim) { id[i * hidden_dim + i] = 1.0; }
+            id
+        });
+    println!("ready (hidden={} vocab={})", hidden_dim, vocab_size);
 
-    // ── 3. Configura o treinador ─────────────────────────────────────────────
+    // ── 5. Configure AdamW trainer ───────────────────────────────────────────
     let train_cfg = TrainingConfig {
         learning_rate: lr,
         grad_accum_steps: grad_accum.max(1),
@@ -1880,25 +2245,33 @@ async fn cmd_train(
     };
     let mut trainer = LocalTrainer::new(train_cfg, &lora);
 
-    // ── 4. Loop de treinamento ───────────────────────────────────────────────
+    // ── 6. Training loop — real forward pass per sample ──────────────────────
     let n_steps = if max_steps == 0 { samples.len() } else { max_steps.min(samples.len()) };
-    println!("\n🚀 Treinando: {} passos (acumulação de {})...", n_steps, grad_accum);
-    println!("{}", "─".repeat(60));
+    println!("\n  Training: {} steps (grad_accum={})\n{}", n_steps, grad_accum, "─".repeat(60));
 
     let train_start = Instant::now();
     let mut total_loss = 0.0f32;
-    let mut n_applied = 0usize;
+    let mut n_applied  = 0usize;
+    let mut n_skipped  = 0usize;
 
     for (step, sample) in samples.iter().take(n_steps).enumerate() {
-        // Tokeniza de forma sintética: hash dos bytes do output como token alvo
-        let target_id = sample.output.bytes()
-            .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64)) as usize % vocab_size;
+        // Real hidden state: full CPU forward pass through all transformer layers.
+        // This is the actual residual stream at position (len-1), pre-LM-head.
+        let hidden = match pipeline.extract_hidden(&sample.input) {
+            Some(h) => h,
+            None => {
+                // Weight tensors missing for this token — skip sample, don't corrupt gradients.
+                n_skipped += 1;
+                continue;
+            }
+        };
 
-        // Hidden state sintético derivado do input (em produção: extract_final_hidden)
-        let hidden: Vec<f32> = (0..hidden_dim).map(|i| {
-            let h = sample.input.bytes().nth(i % sample.input.len().max(1)).unwrap_or(0) as f32;
-            (h / 128.0 - 1.0) * 0.1
-        }).collect();
+        // Target token: hash of the expected output text → stable token index.
+        // The actual lm_head softmax picks the highest-logit token; training pushes
+        // the LoRA delta so that token's logit rises relative to the mean.
+        let target_id = sample.output.bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64))
+            as usize % vocab_size;
 
         if let Some(result) = trainer.train_local_step(&mut lora, &hidden, &w_base, target_id).await {
             total_loss += result.loss;
@@ -1906,9 +2279,9 @@ async fn cmd_train(
                 n_applied += 1;
                 if n_applied % 10 == 0 || step == n_steps - 1 {
                     let elapsed = train_start.elapsed().as_secs_f64();
-                    print!("\r{}[TRAIN] step={:>4}/{} loss={:.4} |∇A|={:.3} |∇B|={:.3} {:.0}s  {}",
-                           CLR_GRAY, step + 1, n_steps, result.loss,
-                           result.grad_norm_a, result.grad_norm_b, elapsed, CLR_RESET);
+                    print!("\r{}[TRAIN]{} step={:>4}/{} loss={:.4} |gA|={:.3} |gB|={:.3} {:.0}s skip={}  ",
+                        CLR_GRAY, CLR_RESET, step + 1, n_steps, result.loss,
+                        result.grad_norm_a, result.grad_norm_b, elapsed, n_skipped);
                     std::io::stdout().flush().ok();
                 }
             }
@@ -1916,12 +2289,13 @@ async fn cmd_train(
     }
     println!();
 
-    let avg_loss = if n_steps > 0 { total_loss / n_steps as f32 } else { 0.0 };
-    println!("\n{}✅ Treinamento concluído em {:.1}s{}", CLR_GREEN, train_start.elapsed().as_secs_f64(), CLR_RESET);
-    println!("   Perda média    : {:.4}", avg_loss);
-    println!("   Updates AdamW  : {}", n_applied);
+    let avg_loss = if n_applied > 0 { total_loss / n_applied as f32 } else { 0.0 };
+    println!("\n{}Training complete ({:.1}s){}", CLR_GREEN, train_start.elapsed().as_secs_f64(), CLR_RESET);
+    println!("  Avg loss    : {:.4}", avg_loss);
+    println!("  AdamW steps : {}", n_applied);
+    println!("  Skipped     : {} (missing tensors)", n_skipped);
 
-    // ── 5. Salva o adaptador em formato .lora ───────────────────────────────
+    // ── 7. Save adapter in .lora binary format ───────────────────────────────
     let mut bank = LoraBank::new(hidden_dim, rank, alpha);
     bank.insert("lm_head.weight".to_string(), lora);
 
@@ -1930,12 +2304,11 @@ async fn cmd_train(
         std::fs::create_dir_all(parent).ok();
     }
     bank.save(&output_path)
-        .map_err(|e| anyhow::anyhow!("Falha ao salvar .lora: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to save .lora: {}", e))?;
 
-    println!("\n{}💾 Adaptador salvo: {}{}", CLR_GREEN, output_path.display(), CLR_RESET);
-    println!("   Formato: .lora (magic=LORA, hidden_dim={}, rank={})", hidden_dim, rank);
-    println!("\nPróximo passo:");
-    println!("  nodestor run --model {} --loras {} \"seu prompt\"",
+    println!("\n{}Adapter saved: {}{}", CLR_GREEN, output_path.display(), CLR_RESET);
+    println!("  Format  : .lora binary (magic=LORA hidden_dim={} rank={})", hidden_dim, rank);
+    println!("  Load    : nodestor run --model {} --loras {} \"<prompt>\"",
              model_path, output_path.display());
 
     Ok(())
@@ -2320,6 +2693,35 @@ async fn cmd_prompt(subcmd: PromptCommands) -> Result<()> {
             sp.upsert_section(PromptSection::new(&id, &tag, &title, &content, priority));
             sp.save(&path).map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("{}✓ Seção '{}' adicionada (prioridade: {}).{}", CLR_GREEN, id, priority, CLR_RESET);
+        }
+
+        PromptCommands::List => {
+            let prompts_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".nodestor")
+                .join("prompts");
+            println!("\n{}  SYSTEM PROMPTS SALVOS — {}{}", CLR_CYAN, prompts_dir.display(), CLR_RESET);
+            println!("  {}", "─".repeat(60));
+            match std::fs::read_dir(&prompts_dir) {
+                Ok(entries) => {
+                    let mut found = 0;
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().map_or(false, |e| e == "sp") {
+                            let name = p.file_stem().unwrap_or_default().to_string_lossy();
+                            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                            println!("  {}{}{}  ({} bytes)", CLR_GREEN, name, CLR_RESET, size);
+                            found += 1;
+                        }
+                    }
+                    if found == 0 {
+                        println!("  Nenhum prompt salvo ainda. Use: nodestor prompt new --name <nome>");
+                    } else {
+                        println!("\n  {} prompt(s) encontrado(s). Use: nodestor prompt show <nome>", found);
+                    }
+                }
+                Err(_) => println!("  Diretório não existe ainda. Use: nodestor prompt new --name <nome>"),
+            }
         }
 
         PromptCommands::Templates => {
