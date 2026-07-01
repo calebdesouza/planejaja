@@ -804,6 +804,8 @@ pub fn gpu_forward_batch(
         }
     }
 
+    engine.reset_batch_pool();
+
     // ── 3. Final norm + LM head ────────────────────────────────────────────────
     let out_norm = match wb.get("output_norm.weight") { Some(w) => w, None => return vec![] };
     let x_final = gpu!(engine.rmsnorm(&x, out_norm, b as u32, h as u32, cfg.eps));
