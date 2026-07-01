@@ -1,64 +1,63 @@
 #!/usr/bin/env bash
-# Download benchmark models from HuggingFace
+# Download benchmark models from HuggingFace (public, no auth required)
 # Usage: bash download_models.sh [small|medium|large|all]
-# Default: small (SmolLM2-135M only — fast, fits any GPU)
+#   small  = Gemma-3-1B Q4_K_M  (~700 MB)
+#   medium = + Gemma-3-4B Q4_K_M (~2.5 GB)
+#   large  = + Llama-3.1-8B Q4_K_M (~4.7 GB)
+#   all    = + Gemma-3-12B Q4_K_M (~7.5 GB)
 set -euo pipefail
 
 TIER="${1:-small}"
 MODELS_DIR="$HOME/.nodestor/models"
 mkdir -p "$MODELS_DIR"
 
-pip3 install -q huggingface_hub 2>/dev/null || true
-
-hf_download() {
+hf_wget() {
     local repo="$1" file="$2" dest="$3"
     if [ -f "$dest" ]; then
-        echo "  [SKIP] $(basename "$dest") already downloaded ($(du -h "$dest" | cut -f1))"
+        echo "  [SKIP] $(basename "$dest") ($(du -h "$dest" | cut -f1))"
         return 0
     fi
-    echo "  Downloading $file from $repo ..."
-    python3 -c "
-from huggingface_hub import hf_hub_download
-import shutil, os
-path = hf_hub_download(repo_id='$repo', filename='$file', local_dir='/tmp/hf_dl')
-shutil.move(path, '$dest')
-print('  OK:', '$dest', '(' + str(round(os.path.getsize('$dest')/1e6)) + ' MB)')
-"
+    local url="https://huggingface.co/${repo}/resolve/main/${file}"
+    echo "  Downloading $(basename "$dest") ..."
+    wget -q --show-progress -O "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" \
+        && echo "  [OK] $(du -h "$dest" | cut -f1)  $dest" \
+        || { rm -f "$dest.tmp"; echo "  [FAIL] $url"; return 1; }
 }
 
 echo "═══ NodeStor model download (tier: $TIER) ═══"
 echo "  Models → $MODELS_DIR"
+echo ""
 
-# SmolLM2-135M-Instruct (258 MB) — baseline, tests GPU path on ANY GPU
+# Gemma-3-1B Q4_K_M (~700 MB) — roda em qualquer GPU, boa qualidade
 if [[ "$TIER" =~ ^(small|medium|large|all)$ ]]; then
-    hf_download \
-        "HuggingFaceTB/SmolLM2-135M-Instruct-GGUF" \
-        "SmolLM2-135M-Instruct-F16.gguf" \
-        "$MODELS_DIR/SmolLM2-135M-Instruct-F16.gguf"
+    hf_wget \
+        "bartowski/gemma-3-1b-it-GGUF" \
+        "gemma-3-1b-it-Q4_K_M.gguf" \
+        "$MODELS_DIR/gemma-3-1b-it-Q4_K_M.gguf"
 fi
 
-# Llama-3.2-1B-Instruct Q4_K_M (770 MB) — tests OOM fix, CPU fallback
+# Gemma-3-4B Q4_K_M (~2.5 GB) — mostra vantagem SSD streaming
 if [[ "$TIER" =~ ^(medium|large|all)$ ]]; then
-    hf_download \
-        "bartowski/Llama-3.2-1B-Instruct-GGUF" \
-        "Llama-3.2-1B-Instruct-Q4_K_M.gguf" \
-        "$MODELS_DIR/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+    hf_wget \
+        "bartowski/gemma-3-4b-it-GGUF" \
+        "gemma-3-4b-it-Q4_K_M.gguf" \
+        "$MODELS_DIR/gemma-3-4b-it-Q4_K_M.gguf"
 fi
 
-# Llama-3.1-7B-Instruct Q4_K_M (~4 GB) — tests 8GB VRAM full-GPU path
+# Llama-3.1-8B Q4_K_M (~4.7 GB) — referência padrão da industria
 if [[ "$TIER" =~ ^(large|all)$ ]]; then
-    hf_download \
+    hf_wget \
         "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" \
         "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
         "$MODELS_DIR/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 fi
 
-# Mistral-7B Q4_K_M (~4 GB) — second 7B for cross-model comparison
+# Gemma-3-12B Q4_K_M (~7.5 GB) — cabe em 11GB VRAM (RTX 2080 Ti / 3080)
 if [[ "$TIER" =~ ^(all)$ ]]; then
-    hf_download \
-        "TheBloke/Mistral-7B-Instruct-v0.2-GGUF" \
-        "mistral-7b-instruct-v0.2.Q4_K_M.gguf" \
-        "$MODELS_DIR/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+    hf_wget \
+        "bartowski/gemma-3-12b-it-GGUF" \
+        "gemma-3-12b-it-Q4_K_M.gguf" \
+        "$MODELS_DIR/gemma-3-12b-it-Q4_K_M.gguf"
 fi
 
 echo ""
