@@ -657,12 +657,19 @@ impl InferencePipeline {
         'outer: while generated_tokens.len() < max_tokens {
             let logits = match cur_logits.take() { Some(l) => l, None => break };
 
-            // 1+2+3. Rascunho n-gram → verificação batched → aceita prefixo.
-            // L1/L2: COBER Crystal Skeleton (GoldenNgrams → PromptLookup → EAGLE-2 → Medusa)
-            // fallback: inline n-gram closure para cobrir o caso de todos os caches vazios.
-            let cober_draft = cober.draft_with_crystal_skeleton(&full_seq, &[]);
-            let draft = if cober_draft.is_empty() { prompt_lookup(&full_seq, draft_k) } else { cober_draft };
-            if !draft.is_empty() {
+            // LOOKAHEAD ESPECULATIVO: anchor_prediction = argmax(logits) = próximo token
+            // com 100% de certeza. Ao passá-lo para o COBER como contexto, especulamos
+            // a partir de pos+1 em vez de pos — draft[0] é SEMPRE aceito, garantindo
+            // +1 token/round grátis e COBER buscando padrões um nível mais à frente.
+            let anchor_prediction = crate::cpu_reference::argmax(&logits) as u32;
+            let mut lookahead_ctx = full_seq.clone();
+            lookahead_ctx.push(anchor_prediction);
+            let cober_sub = cober.draft_with_crystal_skeleton(&lookahead_ctx, &[]);
+            let rest = if cober_sub.is_empty() {
+                prompt_lookup(&lookahead_ctx, draft_k)
+            } else { cober_sub };
+            let draft: Vec<u32> = std::iter::once(anchor_prediction).chain(rest).collect();
+            {
                 spec_rounds += 1;
                 spec_drafted += draft.len();
                 let orig = main_kv.len();
@@ -722,8 +729,6 @@ impl InferencePipeline {
                 // encolhe se rejeitou cedo (evita desperdício de verificação).
                 if m == draft.len() { draft_k = (draft_k + 2).min(DRAFT_K_MAX); }
                 else if m == 0 { draft_k = draft_k.saturating_sub(1).max(1); }
-            } else {
-                cur_logits = Some(logits);
             }
             if generated_tokens.len() >= max_tokens { break; }
 
