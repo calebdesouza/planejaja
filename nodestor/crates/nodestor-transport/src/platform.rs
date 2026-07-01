@@ -121,12 +121,14 @@ impl PlatformIOCapabilities {
         use std::io::ErrorKind;
         // Tentativa segura: apenas verifica se a syscall existe
         // io_uring_setup(0, params) retorna EINVAL ou fd, não ENOSYS se disponível
-        let params: libc::io_uring_params = unsafe { std::mem::zeroed() };
+        // io_uring_params is ~120 bytes; use a zeroed byte buffer to avoid
+        // depending on libc::io_uring_params which is not stable across libc versions
+        let params = [0u8; 120usize];
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_setup,
                 0u32,
-                &params as *const libc::io_uring_params,
+                params.as_ptr(),
             )
         };
         // ENOSYS = syscall não existe. Qualquer outro erro = uring disponível mas args inválidos
