@@ -61,11 +61,14 @@ run_llama_cpp() {
             -n 200 \
             --n-gpu-layers 9999 \
             --threads "$(nproc)" \
+            --no-cnv \
             --log-disable \
-            2>&1 | tail -3)
+            2>&1)
         local elapsed=$((SECONDS - t0))
         local tps
-        tps=$(echo "$output" | grep -oP '\d+\.\d+ tokens per second' | grep -oP '[\d.]+' | head -1 || echo "0")
+        tps=$(echo "$output" | grep -oP 'Generation:\s*\K[\d.]+(?=\s*t/s)' | head -1 \
+              || echo "$output" | grep -oP '[\d.]+(?=\s*tokens per second)' | head -1 \
+              || echo "0")
         tps_list+=("$tps")
         echo "  run $i/$runs: ${tps} tok/s"
     done
