@@ -305,27 +305,22 @@ pub fn gpu_forward_step(
 
         if layer_on_gpu {
             // ── GPU path ─────────────────────────────────────────────────────
-            // to_gpu() uploads only when hs is CPU (boundary crossing); no-op otherwise.
+            // Batch A: RmsNorm + Q + K + V → 1 queue_wait_idle (was 4).
             let x = hs.to_gpu(engine)?;
-
             let attn_norm = wb.get(&format!("blk.{layer}.attn_norm.weight"))?;
-            let x_norm = engine.rmsnorm(&x, attn_norm, 1, h as u32, cfg.eps).ok()?;
-
             let wq = wb.get(&format!("blk.{layer}.attn_q.weight"))?;
             let wk = wb.get(&format!("blk.{layer}.attn_k.weight"))?;
             let wv = wb.get(&format!("blk.{layer}.attn_v.weight"))?;
-            // Batch Q+K+V into ONE command buffer → 1 queue_wait_idle instead of 3.
-            let mut qkv = engine.batch_matmul_to_host(&[
-                (wq, &x_norm, q_dim as u32, h as u32, 1),
-                (wk, &x_norm, kv_dim as u32, h as u32, 1),
-                (wv, &x_norm, kv_dim as u32, h as u32, 1),
-            ]).ok()?;
-            if qkv.len() < 3 { return None; }
-            let (v_gpu, k_gpu, q_gpu) = (qkv.pop()?, qkv.pop()?, qkv.pop()?);
+            let (x_norm, q_gpu, k_gpu, v_gpu) = engine.batch_attn_prep(
+                &x, attn_norm, wq, wk, wv,
+                h as u32, q_dim as u32, kv_dim as u32, cfg.eps,
+            ).ok()?;
+
             let mut q_vec = q_gpu.as_f32_slice().to_vec();
             let mut k_vec = k_gpu.as_f32_slice().to_vec();
             let mut v_vec = v_gpu.as_f32_slice().to_vec();
             if q_vec.is_empty() || k_vec.is_empty() || v_vec.is_empty() { return None; }
+            let _ = x_norm; // keep alive until after barrier flush
 
             if let Some(bq) = wb.get(&format!("blk.{layer}.attn_q.bias")) {
                 let p = bias_neox_to_interleaved(bq.as_f32_slice(), nq, hd);
@@ -346,10 +341,10 @@ pub fn gpu_forward_step(
             let (k_cache, v_cache) = kv.layer_kv(layer);
             let attn_out = gqa_attention(&q_vec, k_cache, v_cache, k_cache.len(), nq, group, hd, scale);
 
+            // Batch B: matmul(wo, attn) + add(x, proj) → 1 queue_wait_idle (was 2).
             let attn_gpu = engine.upload_f32(&attn_out).ok()?;
             let wo = wb.get(&format!("blk.{layer}.attn_output.weight"))?;
-            let attn_proj = engine.matmul(wo, &attn_gpu, h as u32, q_dim as u32, 1).ok()?;
-            let x = engine.add(&x, &attn_proj, h as u32).ok()?;
+            let x = engine.batch_attn_out(wo, &attn_gpu, &x, h as u32, q_dim as u32).ok()?;
 
             // APEX post-attention (GPU arm: download → POD → upload)
             let mut hs_post_attn = HiddenState::Gpu(x);
@@ -357,21 +352,18 @@ pub fn gpu_forward_step(
                 hs_post_attn = hs_post_attn.apply_apex(engine, dir, intensity, d_sq, layer)?;
             }
 
+            // Batch C: RmsNorm + gate + up + SiLU + mul + down → 1 queue_wait_idle (was 6).
             let x = hs_post_attn.to_gpu(engine)?;
             let ffn_norm = wb.get(&format!("blk.{layer}.ffn_norm.weight"))?;
-            let x_norm2 = engine.rmsnorm(&x, ffn_norm, 1, h as u32, cfg.eps).ok()?;
 
             let ffn_out = if let (Some(wg), Some(wu), Some(wd)) = (
                 wb.get(&format!("blk.{layer}.ffn_gate.weight")),
                 wb.get(&format!("blk.{layer}.ffn_up.weight")),
                 wb.get(&format!("blk.{layer}.ffn_down.weight")),
             ) {
-                let gate     = engine.matmul(wg, &x_norm2, cfg.intermediate as u32, h as u32, 1).ok()?;
-                let up_v     = engine.matmul(wu, &x_norm2, cfg.intermediate as u32, h as u32, 1).ok()?;
-                let gate_act = engine.silu(&gate, cfg.intermediate as u32).ok()?;
-                let swiglu   = engine.mul(&gate_act, &up_v, cfg.intermediate as u32).ok()?;
-                engine.matmul(wd, &swiglu, h as u32, cfg.intermediate as u32, 1).ok()?
+                engine.batch_ffn(&x, ffn_norm, wg, wu, wd, h as u32, cfg.intermediate as u32, cfg.eps).ok()?
             } else if let Some(moe_cfg) = &cfg.moe {
+                let x_norm2 = engine.rmsnorm(&x, ffn_norm, 1, h as u32, cfg.eps).ok()?;
                 let normed_cpu = x_norm2.as_f32_slice().to_vec();
                 let moe_out = crate::moe_kernel::moe_ffn_step(&normed_cpu, moe_cfg, wb, layer)?;
                 crate::observability::emit_expert_selection(

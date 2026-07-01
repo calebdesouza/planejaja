@@ -654,6 +654,170 @@ impl ComputePipeline {
         Ok(())
     }
 
+    /// Generic helper: records any 3-binding compute dispatch into an existing command buffer.
+    /// Inserts a COMPUTE→(COMPUTE|HOST) memory barrier on `output_buf` after the dispatch.
+    unsafe fn record_3bind_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        b0: &GpuBuffer, b1: &GpuBuffer, b2: &GpuBuffer,
+        push_bytes: &[u8],
+        dispatch: (u32, u32, u32),
+        output_buf: &GpuBuffer,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        let layouts = [self.descriptor_set_layout.unwrap()];
+        let ds = device.allocate_descriptor_sets(
+            &ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)
+        ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+        ds_collector.push(ds);
+
+        let i0 = [ash::vk::DescriptorBufferInfo::default().buffer(b0.handle.unwrap()).offset(0).range(ash::vk::WHOLE_SIZE)];
+        let i1 = [ash::vk::DescriptorBufferInfo::default().buffer(b1.handle.unwrap()).offset(0).range(ash::vk::WHOLE_SIZE)];
+        let i2 = [ash::vk::DescriptorBufferInfo::default().buffer(b2.handle.unwrap()).offset(0).range(ash::vk::WHOLE_SIZE)];
+        device.update_descriptor_sets(&[
+            ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&i0),
+            ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&i1),
+            ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&i2),
+        ], &[]);
+
+        device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+        device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[ds], &[]);
+        device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+        device.cmd_dispatch(cmd_buf, dispatch.0, dispatch.1, dispatch.2);
+
+        let barrier = ash::vk::BufferMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(ash::vk::AccessFlags::SHADER_READ | ash::vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_buf.handle.unwrap()).offset(0).size(ash::vk::WHOLE_SIZE);
+        device.cmd_pipeline_barrier(
+            cmd_buf,
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER | ash::vk::PipelineStageFlags::HOST,
+            ash::vk::DependencyFlags::empty(),
+            &[], &[barrier], &[],
+        );
+        Ok(())
+    }
+
+    /// Generic helper: records any 2-binding compute dispatch into an existing command buffer.
+    unsafe fn record_2bind_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        b0: &GpuBuffer, b1: &GpuBuffer,
+        push_bytes: &[u8],
+        dispatch: (u32, u32, u32),
+        output_buf: &GpuBuffer,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        let layouts = [self.descriptor_set_layout.unwrap()];
+        let ds = device.allocate_descriptor_sets(
+            &ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)
+        ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+        ds_collector.push(ds);
+
+        let i0 = [ash::vk::DescriptorBufferInfo::default().buffer(b0.handle.unwrap()).offset(0).range(ash::vk::WHOLE_SIZE)];
+        let i1 = [ash::vk::DescriptorBufferInfo::default().buffer(b1.handle.unwrap()).offset(0).range(ash::vk::WHOLE_SIZE)];
+        device.update_descriptor_sets(&[
+            ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&i0),
+            ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&i1),
+        ], &[]);
+
+        device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+        device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[ds], &[]);
+        device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+        device.cmd_dispatch(cmd_buf, dispatch.0, dispatch.1, dispatch.2);
+
+        let barrier = ash::vk::BufferMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(ash::vk::AccessFlags::SHADER_READ | ash::vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_buf.handle.unwrap()).offset(0).size(ash::vk::WHOLE_SIZE);
+        device.cmd_pipeline_barrier(
+            cmd_buf,
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER | ash::vk::PipelineStageFlags::HOST,
+            ash::vk::DependencyFlags::empty(),
+            &[], &[barrier], &[],
+        );
+        Ok(())
+    }
+
+    pub fn record_rmsnorm_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        input: &GpuBuffer, weight: &GpuBuffer, output: &GpuBuffer,
+        seq_len: u32, hidden_size: u32, eps: f32,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("record_rmsnorm_into: simulation".into()));
+        }
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&seq_len.to_le_bytes());
+        push[4..8].copy_from_slice(&hidden_size.to_le_bytes());
+        push[8..12].copy_from_slice(&eps.to_le_bytes());
+        unsafe { self.record_3bind_into(device, descriptor_pool, cmd_buf, input, weight, output, &push, (1, seq_len, 1), output, ds_collector) }
+    }
+
+    pub fn record_add_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        a: &GpuBuffer, b: &GpuBuffer, output: &GpuBuffer,
+        elems: u32,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("record_add_into: simulation".into()));
+        }
+        unsafe { self.record_3bind_into(device, descriptor_pool, cmd_buf, a, b, output, &elems.to_le_bytes(), ((elems + 255) / 256, 1, 1), output, ds_collector) }
+    }
+
+    pub fn record_mul_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        a: &GpuBuffer, b: &GpuBuffer, output: &GpuBuffer,
+        elems: u32,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("record_mul_into: simulation".into()));
+        }
+        unsafe { self.record_3bind_into(device, descriptor_pool, cmd_buf, a, b, output, &elems.to_le_bytes(), ((elems + 255) / 256, 1, 1), output, ds_collector) }
+    }
+
+    pub fn record_silu_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        input: &GpuBuffer, output: &GpuBuffer,
+        elements: u32,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("record_silu_into: simulation".into()));
+        }
+        let push = {
+            let mut b = [0u8; 12];
+            b[0..4].copy_from_slice(&elements.to_le_bytes());
+            b
+        };
+        unsafe { self.record_2bind_into(device, descriptor_pool, cmd_buf, input, output, &push, ((elements + 255) / 256, 1, 1), output, ds_collector) }
+    }
+
     /// Fused Q4_K dequant + matrix-vector dispatch.
     ///
     /// `weight` must contain Q4K quantized bytes (144 bytes / 256 elements per block).
