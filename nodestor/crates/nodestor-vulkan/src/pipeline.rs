@@ -589,6 +589,71 @@ impl ComputePipeline {
         Ok(())
     }
 
+    /// Records a matmul dispatch into an EXISTING command buffer (no submit/wait).
+    /// Caller must call queue_submit + queue_wait_idle when all ops are recorded.
+    /// Appends the allocated DescriptorSet to `ds_collector` for later cleanup.
+    pub fn record_matmul_into(
+        &self,
+        device: &ash::Device,
+        descriptor_pool: ash::vk::DescriptorPool,
+        cmd_buf: ash::vk::CommandBuffer,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        output: &GpuBuffer,
+        m: u32,
+        k: u32,
+        n: u32,
+        ds_collector: &mut Vec<ash::vk::DescriptorSet>,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("record_matmul_into: simulation pipeline".into()));
+        }
+        unsafe {
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let ds = descriptor_sets[0];
+            ds_collector.push(ds);
+
+            let b_a   = [ash::vk::DescriptorBufferInfo::default().buffer(a.handle.unwrap()).offset(0).range(a.size as u64)];
+            let b_b   = [ash::vk::DescriptorBufferInfo::default().buffer(b.handle.unwrap()).offset(0).range(b.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_a),
+                ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_b),
+                ash::vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[ds], &[]);
+            let constants = [m, k, n];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+            device.cmd_dispatch(cmd_buf, (n + 15) / 16, (m + 15) / 16, 1);
+
+            // Memory barrier: writes from this dispatch visible to the next.
+            let buf_barrier = ash::vk::BufferMemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(ash::vk::AccessFlags::SHADER_READ | ash::vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output.handle.unwrap())
+                .offset(0)
+                .size(ash::vk::WHOLE_SIZE);
+            device.cmd_pipeline_barrier(
+                cmd_buf,
+                ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                ash::vk::PipelineStageFlags::COMPUTE_SHADER | ash::vk::PipelineStageFlags::HOST,
+                ash::vk::DependencyFlags::empty(),
+                &[], &[buf_barrier], &[],
+            );
+        }
+        Ok(())
+    }
+
     /// Fused Q4_K dequant + matrix-vector dispatch.
     ///
     /// `weight` must contain Q4K quantized bytes (144 bytes / 256 elements per block).

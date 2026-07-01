@@ -197,6 +197,87 @@ impl VulkanEngine {
         Ok(output)
     }
 
+    /// Executa múltiplos matmuls em um ÚNICO command buffer — 1 submit + 1 queue_wait_idle.
+    ///
+    /// Cada op é `(weight, input, m, k, n)`. Retorna um `GpuBuffer` HOST_VISIBLE por op,
+    /// na mesma ordem. Reduz N syncs GPU→CPU para 1 por chamada — crítico para QKV e gate+up.
+    ///
+    /// Fallback: se Vulkan não está ativo, executa cada op via `matmul_to_host` individualmente.
+    pub fn batch_matmul_to_host(
+        &self,
+        ops: &[(&GpuBuffer, &GpuBuffer, u32, u32, u32)],
+    ) -> Result<Vec<GpuBuffer>, NodeStorError> {
+        if ops.is_empty() { return Ok(vec![]); }
+
+        let pipeline = match self.pipelines.get(&PipelineKind::Matmul) {
+            Some(p) if p.is_gpu_active() => p,
+            _ => {
+                // Fallback: individual calls (simulation mode)
+                let mut out = Vec::with_capacity(ops.len());
+                for &(a, b, m, k, n) in ops {
+                    out.push(self.matmul_to_host(a, b, m, k, n)?);
+                }
+                return Ok(out);
+            }
+        };
+
+        if !self.ctx.vulkan_available {
+            let mut out = Vec::with_capacity(ops.len());
+            for &(a, b, m, k, n) in ops {
+                out.push(self.matmul_to_host(a, b, m, k, n)?);
+            }
+            return Ok(out);
+        }
+
+        unsafe {
+            let device = self.ctx.device.as_ref().unwrap();
+            let descriptor_pool = self.ctx.descriptor_pool.unwrap();
+            let command_pool = self.ctx.command_pool.unwrap();
+
+            // Allocate one command buffer for all ops.
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(ash::vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd_bufs = device.allocate_command_buffers(&alloc_cmds)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default())
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let mut outputs = Vec::with_capacity(ops.len());
+            let mut ds_collector: Vec<ash::vk::DescriptorSet> = Vec::with_capacity(ops.len());
+
+            for &(a, b, m, k, n) in ops {
+                let output = if a.quant_kind == crate::buffer::QuantKind::Q4K {
+                    GpuBuffer::allocate(&self.ctx, (m * 4) as usize, GpuBufferUsage::Staging)
+                } else {
+                    GpuBuffer::allocate(&self.ctx, (m * n * 4) as usize, GpuBufferUsage::Staging)
+                }.map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+                pipeline.record_matmul_into(device, descriptor_pool, cmd_buf, a, b, &output, m, k, n, &mut ds_collector)?;
+                outputs.push(output);
+            }
+
+            device.end_command_buffer(cmd_buf)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(
+                self.ctx.queue.unwrap(),
+                &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])],
+                ash::vk::Fence::null(),
+            ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(self.ctx.queue.unwrap())
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            let _ = device.free_descriptor_sets(descriptor_pool, &ds_collector);
+
+            Ok(outputs)
+        }
+    }
+
     /// Upload para VRAM device-local (256 GB/s de largura de banda pela GPU).
     ///
     /// Três caminhos em ordem de prioridade:

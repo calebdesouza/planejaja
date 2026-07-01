@@ -314,9 +314,14 @@ pub fn gpu_forward_step(
             let wq = wb.get(&format!("blk.{layer}.attn_q.weight"))?;
             let wk = wb.get(&format!("blk.{layer}.attn_k.weight"))?;
             let wv = wb.get(&format!("blk.{layer}.attn_v.weight"))?;
-            let q_gpu = engine.matmul_to_host(wq, &x_norm, q_dim as u32, h as u32, 1).ok()?;
-            let k_gpu = engine.matmul_to_host(wk, &x_norm, kv_dim as u32, h as u32, 1).ok()?;
-            let v_gpu = engine.matmul_to_host(wv, &x_norm, kv_dim as u32, h as u32, 1).ok()?;
+            // Batch Q+K+V into ONE command buffer → 1 queue_wait_idle instead of 3.
+            let mut qkv = engine.batch_matmul_to_host(&[
+                (wq, &x_norm, q_dim as u32, h as u32, 1),
+                (wk, &x_norm, kv_dim as u32, h as u32, 1),
+                (wv, &x_norm, kv_dim as u32, h as u32, 1),
+            ]).ok()?;
+            if qkv.len() < 3 { return None; }
+            let (v_gpu, k_gpu, q_gpu) = (qkv.pop()?, qkv.pop()?, qkv.pop()?);
             let mut q_vec = q_gpu.as_f32_slice().to_vec();
             let mut k_vec = k_gpu.as_f32_slice().to_vec();
             let mut v_vec = v_gpu.as_f32_slice().to_vec();
