@@ -15,6 +15,8 @@ pub enum ShaderKind {
     DequantQ8,
     /// Dequantização Q6_K → F16 (GGML 6-bit K-quant, perda ~2-3%)
     DequantQ6K,
+    /// Dequantização Q5_0 → F32 (GGML 5-bit simples, bloco 22 bytes)
+    DequantQ5_0,
     /// Multiplicação de matrizes F16
     Matmul,
     /// Similaridade cosseno (busca vetorial DiskANN)
@@ -59,6 +61,7 @@ impl ShaderKind {
             Self::DequantQ4 => "dequant_q4",
             Self::DequantQ8 => "dequant_q8",
             Self::DequantQ6K => "dequant_q6k",
+            Self::DequantQ5_0 => "dequant_q5_0",
             Self::Matmul => "matmul",
             Self::CosineSim => "cosine_sim",
             Self::Lossless => "lossless_expansion",
@@ -93,6 +96,7 @@ impl ShaderKind {
             ShaderKind::DequantQ4,
             ShaderKind::DequantQ8,
             ShaderKind::DequantQ6K,
+            ShaderKind::DequantQ5_0,
             ShaderKind::Matmul,
             ShaderKind::CosineSim,
             ShaderKind::Lossless,
@@ -166,6 +170,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::DequantQ4 => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q4.spv")).to_vec(),
         ShaderKind::DequantQ8 => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q8.spv")).to_vec(),
         ShaderKind::DequantQ6K => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q6k.spv")).to_vec(),
+        ShaderKind::DequantQ5_0 => include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q5_0.spv")).to_vec(),
         ShaderKind::Matmul => include_bytes!(concat!(env!("OUT_DIR"), "/matmul.spv")).to_vec(),
         ShaderKind::CosineSim => include_bytes!(concat!(env!("OUT_DIR"), "/cosine_sim.spv")).to_vec(),
         ShaderKind::Lossless => include_bytes!(concat!(env!("OUT_DIR"), "/lossless_expansion.spv")).to_vec(),

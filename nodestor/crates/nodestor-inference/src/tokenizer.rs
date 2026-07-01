@@ -9,6 +9,9 @@ use std::str::FromStr;
 
 pub struct TokenizerManager {
     inner: Tokenizer,
+    /// Raw vocab from GGUF tokenizer.ggml.tokens — used as fallback when BPE decode fails.
+    /// SmolLM2 and models without merges fall through to this for correct token→text mapping.
+    raw_vocab: Vec<String>,
 }
 
 impl TokenizerManager {
@@ -17,7 +20,7 @@ impl TokenizerManager {
         let inner = Tokenizer::from_str(json_content)
             .map_err(|e: Box<dyn std::error::Error + Send + Sync>| NodeStorError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
 
-        Ok(Self { inner })
+        Ok(Self { inner, raw_vocab: Vec::new() })
     }
 
     /// Constrói um tokenizer REAL a partir dos metadados embutidos no GGUF
@@ -83,7 +86,7 @@ impl TokenizerManager {
             inner.add_special_tokens(&specials);
         }
 
-        Ok(Self { inner })
+        Ok(Self { inner, raw_vocab: tokens.to_vec() })
     }
 
     /// Codifica uma string raw para Token IDs.
@@ -96,9 +99,33 @@ impl TokenizerManager {
 
     /// Decodifica Token IDs para String (ideal para stream iterativo de volta pro usuário).
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> std::result::Result<String, NodeStorError> {
-        let text = self.inner.decode(ids, skip_special)
-            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| NodeStorError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
-            
+        // Suppress BPE errors — fall through to raw_vocab when BPE fails or returns empty.
+        // SmolLM2 and models whose BPE merges don't round-trip through the tokenizers lib
+        // (byte-level tokens, unknown merge refs) hit this path.
+        let text = self.inner.decode(ids, skip_special).unwrap_or_default();
+
+        // Raw vocab fallback: direct array lookup + byte-level decoding.
+        if text.is_empty() && !self.raw_vocab.is_empty() {
+            let mut out = String::new();
+            for &id in ids {
+                if let Some(tok) = self.raw_vocab.get(id as usize) {
+                    if skip_special && (tok.starts_with('<') && tok.ends_with('>')) {
+                        continue;
+                    }
+                    // ByteLevel: Ġ → space, ▁ → space
+                    let piece = tok.replace('Ġ', " ").replace('▁', " ");
+                    // Hex byte escapes <0xNN> → actual byte
+                    let piece = if piece.starts_with("<0x") && piece.ends_with('>') {
+                        if let Ok(b) = u8::from_str_radix(&piece[3..piece.len()-1], 16) {
+                            std::str::from_utf8(&[b]).unwrap_or("").to_string()
+                        } else { piece }
+                    } else { piece };
+                    out.push_str(&piece);
+                }
+            }
+            return Ok(out);
+        }
+
         Ok(text)
     }
 }

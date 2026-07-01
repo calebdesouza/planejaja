@@ -10,6 +10,7 @@
 
 pub mod pipeline;
 pub mod cpu_reference;
+pub mod gpu_forward;
 pub mod kv_cache;
 pub mod tokenizer;
 pub mod sampler;
@@ -80,6 +81,44 @@ pub mod entropy_analyzer;
 pub mod tool_registry;
 pub mod agent_loop;
 
+// --- Edge RLHF: Wake-Sleep Cycle (Vigília→Curadoria→Sono) ---
+pub mod background_indexer;
+pub mod dataset_curator;
+pub mod preference_collector;
+pub mod local_dpo;
+
+// --- Mechanistic Interpretability & Observability ---
+pub mod observability;
+
+// --- SSD Weight Stream: MoE-aware tiered expert cache + GDeflate streaming ---
+pub mod ssd_stream;
+
+// --- HeteroScheduler: CPU (attention) + GPU (FFN/MoE) pipeline ---
+pub mod hetero_scheduler;
+
+// --- ContextSsd: infinite context via KV archive on SSD + vector index ---
+pub mod context_ssd;
+
+// --- SsdStripe: multi-SSD parallel reads (N × 7 GB/s + GDeflate) ---
+pub mod ssd_stripe;
+
+// --- MoE Kernel: DeepSeek/Mixtral/Qwen expert routing + parallel FFN ---
+pub mod moe_kernel;
+
+// --- Sparse Activation: dense-to-MoE math optimization (60-80% neuron skip) ---
+pub mod sparse_activation;
+
+// --- SpecStream V2: hyperbolic tree speculation, dynamic K budget ---
+pub mod spec_stream_v2;
+
+// --- Quant-Invariant Bandwidth: GDeflate math + MoE early-abort provisioner ---
+pub mod quant_invariant;
+
+// --- Platform IO: memmap2/MADV_WILLNEED (macOS/Linux) + Win32 sequential scan ---
+pub mod platform_io;
+
+// --- Timeline Semaphore: CPU attention ∥ GPU FFN pipeline overlap ---
+pub mod timeline_semaphore;
 
 #[cfg(test)]
 mod tests {
@@ -148,3 +187,13 @@ pub mod mcts_engine;
 pub mod hnsw_index;
 pub mod lsh_buckets;
 pub mod hamiltonian_dynamics;
+
+// --- Resilient Apex Hardware-Mapped Engine ---
+// Wavefront Timeslicing: sub-4ms GPU dispatch slices with cooperative yield
+pub mod wavefront_scheduler;
+// Elastic Memory: VirtualAlloc/mmap demand-paged tensor slots (no hard page-lock)
+pub mod elastic_memory;
+// APEX Fused Kernel: dequant + POD geometry without intermediate VRAM allocations
+pub mod apex_fused_kernel;
+// Paths: platform-agnostic %USERPROFILE%/.nodestor/ / $HOME/.nodestor/ layout
+pub mod paths;

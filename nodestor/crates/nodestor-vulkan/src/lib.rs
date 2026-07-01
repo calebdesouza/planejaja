@@ -8,6 +8,7 @@ pub mod command_recycler;
 pub mod triple_buffer;
 pub mod external_memory;
 pub mod operator_registry;
+pub mod unified_pool;
 
 pub use buffer::{GpuBuffer, GpuBufferUsage};
 pub use error::VulkanError;
@@ -18,6 +19,8 @@ pub use buffer::MemoryPath;
 pub use command_recycler::CommandRecycler;
 pub use triple_buffer::TripleBufferPipeline;
 pub use external_memory::{try_import_host_memory, is_supported as ext_memory_supported};
+pub use operator_registry::{cpu_gelu_fallback, cpu_layer_norm_fallback, cpu_mean_pool, l2_normalize, TensorOp, ActivationKind};
+pub use unified_pool::{UnifiedMemoryPool, PoolSlotKind};
 
 use nodestor_core::{GpuCapabilities, HardwareProfile, NodeStorError};
 use tracing::{info, warn};
@@ -56,8 +59,7 @@ impl VulkanEngine {
         // forward consistente vale mais — e roda em qualquer máquina.
         let required = [
             PipelineKind::Matmul, PipelineKind::RmsNorm, PipelineKind::RoPe,
-            PipelineKind::SiLu, PipelineKind::Softmax, PipelineKind::Attention,
-            PipelineKind::TurboQuantAttention, PipelineKind::Add, PipelineKind::Mul,
+            PipelineKind::SiLu, PipelineKind::Add, PipelineKind::Mul,
         ];
         if required.iter().any(|k| !pipelines.contains_key(k)) {
             tracing::warn!("Pipelines GPU incompletos neste driver — usando simulação CPU completa.");
@@ -150,6 +152,108 @@ impl VulkanEngine {
         let mut output = self.ctx.alloc_gpu_buffer((m * n * 4) as usize)?;
         pipeline.dispatch_matmul(&self.ctx, a, b, &mut output, m, k, n)?;
         Ok(output)
+    }
+
+    /// Matmul cujo output é HOST_VISIBLE: GPU escreve direto, CPU lê via as_f32_slice()
+    /// sem staging copy. Ideal para Q/K/V (precisam ir para CPU para atenção).
+    pub fn matmul_to_host(&self, a: &GpuBuffer, b: &GpuBuffer, m: u32, k: u32, n: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::Matmul)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline Matmul not available".into()))?;
+        let mut output = if self.ctx.vulkan_available {
+            // Staging = HOST_VISIBLE + STORAGE_BUFFER: shader escreve, CPU lê sem cópia
+            GpuBuffer::allocate(&self.ctx, (m * n * 4) as usize, GpuBufferUsage::Staging)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?
+        } else {
+            GpuBuffer::new_storage((m * n * 4) as usize)
+        };
+        pipeline.dispatch_matmul(&self.ctx, a, b, &mut output, m, k, n)?;
+        Ok(output)
+    }
+
+    /// Upload para VRAM device-local (256 GB/s de largura de banda pela GPU).
+    ///
+    /// Três caminhos em ordem de prioridade:
+    /// - **UMA / ReBAR**: DEVICE_LOCAL + HOST_VISIBLE → escrita direta, sem staging copy.
+    ///   Cobre Apple Silicon via MoltenVK (todo heap é UMA) + AMD/NVIDIA com ReBAR ativo.
+    /// - **Transfer Queue**: staging → vkCmdCopyBuffer via fila de transferência dedicada.
+    ///   Permite overlap com compute em GPUs com fila separada (RX 580, RTX série).
+    /// - **Compute Queue**: staging → vkCmdCopyBuffer via fila de compute (fallback universal).
+    pub fn upload_device_local(&self, data: &[u8]) -> Result<GpuBuffer, NodeStorError> {
+        if !self.ctx.vulkan_available {
+            return Ok(GpuBuffer::from_cpu_data(data.to_vec()));
+        }
+
+        // Caminho A — UMA / ReBAR: DEVICE_LOCAL é também HOST_VISIBLE.
+        // allocate_pinned() tenta ReBAR primeiro; se o heap tiver >= 80% da VRAM como UMA,
+        // retorna buffer mapeado diretamente na VRAM. Zero staging copy.
+        if self.ctx.has_rebar {
+            if let Ok(mut buf) = GpuBuffer::allocate_pinned(&self.ctx, data.len()) {
+                if buf.copy_from_slice(data).is_ok() {
+                    return Ok(buf);
+                }
+            }
+        }
+
+        // Caminho B/C — staging → vkCmdCopyBuffer → DEVICE_LOCAL.
+        let mut staging = GpuBuffer::allocate(&self.ctx, data.len(), GpuBufferUsage::Staging)
+            .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        staging.copy_from_slice(data)
+            .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        let src = staging.handle.ok_or_else(|| NodeStorError::VulkanError("staging handle missing".into()))?;
+
+        let device_local = GpuBuffer::allocate(&self.ctx, data.len(), GpuBufferUsage::Storage)
+            .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        let dst = device_local.handle.ok_or_else(|| NodeStorError::VulkanError("storage handle missing".into()))?;
+
+        unsafe {
+            let device = self.ctx.device.as_ref().unwrap();
+
+            // Seleciona fila: transfer dedicada (DMA paralelo ao compute) ou compute (fallback).
+            let (xfer_queue, pool_family) =
+                if self.ctx.has_dedicated_transfer_queue {
+                    if let Some(tq) = self.ctx.transfer_queue {
+                        (tq, self.ctx.transfer_queue_family)
+                    } else {
+                        (self.ctx.queue.unwrap(), self.ctx.queue_family_index)
+                    }
+                } else {
+                    (self.ctx.queue.unwrap(), self.ctx.queue_family_index)
+                };
+
+            // Pool TRANSIENT no family correto — criado e destruído por upload (carregamento único).
+            let xfer_pool = device.create_command_pool(
+                &ash::vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(pool_family)
+                    .flags(ash::vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let cmd = device.allocate_command_buffers(
+                &ash::vk::CommandBufferAllocateInfo::default()
+                    .command_pool(xfer_pool).level(ash::vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ).map_err(|e| {
+                let _ = device.destroy_command_pool(xfer_pool, None);
+                NodeStorError::VulkanError(e.to_string())
+            })?[0];
+
+            device.begin_command_buffer(cmd, &ash::vk::CommandBufferBeginInfo::default()
+                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_copy_buffer(cmd, src, dst, &[ash::vk::BufferCopy::default().size(data.len() as u64)]);
+            device.end_command_buffer(cmd).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let fence = device.create_fence(&ash::vk::FenceCreateInfo::default(), None)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_submit(xfer_queue, &[ash::vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(xfer_pool, &[cmd]);
+            device.destroy_command_pool(xfer_pool, None);
+        }
+        Ok(device_local)
     }
 
     /// Executa Fused Decompress (TCA-TBE) + Matmul (ZipGEMM) na VRAM.
@@ -270,6 +374,17 @@ impl VulkanEngine {
         self.ctx.alloc_gpu_buffer(size_bytes)
     }
 
+    /// `true` se o motor está rodando em GPU real (não simulação CPU).
+    pub fn is_gpu_active(&self) -> bool {
+        self.ctx.vulkan_available
+    }
+
+    /// Upload de slice f32 direto para GPU.
+    pub fn upload_f32(&self, data: &[f32]) -> Result<GpuBuffer, NodeStorError> {
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.ctx.upload_to_gpu(bytes)
+    }
+
     /// Aloca buffer Via Expressa (Triple-Path: ReBAR → Pinned DMA → Staging Fallback).
     /// Zero configuração. Detecta o melhor caminho automaticamente.
     pub fn alloc_pinned_buffer(&self, size_bytes: usize) -> Result<GpuBuffer, NodeStorError> {
@@ -325,5 +440,73 @@ impl VulkanEngine {
             vram_total_bytes: self.ctx.capabilities().vram_bytes,
             active_kernels: 0,
         }
+    }
+
+    /// Dequantiza blocos Q5_0 → f32.
+    ///
+    /// Caminho GPU: shader `dequant_q5_0.comp` com workgroup correto (local_size_x=256,
+    /// 16 invocações/bloco). Se Vulkan não disponível: CPU fallback inline bit-idêntico.
+    ///
+    /// `raw_blocks`: N * 22 bytes (formato Q5_0: [d:FP16 2B][qh:4B][qs:16B]).
+    /// Retorna N * 32 f32.
+    pub fn dequant_q5_0(&self, raw_blocks: &[u8]) -> Result<Vec<f32>, NodeStorError> {
+        const BLOCK_BYTES: usize = 22;
+        const WEIGHTS_PER_BLOCK: usize = 32;
+
+        if raw_blocks.len() % BLOCK_BYTES != 0 {
+            return Err(NodeStorError::InferenceError(
+                format!("dequant_q5_0: raw_blocks.len()={} não é múltiplo de {}", raw_blocks.len(), BLOCK_BYTES)
+            ));
+        }
+        let num_blocks = (raw_blocks.len() / BLOCK_BYTES) as u32;
+        let out_bytes = (num_blocks as usize) * WEIGHTS_PER_BLOCK * 4;
+
+        // Tenta caminho GPU se o pipeline DequantQ5_0 estiver ativo
+        if let Some(pipeline) = self.pipelines.get(&PipelineKind::DequantQ5_0) {
+            if pipeline.is_gpu_active() {
+                let input_buf = self.ctx.upload_to_gpu(raw_blocks)?;
+                let mut output_buf = self.ctx.alloc_gpu_buffer(out_bytes)?;
+                pipeline.dispatch_q5_0(&self.ctx, &input_buf, &mut output_buf, num_blocks)?;
+                return self.ctx.download_from_gpu(&output_buf);
+            }
+        }
+
+        // CPU fallback: mesma fórmula do shader
+        let mut out = vec![0.0f32; (num_blocks as usize) * WEIGHTS_PER_BLOCK];
+        for b in 0..(num_blocks as usize) {
+            let off = b * BLOCK_BYTES;
+            let d_bits = (raw_blocks[off] as u16) | ((raw_blocks[off + 1] as u16) << 8);
+            let d = Self::fp16_to_f32(d_bits);
+            let qh = (raw_blocks[off + 2] as u32)
+                | ((raw_blocks[off + 3] as u32) << 8)
+                | ((raw_blocks[off + 4] as u32) << 16)
+                | ((raw_blocks[off + 5] as u32) << 24);
+            for j in 0..16usize {
+                let qs = raw_blocks[off + 6 + j];
+                let xh_lo = (qh >> j) & 1;
+                let xh_hi = (qh >> (j + 16)) & 1;
+                let x0 = ((qs & 0x0F) as i32 | ((xh_lo as i32) << 4)) - 16;
+                let x1 = ((qs >> 4) as i32 | ((xh_hi as i32) << 4)) - 16;
+                out[b * 32 + j]      = x0 as f32 * d;
+                out[b * 32 + j + 16] = x1 as f32 * d;
+            }
+        }
+        Ok(out)
+    }
+
+    fn fp16_to_f32(h: u16) -> f32 {
+        let s = (h >> 15) & 1;
+        let e = (h >> 10) & 0x1F;
+        let m = h & 0x3FF;
+        if e == 0 {
+            if m == 0 { return 0.0; }
+            return (if s != 0 { -1.0f32 } else { 1.0 }) * 5.960_464_5e-8 * m as f32;
+        } else if e == 31 {
+            return if m == 0 { f32::INFINITY * (if s != 0 { -1.0 } else { 1.0 }) } else { f32::NAN };
+        }
+        let v = (if s != 0 { -1.0f32 } else { 1.0 })
+            * 2f32.powi(e as i32 - 15)
+            * (1.0 + m as f32 / 1024.0);
+        v
     }
 }

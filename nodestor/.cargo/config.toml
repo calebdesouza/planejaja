@@ -8,3 +8,12 @@
 [build]
 # Usa o target MSVC explicitamente para este workspace
 target = "x86_64-pc-windows-msvc"
+# D: pendrive com defeito (No Media). Build vai para C: com debuginfo=0 para caber.
+# Quando D: voltar: trocar de volta para D:\\nodestor-target
+target-dir = "C:\\nodestor-target"
+# Limita jobs paralelos — 28 threads simultâneas estouram o pagefile do Windows
+jobs = 6
+
+[target.x86_64-pc-windows-msvc]
+# AVX2 + FMA — Xeon E5-2680 v4 suporta ambos; elimina scalar fallbacks do compilador
+rustflags = ["-C", "target-cpu=native"]

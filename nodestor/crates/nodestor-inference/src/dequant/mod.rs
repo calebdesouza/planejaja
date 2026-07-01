@@ -32,14 +32,18 @@
 //! - Q5_K_M: ~150 GB/s de pesos processados/segundo
 
 pub mod q4_k;
+pub mod q5_0;
 pub mod q5_k;
+pub mod q6_k;
 pub mod q8_0;
 pub mod simd_x86;
 pub mod simd_arm;
 
 use crate::dequant::q4_k::{DequantQ4K, Q4KVariant};
+use crate::dequant::q5_0::DequantQ5_0;
 use crate::dequant::q5_k::{DequantQ5K, Q5KVariant};
-use crate::dequant::q8_0::DequantQ8_0;
+use crate::dequant::q6_k::DequantQ6K;
+use crate::dequant::q8_0::{DequantQ8_0, DequantQ8_1};
 
 /// Formato de quantização do tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +52,12 @@ pub enum QuantFormat {
     F16,
     /// FP32 — sem quantização (passthrough)
     F32,
-    /// Q8_0 — 8-bit simples, ~1:4 compressão vs FP32
+    /// Q5_0 — 5-bit simples, blocos de 22 bytes (d FP16 + qh 4B + qs 16B)
+    Q5_0,
+    /// Q8_0 — 8-bit simples, blocos de 34 bytes (d FP16 + 32×i8)
     Q8_0,
+    /// Q8_1 — 8-bit com soma, blocos de 36 bytes (d FP16 + s FP16 + 32×i8)
+    Q8_1,
     /// Q4_K_S — 4-bit com super-blocos, variante Small (menos preciso)
     Q4KSmall,
     /// Q4_K_M — 4-bit com super-blocos, variante Medium (uso mais comum em consumer)
@@ -58,6 +66,8 @@ pub enum QuantFormat {
     Q5KSmall,
     /// Q5_K_M — 5-bit com super-blocos, variante Medium (melhor equilíbrio qualidade/tamanho)
     Q5KMedium,
+    /// Q6_K — 6-bit com super-blocos (128+64+16+2 bytes = 210 bytes por 256 pesos)
+    Q6K,
 }
 
 impl QuantFormat {
@@ -66,11 +76,14 @@ impl QuantFormat {
         match self {
             QuantFormat::F16 => 2,
             QuantFormat::F32 => 4,
-            QuantFormat::Q8_0 => 34,       // 2 bytes escala + 32 bytes Q8
+            QuantFormat::Q5_0 => 22,       // 2 bytes d + 4 bytes qh + 16 bytes qs
+            QuantFormat::Q8_0 => 34,       // 2 bytes d + 32 bytes Q8
+            QuantFormat::Q8_1 => 36,       // 2 bytes d + 2 bytes s + 32 bytes Q8
             QuantFormat::Q4KSmall |
             QuantFormat::Q4KMedium => 144, // 4 + 12 + 128 bytes
             QuantFormat::Q5KSmall |
             QuantFormat::Q5KMedium => 176, // 4 + 12 + 128 + 32 bytes (bits extras)
+            QuantFormat::Q6K => 210,       // 128 + 64 + 16 + 2 bytes
         }
     }
 
@@ -78,9 +91,10 @@ impl QuantFormat {
     pub fn weights_per_block(&self) -> usize {
         match self {
             QuantFormat::F16 | QuantFormat::F32 => 1,
-            QuantFormat::Q8_0 => 32,
+            QuantFormat::Q5_0 | QuantFormat::Q8_0 | QuantFormat::Q8_1 => 32,
             QuantFormat::Q4KSmall | QuantFormat::Q4KMedium |
-            QuantFormat::Q5KSmall | QuantFormat::Q5KMedium => 256,
+            QuantFormat::Q5KSmall | QuantFormat::Q5KMedium |
+            QuantFormat::Q6K => 256,
         }
     }
 
@@ -89,11 +103,14 @@ impl QuantFormat {
         match self {
             QuantFormat::F16 => "F16",
             QuantFormat::F32 => "F32",
+            QuantFormat::Q5_0 => "Q5_0",
             QuantFormat::Q8_0 => "Q8_0",
+            QuantFormat::Q8_1 => "Q8_1",
             QuantFormat::Q4KSmall => "Q4_K_S",
             QuantFormat::Q4KMedium => "Q4_K_M",
             QuantFormat::Q5KSmall => "Q5_K_S",
             QuantFormat::Q5KMedium => "Q5_K_M",
+            QuantFormat::Q6K => "Q6_K",
         }
     }
 }
@@ -160,12 +177,22 @@ impl DequantDispatcher {
                     .map(|b| half_to_f32(u16::from_le_bytes([b[0], b[1]])))
                     .collect()
             }
+            QuantFormat::Q5_0 => {
+                self.stats.total_weights_output += num_elements as u64;
+                self.stats.cpu_scalar_calls += 1;
+                DequantQ5_0::dequantize(raw_bytes)
+            }
             QuantFormat::Q8_0 => {
                 self.stats.q8_blocks_processed += (raw_bytes.len() / format.block_size_bytes()) as u64;
                 self.stats.total_weights_output += num_elements as u64;
-                let result = DequantQ8_0::dequantize(raw_bytes);
                 self.stats.cpu_scalar_calls += 1;
-                result
+                DequantQ8_0::dequantize(raw_bytes)
+            }
+            QuantFormat::Q8_1 => {
+                self.stats.q8_blocks_processed += (raw_bytes.len() / format.block_size_bytes()) as u64;
+                self.stats.total_weights_output += num_elements as u64;
+                self.stats.cpu_scalar_calls += 1;
+                DequantQ8_1::dequantize(raw_bytes)
             }
             QuantFormat::Q4KSmall => {
                 self.stats.q4k_blocks_processed += (raw_bytes.len() / format.block_size_bytes()) as u64;
@@ -186,6 +213,11 @@ impl DequantDispatcher {
                 self.stats.q5k_blocks_processed += (raw_bytes.len() / format.block_size_bytes()) as u64;
                 self.stats.total_weights_output += num_elements as u64;
                 self.dispatch_q5k(raw_bytes, Q5KVariant::Medium)
+            }
+            QuantFormat::Q6K => {
+                self.stats.total_weights_output += num_elements as u64;
+                self.stats.cpu_scalar_calls += 1;
+                DequantQ6K::dequantize(raw_bytes)
             }
         }
     }

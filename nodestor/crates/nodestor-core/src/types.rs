@@ -253,8 +253,16 @@ pub enum TensorDtype {
     Q5_0,
     /// GGML Q5_1
     Q5_1,
-    /// GGML Q8_0
+    /// GGML Q8_0 — 8-bit com escala FP16, blocos de 34 bytes (32 pesos)
     Q8_0,
+    /// GGML Q8_1 — 8-bit com escala + soma FP16, blocos de 36 bytes (32 pesos)
+    Q8_1,
+    /// GGML Q4_K — 4-bit K-quant, super-blocos de 144 bytes (256 pesos)
+    Q4K,
+    /// GGML Q5_K — 5-bit K-quant, super-blocos de 176 bytes (256 pesos)
+    Q5K,
+    /// GGML Q6_K — 6-bit K-quant, super-blocos de 210 bytes (256 pesos)
+    Q6K,
     I8,
     I16,
     I32,
@@ -271,9 +279,13 @@ impl TensorDtype {
             TensorDtype::F32 | TensorDtype::I32 => Some(4.0),
             TensorDtype::F16 | TensorDtype::BF16 | TensorDtype::I16 => Some(2.0),
             TensorDtype::I8 | TensorDtype::Bool => Some(1.0),
-            TensorDtype::Q8_0 => Some(1.0625), // (256 * 8 + 4) / 256
+            TensorDtype::Q8_0 => Some(1.0625), // (32*8+2) / 32
+            TensorDtype::Q8_1 => Some(1.125),  // (32*8+4) / 32
             TensorDtype::Q4_0 | TensorDtype::Q4_1 => Some(0.5625),
             TensorDtype::Q5_0 | TensorDtype::Q5_1 => Some(0.6875),
+            TensorDtype::Q4K  => Some(0.5625), // 144 bytes / 256 pesos
+            TensorDtype::Q5K  => Some(0.6875), // 176 bytes / 256 pesos
+            TensorDtype::Q6K  => Some(0.8203), // 210 bytes / 256 pesos
         }
     }
 
@@ -288,6 +300,10 @@ impl TensorDtype {
             TensorDtype::Q5_0 => "Q5_0",
             TensorDtype::Q5_1 => "Q5_1",
             TensorDtype::Q8_0 => "Q8_0",
+            TensorDtype::Q8_1 => "Q8_1",
+            TensorDtype::Q4K  => "Q4_K",
+            TensorDtype::Q5K  => "Q5_K",
+            TensorDtype::Q6K  => "Q6_K",
             TensorDtype::I8 => "I8",
             TensorDtype::I16 => "I16",
             TensorDtype::I32 => "I32",

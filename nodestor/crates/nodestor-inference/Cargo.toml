@@ -26,6 +26,7 @@ rayon.workspace = true
 anyhow.workspace = true
 num_cpus = "1.17.0"
 dirs = { workspace = true }
+miniz_oxide = "0.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }

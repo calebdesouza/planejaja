@@ -45,3 +45,9 @@ zstd = { workspace = true }
 nodestor-gdeflate = { version = "0.1.0", path = "../crates/nodestor-gdeflate" }
 nodestor-davi = { path = "../crates/nodestor-davi" }
 indicatif = "0.18.4"
+axum = { workspace = true, features = ["macros"] }
+uuid = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+async-stream = "0.3"

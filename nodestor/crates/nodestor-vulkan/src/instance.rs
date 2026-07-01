@@ -97,7 +97,62 @@ impl VulkanContext {
         if !self.vulkan_available {
             return Ok(buffer.as_f32_slice().to_vec());
         }
-        Ok(buffer.as_f32_slice().to_vec())
+        // Buffers com mapped_ptr (pinned/ReBAR) são lidos diretamente — sem staging.
+        let direct = buffer.as_f32_slice();
+        if !direct.is_empty() { return Ok(direct.to_vec()); }
+
+        // Buffer device-local: precisa de staging + vkCmdCopyBuffer.
+        let handle = match buffer.handle {
+            Some(h) => h,
+            None => return Ok(vec![0.0f32; buffer.size / 4]),
+        };
+        // Readback buffer: TRANSFER_DST + HOST_VISIBLE — destino correto para vkCmdCopyBuffer.
+        // (allocate_pinned usa Staging que só tem TRANSFER_SRC, não TRANSFER_DST)
+        let staging = GpuBuffer::allocate(self, buffer.size, GpuBufferUsage::Readback)
+            .map_err(|e| NodeStorError::VulkanError(format!("readback alloc: {e}")))?;
+        let staging_handle = match staging.handle {
+            Some(h) => h,
+            None => return Ok(vec![0.0f32; buffer.size / 4]),
+        };
+
+        unsafe {
+            let device = self.device.as_ref().unwrap();
+            let command_pool = self.command_pool.unwrap();
+            let queue = self.queue.unwrap();
+
+            let cmd_buf = device.allocate_command_buffers(
+                &ash::vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(ash::vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ).map_err(|e| NodeStorError::VulkanError(e.to_string()))?[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()
+                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let region = ash::vk::BufferCopy::default().size(buffer.size as u64);
+            device.cmd_copy_buffer(cmd_buf, handle, staging_handle, &[region]);
+
+            device.end_command_buffer(cmd_buf)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+
+            let fence = device.create_fence(&ash::vk::FenceCreateInfo::default(), None)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_submit(queue, &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], fence)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+        }
+
+        let result = staging.as_f32_slice().to_vec();
+        if result.is_empty() {
+            Ok(vec![0.0f32; buffer.size / 4])
+        } else {
+            Ok(result)
+        }
     }
 
     /// Cria um contexto de simulação FORÇADA (CPU/RAM puro), sem jamais tocar a
@@ -140,6 +195,9 @@ impl Drop for VulkanContext {
                 if let Some(pool) = self.descriptor_pool {
                     device.destroy_descriptor_pool(pool, None);
                 }
+                // O gpu_allocator precisa do device vivo para liberar alocações.
+                // Dropar o allocator ANTES de destroy_device previne use-after-free.
+                drop(self.allocator.take());
                 device.destroy_device(None);
             }
         }
@@ -357,7 +415,10 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                         instance: instance.clone(),
                         device: device.clone(),
                         physical_device: pdevice,
-                        debug_settings: Default::default(),
+                        debug_settings: gpu_allocator::AllocatorDebugSettings {
+                            log_leaks_on_shutdown: false,
+                            ..Default::default()
+                        },
                         buffer_device_address: false,
                         allocation_sizes: Default::default(),
                     }

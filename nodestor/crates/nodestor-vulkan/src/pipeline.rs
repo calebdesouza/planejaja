@@ -16,6 +16,8 @@ pub enum PipelineKind {
     DequantQ8,
     /// Q6_K (6-bit K-quant) — para embeddings residentes na VRAM.
     DequantQ6K,
+    /// Q5_0 (5-bit simples) — tensor dtype mais comum no Qwen2.5 GGUF.
+    DequantQ5_0,
     Matmul,
     CosineSim,
     Lossless,
@@ -67,6 +69,91 @@ impl ComputePipeline {
         }
     }
 
+    pub fn is_gpu_active(&self) -> bool { self.vulkan_active }
+
+    /// Despacha dequantização Q5_0 com parâmetros corretos para o shader.
+    ///
+    /// O shader `dequant_q5_0.comp` tem `local_size_x=256` e 16 invocações por bloco
+    /// (uma por par j=0..15). Push constant = NUM_BLOCKS, não element_count.
+    /// Em modo simulação: retorna Err (caller faz fallback CPU).
+    pub fn dispatch_q5_0(
+        &self,
+        ctx: &VulkanContext,
+        input: &GpuBuffer,
+        output: &mut GpuBuffer,
+        num_blocks: u32,
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            return Err(NodeStorError::VulkanError("dispatch_q5_0: simulation mode".into()));
+        }
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info)
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_in = [ash::vk::DescriptorBufferInfo::default()
+                .buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default()
+                .buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(0)
+                    .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&b_in),
+                ash::vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(1)
+                    .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&b_out),
+            ], &[]);
+
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(ash::vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd_bufs = device.allocate_command_buffers(&alloc_cmds)
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default())
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+
+            // Push constant = NUM_BLOCKS (u32), shader expects pc.NUM_BLOCKS
+            let bytes = num_blocks.to_ne_bytes();
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(),
+                ash::vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+
+            // local_size_x=256, 16 invocações/bloco → ceil(num_blocks*16 / 256) workgroups
+            let workgroups = (num_blocks * 16 + 255) / 256;
+            device.cmd_dispatch(cmd_buf, workgroups, 1, 1);
+            device.end_command_buffer(cmd_buf)
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(ctx.queue.unwrap(),
+                &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])],
+                ash::vk::Fence::null())
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(ctx.queue.unwrap())
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set])
+                .map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn new_real(
         ctx: &VulkanContext,
         kind: PipelineKind,
@@ -89,7 +176,8 @@ impl ComputePipeline {
 
             let num_bindings = match kind {
                 PipelineKind::Softmax => 1,
-                PipelineKind::DequantQ4 | PipelineKind::DequantQ8 | PipelineKind::DequantQ6K 
+                PipelineKind::DequantQ4 | PipelineKind::DequantQ8 | PipelineKind::DequantQ6K
+                | PipelineKind::DequantQ5_0
                 | PipelineKind::Lossless | PipelineKind::GDeflate | PipelineKind::RoPe | PipelineKind::SiLu => 2,
                 PipelineKind::Matmul | PipelineKind::CosineSim | PipelineKind::MatmulQ4 
                 | PipelineKind::MatmulTensorCore | PipelineKind::MatmulTernary | PipelineKind::RmsNorm | PipelineKind::CoopMatrix 
@@ -1444,6 +1532,7 @@ pub fn create_all_pipelines(
             ShaderKind::DequantQ4 => PipelineKind::DequantQ4,
             ShaderKind::DequantQ8 => PipelineKind::DequantQ8,
             ShaderKind::DequantQ6K => PipelineKind::DequantQ6K,
+            ShaderKind::DequantQ5_0 => PipelineKind::DequantQ5_0,
             ShaderKind::Matmul => PipelineKind::Matmul,
             ShaderKind::CosineSim => PipelineKind::CosineSim,
             ShaderKind::Lossless => PipelineKind::Lossless,
@@ -1474,6 +1563,7 @@ pub fn create_all_pipelines(
         let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
         map.insert(kind, pipeline);
     }
+
     Ok(map)
 }
 
@@ -1693,6 +1783,7 @@ pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
         PipelineKind::DequantQ4,
         PipelineKind::DequantQ8,
         PipelineKind::DequantQ6K,
+        PipelineKind::DequantQ5_0,
         PipelineKind::Matmul,
         PipelineKind::CosineSim,
         PipelineKind::Lossless,

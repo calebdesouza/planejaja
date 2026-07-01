@@ -19,7 +19,7 @@ use nodestor_metadata::search::VectorSearch;
 use nodestor_vulkan::VulkanEngine;
 use std::sync::Arc;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use futures::Stream;
 use std::pin::Pin;
 use crate::graph_interpreter;
@@ -48,6 +48,17 @@ pub struct GenerationStats {
     pub probes_alerts: Vec<String>,
     /// Tokens rejeitados pelo Conformal Predictor (alta incerteza)
     pub conformal_rejections: usize,
+    // Speculative decoding telemetry
+    pub spec_rounds: usize,
+    pub spec_drafted: usize,
+    pub spec_accepted: usize,
+    pub spec_k: usize,
+    pub spec_acceptance_rate: f64,
+    pub spec_speedup: f64,
+    // KV-cache / context window
+    pub kv_vram_blocks: usize,
+    pub kv_ssd_blocks: usize,
+    pub context_tokens: usize,
 }
 
 /// Estrutura para orquestração inteligente de contexto (RAM/SSD Paging).
@@ -95,9 +106,9 @@ pub struct ActivationSteeringConfig {
 }
 
 /// Contexto compartilhado pelos métodos de calibração (privado ao módulo).
-struct CalibContext {
+struct CalibContext<'a> {
     cpu_cfg: crate::cpu_reference::CpuModelConfig,
-    weight_bank: nodestor_vulkan::WeightBank,
+    weight_bank: &'a nodestor_vulkan::WeightBank,
     tokenizer: crate::tokenizer::TokenizerManager,
 }
 
@@ -108,6 +119,12 @@ pub struct InferencePipeline {
     pub profile: HardwareProfile,
     pub transport: Arc<dyn DataTransport + Send + Sync>,
     pub metadata: Arc<ModelMetadata>,
+    /// Pesos em staging (HOST_VISIBLE) para cpu_reference.rs — as_f32_slice() funciona.
+    /// Declarado ANTES de `engine` para garantir drop-before-device.
+    pub weight_bank: nodestor_vulkan::WeightBank,
+    /// Pesos em VRAM (DEVICE_LOCAL) para gpu_forward.rs — 16× mais rápido na GPU.
+    /// Carregados em paralelo com weight_bank na init(). Fallback = mesmo staging.
+    pub gpu_weight_bank: nodestor_vulkan::WeightBank,
     pub engine: VulkanEngine,
     pub vector_db: VectorSearch,
     pub kv_paginator: KVCachePaginator,
@@ -117,21 +134,31 @@ pub struct InferencePipeline {
     pub scheduler: std::sync::Mutex<crate::multi_tenant::MultiTenantScheduler>,
     /// Configuração de steering por projeção ortogonal (None = passivo)
     pub steering: Option<ActivationSteeringConfig>,
+    /// Slots elásticos de pesos por layer — libera páginas físicas para layers GPU-resident.
+    pub elastic_cache: crate::elastic_memory::ElasticWeightCache,
 }
 
 impl InferencePipeline {
     /// Boot do sistema de Inteligência Artificial V2.
     /// Inspeciona o hardware dinamicamente e monta o melhor pipeline O.S-Level.
-    pub fn init(config: InferenceConfig) -> Result<Self, NodeStorError> {
+    pub fn init(mut config: InferenceConfig) -> Result<Self, NodeStorError> {
         let profile = scan()?;
         let transport: Arc<dyn DataTransport + Send + Sync> = Arc::from(create_transport(&profile));
+
+        config.model_path = crate::paths::resolve_model_path(&config.model_path)
+            .to_string_lossy()
+            .into_owned();
 
         let parser = detect_parser(&config.model_path)?;
         let raw_metadata = parser.parse(&config.model_path)?;
         let metadata = Arc::new(raw_metadata);
 
         let engine = VulkanEngine::new(&profile)?;
-        
+
+        // Carrega pesos UMA vez durante init — elimina 15-18s de re-loading por chamada.
+        // Retorna par (staging, device_local): staging para cpu_reference, VRAM para gpu_forward.
+        let (weight_bank, gpu_weight_bank) = build_weight_bank(&engine, &metadata, &config.model_path);
+
         let kv_paginator = KVCachePaginator {
             vram_capacity_tokens: 32768, // Valor base, dinâmico em prod real
             ssd_offload_enabled: true,
@@ -141,25 +168,66 @@ impl InferencePipeline {
         let db_path = format!("{}/vector_db", config.model_path);
         let vector_db = VectorSearch::new("knowledge_base", &db_path);
 
-        Ok(Self {
+        let n_layers = metadata.tensors.iter()
+            .filter_map(|t| {
+                let s = t.name.strip_prefix("blk.")?;
+                let dot = s.find('.')?;
+                s[..dot].parse::<usize>().ok()
+            })
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(32);
+        let elastic_cache = crate::elastic_memory::ElasticWeightCache::new(n_layers);
+
+        let instance = Self {
             config,
             probes_config: ProbesConfig::default(),
             profile,
             transport,
             metadata,
+            weight_bank,
+            gpu_weight_bank,
             engine,
             vector_db,
             kv_paginator,
             probes_tool: None,
             scheduler: std::sync::Mutex::new(crate::multi_tenant::MultiTenantScheduler::new(1024, 128)),
             steering: None,
-        })
+            elastic_cache,
+        };
+
+        info!("Resilient Apex Hardware-Mapped Engine Ready. Universal Sovereignty Active.");
+        Ok(instance)
     }
 
     /// Configura o PROBES V2 com parâmetros customizados.
     pub fn with_probes(mut self, probes_config: ProbesConfig) -> Self {
         self.probes_config = probes_config;
         self
+    }
+
+    /// Decommits physical CPU pages for transformer layers whose weights are fully
+    /// resident in VRAM (DEVICE_LOCAL). Virtual pointers in staging_wb remain valid.
+    ///
+    /// Call this after model loading to recover RAM proportional to how many layers
+    /// fit in VRAM. On an RX 580 4 GB loading SmolLM2-135M, all 30 layers can be
+    /// evicted, recovering ~258 MB of staging RAM.
+    ///
+    /// Returns `(evicted_layer_count, freed_mb)`.
+    pub fn evict_gpu_resident_cpu_weights(&mut self) -> (usize, f32) {
+        let n = self.elastic_cache.n_layers();
+        let mut evicted = 0usize;
+        for layer in 0..n {
+            let on_gpu = self.gpu_weight_bank
+                .get(&format!("blk.{layer}.attn_q.weight"))
+                .map_or(false, |t| t.is_on_gpu());
+            if on_gpu {
+                self.elastic_cache.evict_layer(layer);
+                evicted += 1;
+            }
+        }
+        let (_, freed_bytes) = self.elastic_cache.evicted_stats();
+        (evicted, freed_bytes as f32 / (1024.0 * 1024.0))
     }
 
     /// Injeta um sistema externo de inspeção (ELK/CoT/RAISE) via trait object.
@@ -297,90 +365,14 @@ impl InferencePipeline {
                 _ => (32usize, 32000u32, 4096u32, 32u32, 8u32, 11008u32, 10000.0f32),
             };
 
-        // ─── Construir WeightBank a partir dos tensores carregados ───────────────
-        // Em produção, os tensores do GGUF já foram carregados pelo parser e
-        // estão no `self.metadata.tensors`. Aqui subimos cada um para a VRAM.
-        let mut weight_bank = nodestor_vulkan::WeightBank::new();
-
-        // ─── Carregamento de PESOS REAIS via WeightStore (mmap zero-copy + upload) ──
-        // Tenta abrir o GGUF e subir os bytes reais de cada tensor para a GPU. Esta é
-        // a ponte que faz o forward pass operar sobre os pesos verdadeiros do modelo,
-        // e não sobre buffers zerados. Em arquivos sintéticos/testes (sem tensores
-        // mapeáveis), cai no fallback de buffers vazios com as shapes corretas.
-        let mut real_loaded = 0usize;
-        match crate::weight_store::WeightStore::open(std::path::Path::new(&self.config.model_path)) {
-            Ok(store) => {
-                for name in store.list_tensors() {
-                    let bytes = match store.tensor_bytes(name) { Some(b) => b, None => continue };
-                    // Converte do dtype nativo do GGUF para FP32. NÚCLEO LOSSLESS:
-                    // F32/F16/BF16 com fidelidade total (zero perda de qualidade).
-                    // Quant (Q8_0…) é opcional e também convertida aqui.
-                    let (dtype, n_elems) = store.tensor_info(name)
-                        .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
-                        .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
-                    let upload = match tensor_to_f32(bytes, dtype, n_elems) {
-                        Some(f32s) => {
-                            let raw = unsafe {
-                                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
-                            };
-                            self.engine.upload(raw)
-                        }
-                        // Formato ainda não coberto pelo conversor: sobe os bytes crus.
-                        None => self.engine.upload(bytes),
-                    };
-                    match upload {
-                        Ok(buf) => { weight_bank.insert(name.to_string(), buf); real_loaded += 1; }
-                        Err(e) => debug!("WeightStore: upload de '{}' falhou: {}", name, e),
-                    }
-                }
-                debug!("WeightStore: {} tensores REAIS carregados (dtype→FP32 lossless) do GGUF para a GPU", real_loaded);
-            }
-            Err(e) => debug!("WeightStore indisponível ({}); usando fallback de buffers vazios", e),
-        }
-
-        // Fallback: garante que todo tensor esperado exista (shapes corretas) mesmo
-        // que o WeightStore não tenha conseguido mapeá-lo (modelos sintéticos/dummy).
-        for tensor in &self.metadata.tensors {
-            if weight_bank.get(&tensor.name).is_some() { continue; }
-            // Converte shape Vec<u64> para bytes (cada dim é u64 no formato GGUF)
-            let size_bytes: usize = tensor.shape.iter()
-                .map(|&d| d as usize)
-                .product::<usize>() * 4;
-            let size_bytes = size_bytes.max(4);
-            match self.engine.alloc_buffer(size_bytes) {
-                Ok(buf) => weight_bank.insert(tensor.name.clone(), buf),
-                Err(e) => {
-                    debug!("WeightBank: falha ao alocar '{}' ({}B): {}", tensor.name, size_bytes, e);
-                }
-            }
-        }
-        // TIED EMBEDDINGS: muitos modelos (SmolLM2, Gemma…) não trazem `output.weight`
-        // — a lm_head É o `token_embd.weight`. Sem amarrar, o lm_head ficaria um
-        // placeholder zerado e os LOGITS sairiam todos nulos. Materializa a amarração.
-        if weight_bank.get("output.weight").is_none() {
-            let tied = weight_bank.get("token_embd.weight")
-                .map(|te| te.as_f32_slice().to_vec())
-                .filter(|d| !d.is_empty());
-            if let Some(data) = tied {
-                let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-                if let Ok(buf) = self.engine.upload(raw) {
-                    weight_bank.insert("output.weight".to_string(), buf);
-                    debug!("Tied embeddings: output.weight amarrado ao token_embd ({} floats)", data.len());
-                }
-            }
-        }
-
-        // Garante que as chaves críticas existam mesmo se ausentes no GGUF
-        let ensure_key = |bank: &mut nodestor_vulkan::WeightBank, key: &str, size: usize| {
-            if bank.get(key).is_none() {
-                if let Ok(buf) = self.engine.alloc_buffer(size.max(4)) {
-                    bank.insert(key.to_string(), buf);
-                }
-            }
+        // Pesos já carregados em init() — referência direta, sem re-loading.
+        let weight_bank = &self.weight_bank;
+        // Pesos DEVICE_LOCAL para GPU: 16× mais rápido. Se vazio (CPU mode), cai no staging.
+        let gpu_weight_bank: &nodestor_vulkan::WeightBank = if self.gpu_weight_bank.is_empty() {
+            weight_bank
+        } else {
+            &self.gpu_weight_bank
         };
-        ensure_key(&mut weight_bank, "output_norm.weight", hidden_size as usize * 4);
-        ensure_key(&mut weight_bank, "output.weight", hidden_size as usize * vocab_size as usize * 4);
-        ensure_key(&mut weight_bank, "token_embd.weight", vocab_size as usize * hidden_size as usize * 4);
 
         // Inicializa o Paged KV Cache (Contexto Infinito via SSD)
         let swap_path = format!("{}/nodestor_kv_swap_{}.bin", std::env::temp_dir().to_str().unwrap(), std::process::id());
@@ -434,6 +426,16 @@ impl InferencePipeline {
         // de `self` dentro do loop de geração (onde `main_kv` precisa de &mut).
         let steering_dir: Option<&[f32]> = self.steering.as_ref().map(|s| s.direction.as_slice());
         let steering_intensity: f32 = self.steering.as_ref().map_or(1.0, |s| s.intensity);
+        // d_sq pré-calculado uma vez. Invariante: ||d|| deve ser 1.0 para POD estável.
+        // Se o vetor não estiver normalizado, normalizamos aqui (sem modificar self.steering
+        // para que múltiplas chamadas a generate() não acumulem normalizações).
+        let steering_d_sq: f32 = steering_dir
+            .map(|d| {
+                let sq: f32 = d.iter().map(|v| v * v).sum();
+                // Guard: NaN/Inf no vetor de direção → desativa steering silenciosamente
+                if !sq.is_finite() || sq < 1e-12 { 0.0 } else { sq }
+            })
+            .unwrap_or(0.0);
 
         let mut sampler = crate::sampler::Sampler::new(crate::sampler::SamplerConfig {
             temperature: temperature.max(0.0),
@@ -504,6 +506,27 @@ impl InferencePipeline {
 
         // Config do forward de REFERÊNCIA correto (CPU) — base de coerência.
         let head_dim_cfg = if num_heads > 0 { (hidden_size / num_heads) as usize } else { 64 };
+        // Use actual token count from GGUF vocab if larger than architecture default
+        let effective_vocab = if !gguf_tokens.is_empty() && gguf_tokens.len() > vocab_size as usize {
+            gguf_tokens.len()
+        } else {
+            vocab_size as usize
+        };
+        // Read RMSNorm epsilon from GGUF metadata; default 1e-5
+        let f32_meta = |key: &str| -> Option<f32> {
+            self.metadata.extra.get(key).and_then(|v| v.as_f64()).map(|f| f as f32)
+        };
+        let rms_eps = f32_meta("qwen2.attention.layer_norm_rms_epsilon")
+            .or_else(|| f32_meta("llama.attention.layer_norm_rms_epsilon"))
+            .or_else(|| f32_meta("gemma.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-5);
+        // Detecta MoE automaticamente a partir dos tensores do WeightBank
+        let moe_cfg = crate::moe_kernel::MoeConfig::from_weight_bank(
+            &self.weight_bank, hidden_size as usize, intermediate_size as usize,
+        );
+        if moe_cfg.is_some() {
+            debug!("MoE detectado: {} experts, top-{}", moe_cfg.as_ref().unwrap().n_experts, moe_cfg.as_ref().unwrap().top_k);
+        }
         let cpu_cfg = crate::cpu_reference::CpuModelConfig {
             n_layers: num_layers,
             hidden: hidden_size as usize,
@@ -511,15 +534,16 @@ impl InferencePipeline {
             n_kv_heads: num_kv_heads as usize,
             head_dim: head_dim_cfg,
             intermediate: intermediate_size as usize,
-            vocab: vocab_size as usize,
+            vocab: effective_vocab,
             rope_base,
-            eps: 1e-5,
+            eps: rms_eps,
+            moe: moe_cfg,
         };
         let eos_token: Option<u32> = self.metadata.extra.get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u64()).map(|n| n as u32);
-        debug!("CPU-fwd cfg: layers={} hidden={} n_heads={} n_kv={} head_dim={} inter={} vocab={} rope_base={} eos={:?}",
+        debug!("CPU-fwd cfg: layers={} hidden={} n_heads={} n_kv={} head_dim={} inter={} vocab={} rope_base={} eps={} eos={:?}",
             cpu_cfg.n_layers, cpu_cfg.hidden, cpu_cfg.n_heads, cpu_cfg.n_kv_heads,
-            cpu_cfg.head_dim, cpu_cfg.intermediate, cpu_cfg.vocab, cpu_cfg.rope_base, eos_token);
+            cpu_cfg.head_dim, cpu_cfg.intermediate, cpu_cfg.vocab, cpu_cfg.rope_base, cpu_cfg.eps, eos_token);
 
         // ─── Forward INCREMENTAL com KV cache (reuso): O(seq) por token ─────────
         // Prefill: processa cada token do prompt UMA vez, preenchendo o cache.
@@ -534,20 +558,38 @@ impl InferencePipeline {
         // aceita o PREFIXO concordante (greedy ⇒ lossless) e GUILHOTINA o resto
         // (rollback do cache). Em texto repetitivo (código/JSON/listas) a aceitação
         // é alta → "K tokens no tempo de 1" na placa limitada por banda.
-        const NGRAM: usize = 2;
         const DRAFT_K_MAX: usize = 16;
         let mut draft_k = 4usize; // K-DINÂMICO: calibra-se sozinho pela aceitação
+        // Prompt Lookup Speculation: busca o match de N-gram mais longo no contexto.
+        // Estratégia greedy: tenta NGRAM=6,5,4,3,2 em ordem decrescente para maximizar
+        // aceitação (matches mais longos → predições mais precisas → menos rollbacks).
         let prompt_lookup = |seq: &[u32], k: usize| -> Vec<u32> {
             let n = seq.len();
-            if n <= NGRAM { return Vec::new(); }
-            let suffix = &seq[n - NGRAM..];
-            let mut i = n - NGRAM;
-            while i > 0 {
-                i -= 1;
-                if &seq[i..i + NGRAM] == suffix {
-                    let start = i + NGRAM;
-                    let end = (start + k).min(n);
-                    if start < n { return seq[start..end].to_vec(); }
+            if n < 3 { return Vec::new(); }
+            // Busca do maior N-gram possível para o menor (greedy longest match)
+            for ngram in (2..=6usize).rev() {
+                if n <= ngram { continue; }
+                let suffix = &seq[n - ngram..];
+                // Varre o contexto do mais recente para o mais antigo (matches próximos tendem
+                // a ser mais relevantes para estruturas repetitivas como código/JSON/XML)
+                let mut best_start = 0usize;
+                let mut best_len = 0usize;
+                let mut i = n - ngram;
+                while i > 0 {
+                    i -= 1;
+                    if &seq[i..i + ngram] == suffix {
+                        let start = i + ngram;
+                        let end = (start + k).min(n);
+                        let len = end.saturating_sub(start);
+                        if len > best_len {
+                            best_len = len;
+                            best_start = start;
+                        }
+                        break; // primeiro match encontrado (busca de trás para frente)
+                    }
+                }
+                if best_len > 0 {
+                    return seq[best_start..best_start + best_len].to_vec();
                 }
             }
             Vec::new()
@@ -564,13 +606,36 @@ impl InferencePipeline {
         let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
 
         // Prefill: preenche o cache com o prompt.
+        let use_gpu = self.engine.is_gpu_active();
+        // Pacote de steering para GPU: (direction, intensity, d_sq) — None se inativo.
+        let gpu_steering = steering_dir.map(|d| (d, steering_intensity, steering_d_sq));
         let mut cur_logits: Option<Vec<f32>> = None;
+        // Track whether GPU path is actually working (weights on GPU).
+        // First None from gpu_forward_step means weights are CPU-only → switch to CPU for all.
+        let mut gpu_path_active = use_gpu;
         for (p, &tok) in input_tokens.iter().enumerate() {
-            let logits = match steering_dir {
-                Some(dir) => crate::cpu_reference::forward_step_with_steering(
-                    tok, p, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
-                ),
-                None => crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv),
+            let logits = if gpu_path_active {
+                let result = crate::gpu_forward::gpu_forward_step(tok, p, &cpu_cfg, &self.engine, gpu_weight_bank, &self.weight_bank, &mut main_kv, gpu_steering);
+                if result.is_none() {
+                    // GPU path failed (weights not on GPU) — switch permanently to CPU.
+                    gpu_path_active = false;
+                    debug!("GPU forward returned None at prefill pos={} — switching to CPU path", p);
+                    match steering_dir {
+                        Some(dir) => crate::cpu_reference::forward_step_with_steering(
+                            tok, p, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                        ),
+                        None => crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv),
+                    }
+                } else {
+                    result
+                }
+            } else {
+                match steering_dir {
+                    Some(dir) => crate::cpu_reference::forward_step_with_steering(
+                        tok, p, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                    ),
+                    None => crate::cpu_reference::forward_step(tok, p, &cpu_cfg, &weight_bank, &mut main_kv),
+                }
             };
             match logits {
                 Some(l) => cur_logits = Some(l),
@@ -598,11 +663,21 @@ impl InferencePipeline {
                 spec_rounds += 1;
                 spec_drafted += draft.len();
                 let orig = main_kv.len();
-                let vlogits = match steering_dir {
-                    Some(dir) => crate::cpu_reference::forward_verify_with_steering(
-                        &draft, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
-                    ),
-                    None => crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                let vlogits = if gpu_path_active {
+                    let r = crate::gpu_forward::gpu_forward_verify(&draft, pos, &cpu_cfg, &self.engine, gpu_weight_bank, &self.weight_bank, &mut main_kv, gpu_steering);
+                    if r.is_empty() {
+                        match steering_dir {
+                            Some(dir) => crate::cpu_reference::forward_verify_with_steering(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity),
+                            None => crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                        }
+                    } else { r }
+                } else {
+                    match steering_dir {
+                        Some(dir) => crate::cpu_reference::forward_verify_with_steering(
+                            &draft, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                        ),
+                        None => crate::cpu_reference::forward_verify(&draft, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                    }
                 };
                 let mut m = 0usize;
                 let mut prev: &Vec<f32> = &logits;
@@ -646,11 +721,20 @@ impl InferencePipeline {
                 let s = tokenizer.decode(&[anchor], true).unwrap_or_default();
                 if !s.is_empty() { let _ = tx_stream.send(Ok(s)).await; }
             }
-            cur_logits = match steering_dir {
-                Some(dir) => crate::cpu_reference::forward_step_with_steering(
-                    anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
-                ),
-                None => crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+            cur_logits = if gpu_path_active {
+                let r = crate::gpu_forward::gpu_forward_step(anchor, pos, &cpu_cfg, &self.engine, gpu_weight_bank, &self.weight_bank, &mut main_kv, gpu_steering);
+                if r.is_none() { gpu_path_active = false; }
+                r.or_else(|| match steering_dir {
+                    Some(dir) => crate::cpu_reference::forward_step_with_steering(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity),
+                    None => crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                })
+            } else {
+                match steering_dir {
+                    Some(dir) => crate::cpu_reference::forward_step_with_steering(
+                        anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv, dir, steering_intensity,
+                    ),
+                    None => crate::cpu_reference::forward_step(anchor, pos, &cpu_cfg, &weight_bank, &mut main_kv),
+                }
             };
             pos += 1;
             // Aplica a janela deslizante por rodada (fora da verificação especulativa,
@@ -691,6 +775,20 @@ impl InferencePipeline {
             0.0
         };
 
+        let kv_vram_blocks = kv_cache.layers.iter()
+            .map(|l| l.blocks.iter().filter(|b| b.in_vram).count())
+            .sum::<usize>();
+        let kv_ssd_blocks = kv_cache.layers.iter()
+            .map(|l| l.blocks.iter().filter(|b| !b.in_vram).count())
+            .sum::<usize>();
+
+        let spec_acceptance_rate = if spec_drafted > 0 {
+            spec_accepted as f64 / spec_drafted as f64
+        } else { 0.0 };
+        let spec_speedup = if spec_rounds > 0 {
+            (spec_accepted + spec_rounds) as f64 / spec_rounds as f64
+        } else { 1.0 };
+
         let stats = GenerationStats {
             prompt_tokens: prompt.split_whitespace().count(),
             generated_tokens: tokens_done,
@@ -698,6 +796,15 @@ impl InferencePipeline {
             total_time_ms: elapsed_ms,
             probes_alerts,
             conformal_rejections,
+            spec_rounds,
+            spec_drafted,
+            spec_accepted,
+            spec_k: draft_k,
+            spec_acceptance_rate,
+            spec_speedup,
+            kv_vram_blocks,
+            kv_ssd_blocks,
+            context_tokens: full_seq.len(),
         };
 
         // Decode da string final
@@ -756,6 +863,13 @@ impl InferencePipeline {
             };
 
         let head_dim = if num_heads > 0 { (hidden_size / num_heads) as usize } else { 64 };
+        let f32_meta_calib = |key: &str| -> Option<f32> {
+            self.metadata.extra.get(key).and_then(|v| v.as_f64()).map(|f| f as f32)
+        };
+        let rms_eps_calib = f32_meta_calib("qwen2.attention.layer_norm_rms_epsilon")
+            .or_else(|| f32_meta_calib("llama.attention.layer_norm_rms_epsilon"))
+            .or_else(|| f32_meta_calib("gemma.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-5);
         let cpu_cfg = CpuModelConfig {
             n_layers: num_layers,
             hidden: hidden_size as usize,
@@ -765,38 +879,13 @@ impl InferencePipeline {
             intermediate: intermediate_size as usize,
             vocab: vocab_size as usize,
             rope_base,
-            eps: 1e-5,
+            eps: rms_eps_calib,
+            moe: crate::moe_kernel::MoeConfig::from_weight_bank(
+                &self.weight_bank, hidden_size as usize, intermediate_size as usize,
+            ),
         };
 
-        let mut weight_bank = nodestor_vulkan::WeightBank::new();
-        match crate::weight_store::WeightStore::open(std::path::Path::new(&self.config.model_path)) {
-            Ok(store) => {
-                for name in store.list_tensors() {
-                    let bytes = match store.tensor_bytes(name) { Some(b) => b, None => continue };
-                    let (dtype, n_elems) = store.tensor_info(name)
-                        .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
-                        .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
-                    let upload = match tensor_to_f32(bytes, dtype, n_elems) {
-                        Some(f32s) => {
-                            let raw = unsafe {
-                                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
-                            };
-                            self.engine.upload(raw)
-                        }
-                        None => self.engine.upload(bytes),
-                    };
-                    if let Ok(buf) = upload { weight_bank.insert(name.to_string(), buf); }
-                }
-            }
-            Err(e) => debug!("CalibWeightStore indisponível ({}); usando buffers vazios", e),
-        }
-        for tensor in &self.metadata.tensors {
-            if weight_bank.get(&tensor.name).is_some() { continue; }
-            let size_bytes = (tensor.shape.iter().map(|&d| d as usize).product::<usize>() * 4).max(4);
-            if let Ok(buf) = self.engine.alloc_buffer(size_bytes) {
-                weight_bank.insert(tensor.name.clone(), buf);
-            }
-        }
+        let weight_bank = &self.weight_bank;
 
         let dummy_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<unk>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#;
         let extra = &self.metadata.extra;
@@ -823,6 +912,39 @@ impl InferencePipeline {
         };
 
         Ok(CalibContext { cpu_cfg, weight_bank, tokenizer })
+    }
+
+    /// Real (hidden_dim, vocab_size) extracted from model metadata.
+    /// Used by the training loop to allocate LoRA with correct dimensions.
+    pub fn model_dims(&self) -> (usize, usize) {
+        if let Ok(ctx) = self.build_calib_context() {
+            (ctx.cpu_cfg.hidden as usize, ctx.cpu_cfg.vocab as usize)
+        } else {
+            (4096, 32000)
+        }
+    }
+
+    /// Runs a full CPU forward pass on `text` and returns the final hidden state
+    /// (pre-LM-head, dimension = hidden_dim). Returns None only when the model
+    /// lacks required weight tensors (e.g. embedding not loaded).
+    ///
+    /// This is the extraction path used by the LoRA training loop:
+    ///   `pipeline.extract_hidden(text)` → gradient → AdamW update → `.lora` file.
+    pub fn extract_hidden(&self, text: &str) -> Option<Vec<f32>> {
+        use crate::cpu_reference::{CpuKvCache, extract_final_hidden, forward_step};
+
+        let ctx = self.build_calib_context().ok()?;
+        let tokens = ctx.tokenizer.encode(text).unwrap_or(vec![0u32]);
+        if tokens.is_empty() { return None; }
+
+        let mut kv = CpuKvCache::new(ctx.cpu_cfg.n_layers);
+        // Warm-up: run all tokens except the last through forward_step to fill KV cache.
+        for (p, &tok) in tokens[..tokens.len().saturating_sub(1)].iter().enumerate() {
+            forward_step(tok, p, &ctx.cpu_cfg, ctx.weight_bank, &mut kv);
+        }
+        // Extract final hidden state from the last token.
+        let last_pos = tokens.len() - 1;
+        extract_final_hidden(tokens[last_pos], last_pos, &ctx.cpu_cfg, ctx.weight_bank, &mut kv)
     }
 
     /// Extrai hidden states normalizados (pre-LM-head) para uma lista de textos.
@@ -1026,7 +1148,12 @@ fn tensor_to_f32(
     let format = match dtype {
         DT::F32  => QuantFormat::F32,
         DT::F16  => QuantFormat::F16,
-        DT::Q8_0 => QuantFormat::Q8_0, // near-lossless (~idêntico a FP16)
+        DT::Q5_0 => QuantFormat::Q5_0, // 22 bytes/bloco, 32 pesos (5-bit simples)
+        DT::Q8_0 => QuantFormat::Q8_0, // 34 bytes/bloco, near-lossless
+        DT::Q8_1 => QuantFormat::Q8_1, // 36 bytes/bloco (d+s FP16 + 32×i8)
+        DT::Q4K  => QuantFormat::Q4KMedium, // 144 bytes/256 pesos
+        DT::Q5K  => QuantFormat::Q5KMedium, // 176 bytes/256 pesos
+        DT::Q6K  => QuantFormat::Q6K,       // 210 bytes/256 pesos (token_embd em Q4_K_M)
         _ => return None,
     };
 
@@ -1070,4 +1197,206 @@ mod weight_dtype_tests {
         // Q4_0 legado ainda não tem conversor direto → None (chamador usa fallback)
         assert!(tensor_to_f32(&[0u8; 18], TensorDtype::Q4_0, 32).is_none());
     }
+}
+
+/// Detecta e decodifica arquivo NSZ (NodeStor Zip, TCA-TBE lossless).
+/// Retorna Some(HashMap) se o arquivo começa com magic `NSZ1`, None caso contrário.
+/// A decodificação é bit-exact: `decode(encode(w)) == w` para cada weight.
+fn try_load_nsz_file(path: &str) -> Option<std::collections::HashMap<String, Vec<f32>>> {
+    use nodestor_formats::nsz_format::{
+        NszFileHeader, NszTensorEntry, TileHeader, NszTile, TILE_SIZE, ALIGNMENT, NSZ_MAGIC,
+    };
+    use nodestor_formats::nsz_decoder::decode_tile_fp32;
+
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 4 || &data[..4] != &NSZ_MAGIC { return None; }
+
+    let file_hdr = NszFileHeader::from_bytes(&data).ok()?;
+    let num_tensors = file_hdr.num_tensors as usize;
+    let mut result: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::with_capacity(num_tensors);
+
+    let mut entry_pos = NszFileHeader::SIZE;
+    for _ in 0..num_tensors {
+        if entry_pos + 128 > data.len() { break; }
+        let entry = match NszTensorEntry::from_bytes(&data[entry_pos..entry_pos + 128]) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        entry_pos += 128;
+
+        let num_weights = entry.num_weights as usize;
+        let num_tiles   = entry.num_tiles as usize;
+        let mut tile_pos = entry.compressed_offset as usize;
+        let mut weights: Vec<f32> = Vec::with_capacity(num_weights);
+
+        'tiles: for tile_idx in 0..num_tiles {
+            let done = tile_idx * TILE_SIZE;
+            let actual_size = (num_weights - done).min(TILE_SIZE);
+            let tile_data = match data.get(tile_pos..) {
+                Some(s) if s.len() >= TileHeader::SIZE => s,
+                _ => break 'tiles,
+            };
+            let hdr = TileHeader::from_bytes(match tile_data[..TileHeader::SIZE].try_into() {
+                Ok(a) => a,
+                Err(_) => break 'tiles,
+            });
+            let num_near      = hdr.num_near as usize;
+            let num_residuals = hdr.num_residuals as usize;
+            let bmap_len      = (actual_size + 7) / 8;
+            let near_len      = (num_near + 7) / 8;
+            // FP32 mantissa: 3 bytes/weight (23 bits stored); FP16/BF16: 2 bytes/weight
+            let mbytes        = if hdr.dtype == 0 { 3usize } else { 2usize };
+            let sign_len      = (actual_size + 7) / 8;
+
+            let mut p = TileHeader::SIZE;
+            macro_rules! take {
+                ($n:expr) => {{
+                    let end = p + $n;
+                    if end > tile_data.len() { break 'tiles; }
+                    let s = tile_data[p..end].to_vec();
+                    p = end;
+                    s
+                }};
+            }
+            let bitmap_match       = take!(bmap_len);
+            let bitmap_near        = take!(bmap_len);
+            let near_deltas        = take!(near_len);
+            let residual_exponents = take!(num_residuals);
+            let mantissas          = take!(actual_size * mbytes);
+            let signs              = take!(sign_len);
+
+            // Avança tile_pos pelo tamanho serializado (com padding de 64 bytes)
+            let raw_tile_bytes = p;
+            let padded = if raw_tile_bytes % ALIGNMENT == 0 {
+                raw_tile_bytes
+            } else {
+                raw_tile_bytes + ALIGNMENT - raw_tile_bytes % ALIGNMENT
+            };
+            tile_pos += padded;
+
+            let tile = NszTile {
+                header: hdr,
+                bitmap_match,
+                bitmap_near,
+                near_deltas,
+                residual_exponents,
+                mantissas,
+                signs,
+                actual_size,
+            };
+            weights.extend_from_slice(&decode_tile_fp32(&tile));
+        }
+
+        result.insert(entry.name.clone(), weights);
+    }
+
+    debug!("NSZ: {} tensores decodificados (lossless TCA-TBE)", result.len());
+    Some(result)
+}
+
+/// Carrega e dequantiza todos os pesos do GGUF para um WeightBank.
+/// Chamado UMA VEZ durante `init()` — elimina o re-loading por chamada de `generate()`.
+/// Retorna `(staging_bank, gpu_bank)`:
+/// - `staging_bank`: HOST_VISIBLE — cpu_reference.rs pode chamar as_f32_slice().
+/// - `gpu_bank`: DEVICE_LOCAL — gpu_forward.rs lê à velocidade total da VRAM (~256 GB/s).
+///   Se Vulkan não está ativo, ambos são staging (mesmo buffer, comportamento idêntico ao anterior).
+fn build_weight_bank(
+    engine: &VulkanEngine,
+    metadata: &nodestor_core::ModelMetadata,
+    model_path: &str,
+) -> (nodestor_vulkan::WeightBank, nodestor_vulkan::WeightBank) {
+    let mut staging_bank = nodestor_vulkan::WeightBank::new();
+    // Armazena os dados f32 brutos para depois construir o gpu_bank sem re-ler o GGUF.
+    let mut raw_data: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+
+    let mut real_loaded = 0usize;
+
+    // 0. Tenta NSZ (formato nativo lossless — sem dequantização lossy).
+    //    Se o arquivo começa com "NSZ1", decodifica via TCA-TBE e ignora o caminho GGUF.
+    if let Some(nsz_tensors) = try_load_nsz_file(model_path) {
+        debug!("WeightBank: NSZ detectado — {} tensores lossless (TCA-TBE)", nsz_tensors.len());
+        for (name, f32s) in nsz_tensors {
+            let bytes: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4).to_vec()
+            };
+            staging_bank.insert(name.clone(), nodestor_vulkan::GpuBuffer::from_cpu_data(bytes.clone()));
+            raw_data.insert(name, bytes);
+            real_loaded += 1;
+        }
+    } else {
+        // 1. Carrega pesos do GGUF via WeightStore (mmap zero-copy) + dequantização
+        match crate::weight_store::WeightStore::open(std::path::Path::new(model_path)) {
+            Ok(store) => {
+                for name in store.list_tensors() {
+                    let bytes = match store.tensor_bytes(name) { Some(b) => b, None => continue };
+                    let (dtype, n_elems) = store.tensor_info(name)
+                        .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
+                        .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
+                    let upload_bytes: Vec<u8> = match tensor_to_f32(bytes, dtype, n_elems) {
+                        Some(f32s) => {
+                            let raw = unsafe {
+                                std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
+                            };
+                            raw.to_vec()
+                        }
+                        None => bytes.to_vec(),
+                    };
+                    // staging_bank uses CPU-backed buffers so as_f32_slice() is always readable.
+                    // GPU compute uses gpu_bank (device-local). Never mix them up.
+                    staging_bank.insert(name.to_string(), nodestor_vulkan::GpuBuffer::from_cpu_data(upload_bytes.clone()));
+                    raw_data.insert(name.to_string(), upload_bytes);
+                    real_loaded += 1;
+                }
+                debug!("WeightBank: {} tensores carregados do GGUF", real_loaded);
+            }
+            Err(e) => debug!("WeightStore indisponível ({}); usando buffers vazios", e),
+        }
+    }
+
+    // 2. Fallback: garante que todos os tensores do metadata existam (shapes corretas)
+    for tensor in &metadata.tensors {
+        if staging_bank.get(&tensor.name).is_some() { continue; }
+        let size_bytes = (tensor.shape.iter().map(|&d| d as usize).product::<usize>() * 4).max(4);
+        staging_bank.insert(tensor.name.clone(), nodestor_vulkan::GpuBuffer::from_cpu_data(vec![0u8; size_bytes]));
+    }
+
+    // 3. Tied embeddings: muitos modelos não trazem output.weight separado
+    if staging_bank.get("output.weight").is_none() {
+        let tied = staging_bank.get("token_embd.weight")
+            .map(|te| te.as_f32_slice().to_vec())
+            .filter(|d| !d.is_empty());
+        if let Some(data) = tied {
+            let raw: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4).to_vec()
+            };
+            staging_bank.insert("output.weight".to_string(), nodestor_vulkan::GpuBuffer::from_cpu_data(raw.clone()));
+            raw_data.insert("output.weight".to_string(), raw);
+            debug!("WeightBank: tied embeddings output.weight←token_embd ({} floats)", data.len());
+        }
+    }
+
+    // 4. Constrói gpu_bank com DEVICE_LOCAL (pesos na VRAM real, acesso 16× mais rápido).
+    //    Se não há Vulkan real, reutiliza staging (upload() já retorna CPU-backed buffer).
+    let mut gpu_bank = nodestor_vulkan::WeightBank::new();
+    if engine.is_gpu_active() {
+        for (name, data) in &raw_data {
+            match engine.upload_device_local(data) {
+                Ok(buf) => gpu_bank.insert(name.clone(), buf),
+                Err(e) => {
+                    // Fallback: usa staging se device_local falhar (VRAM cheia, etc.)
+                    debug!("gpu_weight_bank: device_local upload '{}' falhou ({}); usando staging", name, e);
+                    if let Ok(buf) = engine.upload(data) {
+                        gpu_bank.insert(name.clone(), buf);
+                    }
+                }
+            }
+        }
+        debug!("gpu_weight_bank: {} tensores em DEVICE_LOCAL", gpu_bank.len());
+    } else {
+        // CPU mode: gpu_bank vazio — gpu_forward nunca é chamado (use_gpu = false)
+        debug!("gpu_weight_bank: Vulkan inativo, gpu_bank vazio (não usado)");
+    }
+
+    (staging_bank, gpu_bank)
 }

@@ -211,6 +211,11 @@ impl GraphInterpreter {
                 0
             };
 
+            let rope_base = Self::try_f32_from_extra(&metadata.extra, &[
+                "llama.rope.freq_base", "qwen2.rope.freq_base", "gemma.rope.freq_base",
+                "phi3.rope.freq_base", "model.rope_theta", "rope_theta",
+            ]).unwrap_or(10000.0);
+
             return Ok(ModelArchitecture::Llama {
                 num_layers,
                 hidden_dim,
@@ -219,7 +224,7 @@ impl GraphInterpreter {
                 intermediate_size,
                 head_dim: if num_heads > 0 { hidden_dim / num_heads } else { 64 },
                 vocab_size: Self::extract_vocab_size(metadata),
-                rope_base: 10000.0,
+                rope_base,
                 is_moe,
                 num_experts,
             });
@@ -481,21 +486,33 @@ impl GraphInterpreter {
     }
 
     fn extract_llama_dims(metadata: &ModelMetadata) -> (u32, u32, u32, u32) {
-        // Tenta extrair dos metadados GGUF via `extra` JSON
+        // Tenta extrair dos metadados GGUF via `extra` JSON.
+        // Cobre: llama (Llama/Mistral/Phi), qwen2 (Qwen2.5), gemma, phi, falcon, gpt2, etc.
         let hidden = Self::try_u32_from_extra(&metadata.extra, &[
-            "llama.embedding_length", "model.hidden_size", "hidden_size"
+            "llama.embedding_length", "qwen2.embedding_length", "gemma.embedding_length",
+            "phi2.embedding_length", "phi3.embedding_length", "falcon.embedding_length",
+            "gpt2.embedding_length", "model.hidden_size", "hidden_size",
         ]).unwrap_or(4096);
 
         let heads = Self::try_u32_from_extra(&metadata.extra, &[
-            "llama.attention.head_count", "model.num_attention_heads", "num_attention_heads"
+            "llama.attention.head_count", "qwen2.attention.head_count",
+            "gemma.attention.head_count", "phi2.attention.head_count",
+            "phi3.attention.head_count", "falcon.attention.head_count",
+            "gpt2.attention.head_count", "model.num_attention_heads", "num_attention_heads",
         ]).unwrap_or(32);
 
         let kv_heads = Self::try_u32_from_extra(&metadata.extra, &[
-            "llama.attention.head_count_kv", "model.num_key_value_heads", "num_key_value_heads"
+            "llama.attention.head_count_kv", "qwen2.attention.head_count_kv",
+            "gemma.attention.head_count_kv", "phi2.attention.head_count_kv",
+            "phi3.attention.head_count_kv", "falcon.attention.head_count_kv",
+            "gpt2.attention.head_count_kv", "model.num_key_value_heads", "num_key_value_heads",
         ]).unwrap_or(heads);
 
         let intermediate = Self::try_u32_from_extra(&metadata.extra, &[
-            "llama.feed_forward_length", "model.intermediate_size", "intermediate_size"
+            "llama.feed_forward_length", "qwen2.feed_forward_length",
+            "gemma.feed_forward_length", "phi2.feed_forward_length",
+            "phi3.feed_forward_length", "falcon.feed_forward_length",
+            "gpt2.feed_forward_length", "model.intermediate_size", "intermediate_size",
         ]).unwrap_or(11008);
 
         (hidden, heads, kv_heads, intermediate)
@@ -518,9 +535,10 @@ impl GraphInterpreter {
     }
 
     fn extract_vocab_size(metadata: &ModelMetadata) -> u32 {
-        // Tenta extrair do metadado
         Self::try_u32_from_extra(&metadata.extra, &[
-            "llama.vocab_size", "bert.vocab_size", "vocab_size", "tokenizer.ggml.tokens"
+            "llama.vocab_size", "qwen2.vocab_size", "gemma.vocab_size",
+            "phi2.vocab_size", "phi3.vocab_size", "falcon.vocab_size",
+            "gpt2.vocab_size", "bert.vocab_size", "vocab_size", "tokenizer.ggml.tokens",
         ]).unwrap_or(32000)
     }
 
@@ -530,9 +548,24 @@ impl GraphInterpreter {
                 if let Some(n) = v.as_u64() {
                     return Some(n as u32);
                 }
-                // Tenta como string (alguns exporters GGUF serializam como string)
                 if let Some(s) = v.as_str() {
                     if let Ok(n) = s.parse::<u32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn try_f32_from_extra(extra: &serde_json::Value, keys: &[&str]) -> Option<f32> {
+        for key in keys {
+            if let Some(v) = extra.get(key) {
+                if let Some(n) = v.as_f64() {
+                    return Some(n as f32);
+                }
+                if let Some(s) = v.as_str() {
+                    if let Ok(n) = s.parse::<f32>() {
                         return Some(n);
                     }
                 }
@@ -659,6 +692,46 @@ mod tests {
         if let ModelArchitecture::Llama { num_layers, hidden_dim, .. } = arch {
             assert_eq!(num_layers, 2, "Deve detectar 2 camadas (blk.0 e blk.1)");
             assert_eq!(hidden_dim, 4096, "hidden_dim deve ser 4096");
+        }
+    }
+
+    #[test]
+    fn test_detect_qwen2_architecture_dims() {
+        // Qwen2.5-0.5B usa chaves qwen2.* no GGUF — devem ser lidas corretamente
+        let meta = ModelMetadata {
+            format: ModelFormat::Gguf,
+            model_name: Some("qwen2.5-0.5b".to_string()),
+            architecture: Some("qwen2".to_string()),
+            param_count: Some(500_000_000),
+            tensors: vec![
+                make_tensor("blk.0.attn_q.weight"),
+                make_tensor("blk.0.attn_k.weight"),
+                make_tensor("blk.0.attn_v.weight"),
+                make_tensor("blk.0.ffn_gate.weight"),
+                make_tensor("blk.1.attn_q.weight"),
+                make_tensor("blk.1.ffn_gate.weight"),
+                make_tensor("token_embd.weight"),
+            ],
+            data_offset: 0,
+            file_size: 500 * 1024 * 1024,
+            extra: serde_json::json!({
+                "qwen2.embedding_length": 896,
+                "qwen2.attention.head_count": 14,
+                "qwen2.attention.head_count_kv": 2,
+                "qwen2.feed_forward_length": 4864,
+                "qwen2.vocab_size": 151936,
+                "qwen2.rope.freq_base": 1000000.0
+            }),
+        };
+        let arch = GraphInterpreter::detect_architecture(&meta).unwrap();
+        assert!(matches!(arch, ModelArchitecture::Llama { .. }), "Qwen2 deve detectar como Llama-family");
+        if let ModelArchitecture::Llama { hidden_dim, num_heads, num_kv_heads, intermediate_size, vocab_size, rope_base, .. } = arch {
+            assert_eq!(hidden_dim, 896, "hidden_dim deve ser 896 (não 4096)");
+            assert_eq!(num_heads, 14, "num_heads deve ser 14");
+            assert_eq!(num_kv_heads, 2, "num_kv_heads deve ser 2");
+            assert_eq!(intermediate_size, 4864, "intermediate deve ser 4864");
+            assert_eq!(vocab_size, 151936, "vocab deve ser 151936");
+            assert!((rope_base - 1_000_000.0f32).abs() < 1.0, "rope_base deve ser 1M, got {}", rope_base);
         }
     }
 

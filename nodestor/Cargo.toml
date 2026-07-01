@@ -48,6 +48,7 @@ axum = "0.8"
 
 # === CLI ===
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
 
 # === Hardware Detection ===
 sysinfo = "0.32"
@@ -61,6 +62,7 @@ uuid = { version = "1", features = ["v4"] }
 dashmap = "6"
 sha2 = "0.10"
 rayon = "1.10"
+ratatui = "0.29"
 
 # === Telemetria ===
 opentelemetry = "0.24"
@@ -69,10 +71,11 @@ opentelemetry-otlp = "0.17"
 prometheus = "0.13"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 4
 opt-level = 3
 strip = true
+debug = false
 panic = "abort"
 
 [profile.release.build-override]

@@ -14,6 +14,7 @@
 //! correto como base.
 
 use nodestor_vulkan::WeightBank;
+use rayon::prelude::*;
 
 /// Dimensões e hiperparâmetros do modelo (extraídos do GGUF/GraphInterpreter).
 pub struct CpuModelConfig {
@@ -26,6 +27,8 @@ pub struct CpuModelConfig {
     pub vocab: usize,
     pub rope_base: f32,
     pub eps: f32,
+    /// MoE: configuração de roteamento (None = modelo denso padrão).
+    pub moe: Option<crate::moe_kernel::MoeConfig>,
 }
 
 #[inline]
@@ -34,19 +37,13 @@ fn weight<'a>(wb: &'a WeightBank, key: &str) -> Option<&'a [f32]> {
 }
 
 /// y[o] = Σ_i W[o·in_dim + i] · x[i]   (W em layout GGUF [out_dim, in_dim]).
+/// Parallelized with rayon; inner loop uses iter().zip() for AVX2 auto-vectorization.
 fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
-    let mut y = vec![0.0f32; out_dim];
-    for o in 0..out_dim {
+    (0..out_dim).into_par_iter().map(|o| {
         let base = o * in_dim;
-        if base + in_dim > w.len() { break; }
-        let row = &w[base..base + in_dim];
-        let mut acc = 0.0f32;
-        for i in 0..in_dim {
-            acc += row[i] * x[i];
-        }
-        y[o] = acc;
-    }
-    y
+        if base + in_dim > w.len() { return 0.0f32; }
+        w[base..base + in_dim].iter().zip(x.iter()).map(|(&a, &b)| a * b).sum()
+    }).collect()
 }
 
 /// RMSNorm: y[i] = x[i] / sqrt(mean(x²) + eps) · w[i].
@@ -81,16 +78,39 @@ fn softmax(s: &mut [f32]) {
 ///   x'[2i+1] = x[2i]·sin + x[2i+1]·cos
 fn rope_neox(vec: &mut [f32], n_heads: usize, hd: usize, pos: usize, base: f32) {
     let half = hd / 2;
+    let pos_f = pos as f32;
+    // Precompute (sin, cos) once per dimension — same across all heads.
+    // Eliminates n_heads repetitions of powf (expensive transcendental).
+    let sincos: Vec<(f32, f32)> = (0..half).map(|i| {
+        (pos_f * base.powf(-2.0 * i as f32 / hd as f32)).sin_cos()
+    }).collect();
     for h in 0..n_heads {
         let off = h * hd;
         for i in 0..half {
-            let freq = base.powf(-2.0 * i as f32 / hd as f32);
-            let ang = pos as f32 * freq;
-            let (sin, cos) = ang.sin_cos();
+            let (sin, cos) = sincos[i];
             let a = vec[off + 2 * i];
             let b = vec[off + 2 * i + 1];
-            vec[off + 2 * i] = a * cos - b * sin;
+            vec[off + 2 * i]     = a * cos - b * sin;
             vec[off + 2 * i + 1] = a * sin + b * cos;
+        }
+    }
+}
+
+/// Adiciona bias que está em layout NEOX a um vetor Q/K em layout INTERLEAVED.
+///
+/// O llama.cpp permuta os pesos Q/K de NEOX→INTERLEAVED durante a conversão GGUF,
+/// mas NÃO permuta os biases. Portanto o bias b[j] (NEOX: j < hd/2 = componente real,
+/// j ≥ hd/2 = componente imaginária) precisa ser remapeado para o layout interleaved
+/// (posição 2*j = real, 2*j+1 = imaginária) antes de ser somado ao vetor.
+fn add_bias_neox_to_interleaved(vec: &mut [f32], bias: &[f32], n_heads: usize, hd: usize) {
+    let half = hd / 2;
+    for h in 0..n_heads {
+        let off = h * hd;
+        for j in 0..half {
+            if off + 2 * j + 1 < vec.len() && off + half + j < bias.len() {
+                vec[off + 2 * j]     += bias[off + j];           // real
+                vec[off + 2 * j + 1] += bias[off + half + j];    // imaginary
+            }
         }
     }
 }
@@ -123,9 +143,9 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
         let wv = weight(wb, &format!("blk.{}.attn_v.weight", layer))?;
         let wo = weight(wb, &format!("blk.{}.attn_output.weight", layer))?;
         let ffn_norm = weight(wb, &format!("blk.{}.ffn_norm.weight", layer))?;
-        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer))?;
-        let wup = weight(wb, &format!("blk.{}.ffn_up.weight", layer))?;
-        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer))?;
+        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer));
+        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer));
+        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer));
 
         // Q, K, V (com RoPE NeoX) por posição.
         let mut qs: Vec<Vec<f32>> = Vec::with_capacity(seq);
@@ -135,7 +155,12 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
             let normed = rmsnorm(&x[t], attn_norm, cfg.eps);
             let mut q = matvec(wq, &normed, q_dim, h);
             let mut k = matvec(wk, &normed, kv_dim, h);
-            let v = matvec(wv, &normed, kv_dim, h);
+            let mut v = matvec(wv, &normed, kv_dim, h);
+            // Q/K: bias em NEOX layout → converter para interleaved antes de somar
+            if let Some(b) = weight(wb, &format!("blk.{layer}.attn_q.bias")) { add_bias_neox_to_interleaved(&mut q, b, nq, hd); }
+            if let Some(b) = weight(wb, &format!("blk.{layer}.attn_k.bias")) { add_bias_neox_to_interleaved(&mut k, b, nkv, hd); }
+            // V: não sofre RoPE, bias se soma diretamente
+            if let Some(b) = weight(wb, &format!("blk.{layer}.attn_v.bias")) { for i in 0..v.len().min(b.len()) { v[i] += b[i]; } }
             rope_neox(&mut q, nq, hd, t, cfg.rope_base);
             rope_neox(&mut k, nkv, hd, t, cfg.rope_base);
             qs.push(q); ks.push(k); vs.push(v);
@@ -165,19 +190,43 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
             }
         }
 
-        // Output proj + residual; depois FFN (SwiGLU) + residual.
+        // Output proj + residual; FFN (denso ou MoE) + residual.
         for t in 0..seq {
             let proj = matvec(wo, &attn[t], h, q_dim);
             for i in 0..h { x[t][i] += proj[i]; }
 
             let normed2 = rmsnorm(&x[t], ffn_norm, cfg.eps);
-            let gate = matvec(wgate, &normed2, cfg.intermediate, h);
-            let up = matvec(wup, &normed2, cfg.intermediate, h);
-            let mut swiglu = vec![0.0f32; cfg.intermediate];
-            for i in 0..cfg.intermediate { swiglu[i] = silu(gate[i]) * up[i]; }
-            let down = matvec(wdown, &swiglu, h, cfg.intermediate);
-            for i in 0..h { x[t][i] += down[i]; }
+            let ffn_out: Vec<f32> = if let Some(moe_cfg) = &cfg.moe {
+                match crate::moe_kernel::moe_ffn_step(&normed2, moe_cfg, wb, layer) {
+                    Some(moe_out) => {
+                        crate::observability::emit_expert_selection(
+                            layer,
+                            &moe_out.routing.expert_indices,
+                            moe_out.routing.entropy,
+                        );
+                        moe_out.hidden
+                    }
+                    None => {
+                        if let (Some(wg), Some(wu), Some(wd)) = (wgate, wup, wdown) {
+                            let gate = matvec(wg, &normed2, cfg.intermediate, h);
+                            let up   = matvec(wu, &normed2, cfg.intermediate, h);
+                            let mut mid = vec![0.0f32; cfg.intermediate];
+                            for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+                            matvec(wd, &mid, h, cfg.intermediate)
+                        } else { vec![0.0f32; h] }
+                    }
+                }
+            } else {
+                let wg = wgate?; let wu = wup?; let wd = wdown?;
+                let gate = matvec(wg, &normed2, cfg.intermediate, h);
+                let up   = matvec(wu, &normed2, cfg.intermediate, h);
+                let mut mid = vec![0.0f32; cfg.intermediate];
+                for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+                matvec(wd, &mid, h, cfg.intermediate)
+            };
+            for i in 0..h { x[t][i] += ffn_out[i]; }
         }
+        crate::observability::emit(layer, &x[seq - 1]);
     }
 
     // Norma final + LM head na ÚLTIMA posição. `output.weight` ausente ⇒ pesos
@@ -185,7 +234,10 @@ pub fn forward_last_logits(tokens: &[u32], cfg: &CpuModelConfig, wb: &WeightBank
     let final_norm = weight(wb, "output_norm.weight")?;
     let normed = rmsnorm(&x[seq - 1], final_norm, cfg.eps);
     let lm_head = weight(wb, "output.weight").unwrap_or(tok_embd);
-    Some(matvec(lm_head, &normed, cfg.vocab, h))
+    let logits = matvec(lm_head, &normed, cfg.vocab, h);
+    // Emit logits (sentinel layer = usize::MAX) for entropy + top-k in TUI.
+    crate::observability::emit(usize::MAX, &logits);
+    Some(logits)
 }
 
 /// KV cache em CPU: por camada, K e V acumulados (uma entrada por posição já vista).
@@ -236,6 +288,17 @@ impl CpuKvCache {
         for l in self.k.iter_mut() { l.truncate(len); }
         for l in self.v.iter_mut() { l.truncate(len); }
     }
+
+    /// Anexa K e V de uma posição à camada `layer`.
+    pub fn push_kv(&mut self, layer: usize, k: Vec<f32>, v: Vec<f32>) {
+        self.k[layer].push(k);
+        self.v[layer].push(v);
+    }
+
+    /// Retorna slices imutáveis de K e V para a camada `layer`.
+    pub fn layer_kv(&self, layer: usize) -> (&[Vec<f32>], &[Vec<f32>]) {
+        (&self.k[layer], &self.v[layer])
+    }
 }
 
 /// Índice do maior elemento (argmax) — escolha greedy (lossless por construção).
@@ -272,14 +335,18 @@ fn step_impl(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cach
         let wv = weight(wb, &format!("blk.{}.attn_v.weight", layer))?;
         let wo = weight(wb, &format!("blk.{}.attn_output.weight", layer))?;
         let ffn_norm = weight(wb, &format!("blk.{}.ffn_norm.weight", layer))?;
-        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer))?;
-        let wup = weight(wb, &format!("blk.{}.ffn_up.weight", layer))?;
-        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer))?;
+        // Pesos densos são opcionais: modelos MoE não os têm (experts são carregados em moe_ffn_step)
+        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer));
+        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer));
+        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer));
 
         let normed = rmsnorm(&x, attn_norm, cfg.eps);
         let mut q = matvec(wq, &normed, q_dim, h);
         let mut k = matvec(wk, &normed, kv_dim, h);
-        let vv = matvec(wv, &normed, kv_dim, h);
+        let mut vv = matvec(wv, &normed, kv_dim, h);
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_q.bias")) { add_bias_neox_to_interleaved(&mut q, b, nq, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_k.bias")) { add_bias_neox_to_interleaved(&mut k, b, nkv, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_v.bias")) { for i in 0..vv.len().min(b.len()) { vv[i] += b[i]; } }
         rope_neox(&mut q, nq, hd, pos, cfg.rope_base);
         rope_neox(&mut k, nkv, hd, pos, cfg.rope_base);
 
@@ -311,18 +378,50 @@ fn step_impl(token: u32, pos: usize, cfg: &CpuModelConfig, wb: &WeightBank, cach
         for i in 0..h { x[i] += proj[i]; }
 
         let normed2 = rmsnorm(&x, ffn_norm, cfg.eps);
-        let gate = matvec(wgate, &normed2, cfg.intermediate, h);
-        let up = matvec(wup, &normed2, cfg.intermediate, h);
-        let mut swiglu = vec![0.0f32; cfg.intermediate];
-        for i in 0..cfg.intermediate { swiglu[i] = silu(gate[i]) * up[i]; }
-        let down = matvec(wdown, &swiglu, h, cfg.intermediate);
-        for i in 0..h { x[i] += down[i]; }
+
+        // Dispatch: MoE (DeepSeek/Mixtral/Qwen) ou FFN denso (Llama/Mistral denso)
+        let ffn_out: Vec<f32> = if let Some(moe_cfg) = &cfg.moe {
+            match crate::moe_kernel::moe_ffn_step(&normed2, moe_cfg, wb, layer) {
+                Some(moe_out) => {
+                    // Emite expert loads para observabilidade e aquecimento de cache SSD
+                    crate::observability::emit_expert_selection(
+                        layer,
+                        &moe_out.routing.expert_indices,
+                        moe_out.routing.entropy,
+                    );
+                    moe_out.hidden
+                }
+                // Fallback silencioso: sem pesos MoE → FFN denso com o que tiver
+                None => {
+                    if let (Some(wg), Some(wu), Some(wd)) = (wgate, wup, wdown) {
+                        let gate = matvec(wg, &normed2, cfg.intermediate, h);
+                        let up   = matvec(wu, &normed2, cfg.intermediate, h);
+                        let mut mid = vec![0.0f32; cfg.intermediate];
+                        for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+                        matvec(wd, &mid, h, cfg.intermediate)
+                    } else { vec![0.0f32; h] }
+                }
+            }
+        } else {
+            // Caminho denso padrão (Llama, Mistral, Phi, etc.)
+            let wg = wgate?; let wu = wup?; let wd = wdown?;
+            let gate = matvec(wg, &normed2, cfg.intermediate, h);
+            let up   = matvec(wu, &normed2, cfg.intermediate, h);
+            let mut mid = vec![0.0f32; cfg.intermediate];
+            for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+            matvec(wd, &mid, h, cfg.intermediate)
+        };
+
+        for i in 0..h { x[i] += ffn_out[i]; }
+        crate::observability::emit(layer, &x);
     }
 
     let final_norm = weight(wb, "output_norm.weight")?;
     let normed = rmsnorm(&x, final_norm, cfg.eps);
     let lm_head = weight(wb, "output.weight").unwrap_or(tok_embd);
-    Some(matvec(lm_head, &normed, cfg.vocab, h))
+    let logits = matvec(lm_head, &normed, cfg.vocab, h);
+    crate::observability::emit(usize::MAX, &logits);
+    Some(logits)
 }
 
 /// Forward incremental COMPLETO (todas as camadas) — o modelo ALVO.
@@ -410,15 +509,18 @@ pub fn forward_step_with_steering(
         let wv  = weight(wb, &format!("blk.{}.attn_v.weight", layer))?;
         let wo  = weight(wb, &format!("blk.{}.attn_output.weight", layer))?;
         let ffn_norm = weight(wb, &format!("blk.{}.ffn_norm.weight", layer))?;
-        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer))?;
-        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer))?;
-        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer))?;
+        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer));
+        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer));
+        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer));
 
         // ── Atenção ──────────────────────────────────────────────────────────
         let normed = rmsnorm(&x, attn_norm, cfg.eps);
         let mut q = matvec(wq, &normed, q_dim, h);
         let mut k = matvec(wk, &normed, kv_dim, h);
-        let vv    = matvec(wv, &normed, kv_dim, h);
+        let mut vv = matvec(wv, &normed, kv_dim, h);
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_q.bias")) { add_bias_neox_to_interleaved(&mut q, b, nq, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_k.bias")) { add_bias_neox_to_interleaved(&mut k, b, nkv, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_v.bias")) { for i in 0..vv.len().min(b.len()) { vv[i] += b[i]; } }
         rope_neox(&mut q, nq, hd, pos, cfg.rope_base);
         rope_neox(&mut k, nkv, hd, pos, cfg.rope_base);
 
@@ -446,14 +548,37 @@ pub fn forward_step_with_steering(
         let proj = matvec(wo, &attn_out, h, q_dim);
         for i in 0..h { x[i] += proj[i]; }
 
-        // ── FFN SwiGLU ───────────────────────────────────────────────────────
+        // ── FFN: dispatch MoE ou denso ────────────────────────────────────────
         let normed2 = rmsnorm(&x, ffn_norm, cfg.eps);
-        let gate = matvec(wgate, &normed2, cfg.intermediate, h);
-        let up   = matvec(wup,   &normed2, cfg.intermediate, h);
-        let mut swiglu = vec![0.0f32; cfg.intermediate];
-        for i in 0..cfg.intermediate { swiglu[i] = silu(gate[i]) * up[i]; }
-        let down = matvec(wdown, &swiglu, h, cfg.intermediate);
-        for i in 0..h { x[i] += down[i]; }
+        let ffn_out: Vec<f32> = if let Some(moe_cfg) = &cfg.moe {
+            match crate::moe_kernel::moe_ffn_step(&normed2, moe_cfg, wb, layer) {
+                Some(moe_out) => {
+                    crate::observability::emit_expert_selection(
+                        layer,
+                        &moe_out.routing.expert_indices,
+                        moe_out.routing.entropy,
+                    );
+                    moe_out.hidden
+                }
+                None => {
+                    if let (Some(wg), Some(wu), Some(wd)) = (wgate, wup, wdown) {
+                        let gate = matvec(wg, &normed2, cfg.intermediate, h);
+                        let up   = matvec(wu, &normed2, cfg.intermediate, h);
+                        let mut mid = vec![0.0f32; cfg.intermediate];
+                        for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+                        matvec(wd, &mid, h, cfg.intermediate)
+                    } else { vec![0.0f32; h] }
+                }
+            }
+        } else {
+            let wg = wgate?; let wu = wup?; let wd = wdown?;
+            let gate = matvec(wg, &normed2, cfg.intermediate, h);
+            let up   = matvec(wu, &normed2, cfg.intermediate, h);
+            let mut mid = vec![0.0f32; cfg.intermediate];
+            for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+            matvec(wd, &mid, h, cfg.intermediate)
+        };
+        for i in 0..h { x[i] += ffn_out[i]; }
 
         // ── Projeção Ortogonal Dinâmica (POD) ────────────────────────────────
         // INTERCEPÇÃO após bloco Attn+MLP completo (pós-residual), antes da
@@ -531,14 +656,17 @@ pub fn extract_final_hidden(
         let wv  = weight(wb, &format!("blk.{}.attn_v.weight", layer))?;
         let wo  = weight(wb, &format!("blk.{}.attn_output.weight", layer))?;
         let ffn_norm = weight(wb, &format!("blk.{}.ffn_norm.weight", layer))?;
-        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer))?;
-        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer))?;
-        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer))?;
+        let wgate = weight(wb, &format!("blk.{}.ffn_gate.weight", layer));
+        let wup   = weight(wb, &format!("blk.{}.ffn_up.weight", layer));
+        let wdown = weight(wb, &format!("blk.{}.ffn_down.weight", layer));
 
         let normed = rmsnorm(&x, attn_norm, cfg.eps);
         let mut q = matvec(wq, &normed, q_dim, h);
         let mut k = matvec(wk, &normed, kv_dim, h);
-        let vv    = matvec(wv, &normed, kv_dim, h);
+        let mut vv = matvec(wv, &normed, kv_dim, h);
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_q.bias")) { add_bias_neox_to_interleaved(&mut q, b, nq, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_k.bias")) { add_bias_neox_to_interleaved(&mut k, b, nkv, hd); }
+        if let Some(b) = weight(wb, &format!("blk.{layer}.attn_v.bias")) { for i in 0..vv.len().min(b.len()) { vv[i] += b[i]; } }
         rope_neox(&mut q, nq, hd, pos, cfg.rope_base);
         rope_neox(&mut k, nkv, hd, pos, cfg.rope_base);
 
@@ -567,12 +695,28 @@ pub fn extract_final_hidden(
         for i in 0..h { x[i] += proj[i]; }
 
         let normed2 = rmsnorm(&x, ffn_norm, cfg.eps);
-        let gate = matvec(wgate, &normed2, cfg.intermediate, h);
-        let up   = matvec(wup,   &normed2, cfg.intermediate, h);
-        let mut swiglu = vec![0.0f32; cfg.intermediate];
-        for i in 0..cfg.intermediate { swiglu[i] = silu(gate[i]) * up[i]; }
-        let down = matvec(wdown, &swiglu, h, cfg.intermediate);
-        for i in 0..h { x[i] += down[i]; }
+        let ffn_out: Vec<f32> = if let Some(moe_cfg) = &cfg.moe {
+            match crate::moe_kernel::moe_ffn_step(&normed2, moe_cfg, wb, layer) {
+                Some(moe_out) => moe_out.hidden,
+                None => {
+                    if let (Some(wg), Some(wu), Some(wd)) = (wgate, wup, wdown) {
+                        let gate = matvec(wg, &normed2, cfg.intermediate, h);
+                        let up   = matvec(wu, &normed2, cfg.intermediate, h);
+                        let mut mid = vec![0.0f32; cfg.intermediate];
+                        for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+                        matvec(wd, &mid, h, cfg.intermediate)
+                    } else { vec![0.0f32; h] }
+                }
+            }
+        } else {
+            let wg = wgate?; let wu = wup?; let wd = wdown?;
+            let gate = matvec(wg, &normed2, cfg.intermediate, h);
+            let up   = matvec(wu, &normed2, cfg.intermediate, h);
+            let mut mid = vec![0.0f32; cfg.intermediate];
+            for i in 0..cfg.intermediate { mid[i] = silu(gate[i]) * up[i]; }
+            matvec(wd, &mid, h, cfg.intermediate)
+        };
+        for i in 0..h { x[i] += ffn_out[i]; }
     }
 
     // Retorna o hidden state após RMSNorm final (espaço de representação normalizado,
@@ -597,6 +741,7 @@ pub fn make_test_weight_bank() -> (nodestor_vulkan::WeightBank, CpuModelConfig) 
         vocab: 16,
         rope_base: 10000.0,
         eps: 1e-5,
+        moe: None,
     };
     let engine = VulkanEngine::new_simulation();
     let mut wb = WeightBank::new();

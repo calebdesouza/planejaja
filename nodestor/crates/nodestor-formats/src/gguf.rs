@@ -270,21 +270,26 @@ fn read_tensor_info<R: Read>(reader: &mut R, index: u64) -> std::io::Result<Tens
 
 fn ggml_dtype(dtype_id: u32) -> TensorDtype {
     match dtype_id {
-        0 => TensorDtype::F32,
-        1 => TensorDtype::F16,
-        2 => TensorDtype::Q4_0,
-        3 => TensorDtype::Q4_1,
-        6 => TensorDtype::Q5_0,
-        7 => TensorDtype::Q5_1,
-        8 => TensorDtype::Q8_0,
-        9 => TensorDtype::Q8_0,
-
+        0  => TensorDtype::F32,
+        1  => TensorDtype::F16,
+        2  => TensorDtype::Q4_0,
+        3  => TensorDtype::Q4_1,
+        6  => TensorDtype::Q5_0,
+        7  => TensorDtype::Q5_1,
+        8  => TensorDtype::Q8_0,
+        9  => TensorDtype::Q8_1,   // Q8_1: blocos 36 bytes (d FP16 + s FP16 + 32×i8)
+        10 => TensorDtype::F32,    // Q2_K — fallback F32 (não implementado)
+        11 => TensorDtype::F32,    // Q3_K — fallback F32 (não implementado)
+        12 => TensorDtype::Q4K,    // Q4_K — implementado em dequant/q4_k.rs
+        13 => TensorDtype::Q5K,    // Q5_K — implementado em dequant/q5_k.rs
+        14 => TensorDtype::Q6K,    // Q6_K — implementado em dequant/q6_k.rs
+        15 => TensorDtype::F32,    // Q8_K — fallback F32 (não implementado)
         16 => TensorDtype::I8,
         17 => TensorDtype::I16,
         18 => TensorDtype::I32,
         30 => TensorDtype::BF16,
         31 => TensorDtype::I64,
-        _ => TensorDtype::F32, // Fallback para tipos desconhecidos
+        _  => TensorDtype::F32, // Fallback para tipos desconhecidos
     }
 }
 
@@ -297,12 +302,17 @@ fn calculate_tensor_size(num_elements: u64, dtype_id: u32) -> u64 {
         16 => num_elements,             // I8
         17 => num_elements * 2,         // I16
         18 => num_elements * 4,         // I32
-        2 => (num_elements * 9 + 1) / 16,  // Q4_0: cada 32 elems = 18 bytes
-        3 => (num_elements * 10 + 1) / 16, // Q4_1
-        6 => (num_elements * 11 + 1) / 16, // Q5_0
-        7 => (num_elements * 12 + 1) / 16, // Q5_1
-        8 => (num_elements * 9 + 7) / 8,   // Q8_0
-        _ => num_elements * 4,          // Fallback: assume F32
+        2 => (num_elements + 31) / 32 * 18,       // Q4_0:  18 bytes/bloco de 32
+        3 => (num_elements + 31) / 32 * 20,       // Q4_1:  20 bytes/bloco
+        6 => (num_elements + 31) / 32 * 22,       // Q5_0:  22 bytes/bloco
+        7 => (num_elements + 31) / 32 * 24,       // Q5_1:  24 bytes/bloco
+        8  => (num_elements + 31) / 32 * 34,      // Q8_0:  34 bytes/bloco (2 FP16 + 32×i8)
+        9  => (num_elements * 36 + 31) / 32,      // Q8_1: 36 bytes/32 pesos (d+s FP16 + 32×i8)
+        12 => (num_elements * 144 + 255) / 256,   // Q4_K: 144 bytes/256 pesos
+        13 => (num_elements * 176 + 255) / 256,   // Q5_K: 176 bytes/256 pesos
+        14 => (num_elements * 210 + 255) / 256,   // Q6_K: 210 bytes/256 pesos (não dequantizado)
+        15 => (num_elements * 9 + 7) / 8,         // Q8_K: ~Q8_0 size (fallback)
+        _  => num_elements * 4,                   // Fallback: assume F32
     }
 }
 

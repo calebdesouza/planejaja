@@ -11,6 +11,14 @@ rust-version.workspace = true
 name = "mega_test"
 path = "../tests/mega_test.rs"
 
+[[test]]
+name = "generation_proof_tests"
+path = "../tests/generation_proof_tests.rs"
+
+[[test]]
+name = "arch_integration_tests"
+path = "../tests/arch_integration_tests.rs"
+
 [dependencies]
 nodestor-core      = { path = "../crates/nodestor-core" }
 nodestor-formats   = { path = "../crates/nodestor-formats" }
@@ -19,9 +27,13 @@ nodestor-transport = { path = "../crates/nodestor-transport" }
 nodestor-vulkan    = { path = "../crates/nodestor-vulkan" }
 nodestor-metadata  = { path = "../crates/nodestor-metadata" }
 nodestor-inference = { path = "../crates/nodestor-inference" }
+nodestor-davi      = { path = "../crates/nodestor-davi" }
 byteorder.workspace = true
 tokio.workspace     = true
+futures             = "0.3"
 
 [dev-dependencies]
 byteorder.workspace = true
 tokio.workspace     = true
+futures             = "0.3"
+tempfile.workspace  = true

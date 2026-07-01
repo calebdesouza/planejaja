@@ -389,6 +389,10 @@ impl GpuBuffer {
     pub fn as_bytes(&self) -> &[u8] { &self.data }
     pub fn as_mut_bytes(&mut self) -> &mut [u8] { &mut self.data }
 
+    /// Returns true when the buffer has a real Vulkan allocation (not a CPU fallback).
+    /// Use this as a guard before GPU dispatches to avoid panic on None handle.
+    pub fn is_on_gpu(&self) -> bool { self.handle.is_some() }
+
     pub fn as_f32_slice(&self) -> &[f32] {
         if let Some(alloc) = &self.allocation {
             if let Some(ptr) = alloc.mapped_ptr() {
