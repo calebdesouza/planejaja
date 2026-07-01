@@ -1,0 +1,104 @@
+#version 450
+// Q4_K fused dequantization + matrix-vector multiply.
+//
+// Weight layout (Q4_K, 144 bytes per 256-element block):
+//   [d:f16 2B][dmin:f16 2B][scales:12B][qs:128B]
+//
+// Computes: y[N] = W_q4k[N×K] × x[K]
+// Each GL thread computes one output row y[n].
+// Dispatch: ceil(N/64) workgroups, local_size_x=64.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer WeightBuffer { uint w[]; };
+layout(std430, set = 0, binding = 1) readonly buffer InputBuffer  { float x[]; };
+layout(std430, set = 0, binding = 2) buffer       OutputBuffer   { float y_out[]; };
+
+layout(push_constant) uniform PC {
+    uint N;               // number of output rows (weight rows)
+    uint K;               // inner dimension (input length)
+    uint n_blocks_per_row; // = ceil(K / 256)
+} pc;
+
+// Extract byte at global byte offset from the uint weight buffer.
+uint gbyte(uint byte_off) {
+    uint word = w[byte_off >> 2u];
+    return (word >> ((byte_off & 3u) << 3u)) & 0xFFu;
+}
+
+// FP16 → FP32 (subnormals treated as 0 — fine for quantization scales).
+float f16f(uint h) {
+    uint e = (h >> 10u) & 31u;
+    if (e == 0u) return 0.0;
+    uint s = (h >> 15u) & 1u;
+    uint m = h & 1023u;
+    float f = (1.0 + float(m) * 9.765625e-4) * exp2(float(int(e) - 15));
+    return (s != 0u) ? -f : f;
+}
+
+// Unpack Q4_K 6-bit scale/min for sub-block j (0..7) from the 12 scale bytes.
+// Mirrors q4_k.rs::get_scale_min_k4 exactly.
+void unpack_scale_min(uint j, uint blk_start, float d, float dmin,
+                      out float scale, out float mn) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = gbyte(blk_start + 4u + j)      & 0x3Fu;
+        m  = gbyte(blk_start + 4u + j + 4u) & 0x3Fu;
+    } else {
+        sc = (gbyte(blk_start + 4u + j + 4u) & 0x0Fu)
+           | ((gbyte(blk_start + 4u + j - 4u) >> 6u) << 4u);
+        m  = (gbyte(blk_start + 4u + j + 4u) >> 4u)
+           | ((gbyte(blk_start + 4u + j)      >> 6u) << 4u);
+    }
+    scale =  d    * float(sc);
+    mn    = -dmin * float(m);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.N) return;
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.n_blocks_per_row; b++) {
+        uint blk = (n * pc.n_blocks_per_row + b) * 144u; // byte offset of block
+
+        // d and dmin (bytes 0-3 of block)
+        float d    = f16f(gbyte(blk) | (gbyte(blk + 1u) << 8u));
+        float dmin = f16f(gbyte(blk + 2u) | (gbyte(blk + 3u) << 8u));
+
+        // 4 chunks of 64 elements = 2 sub-blocks (lower + upper nibble) each
+        uint k_base = b * 256u;
+
+        for (uint chunk = 0u; chunk < 4u; chunk++) {
+            uint is0 = chunk * 2u;
+            uint is1 = chunk * 2u + 1u;
+
+            float d1, m1, d2, m2;
+            unpack_scale_min(is0, blk, d, dmin, d1, m1);
+            unpack_scale_min(is1, blk, d, dmin, d2, m2);
+
+            // qs start at byte 16 of block; chunk covers bytes chunk*32 .. chunk*32+31
+            uint q_off = blk + 16u + chunk * 32u;
+            uint k_off = k_base + chunk * 64u;
+
+            // 32 lower nibbles → sub-block is0
+            for (uint l = 0u; l < 32u; l++) {
+                uint k = k_off + l;
+                if (k >= pc.K) break;
+                float q = float(gbyte(q_off + l) & 0x0Fu);
+                acc += (d1 * q + m1) * x[k];
+            }
+
+            // 32 upper nibbles → sub-block is1
+            for (uint l = 0u; l < 32u; l++) {
+                uint k = k_off + 32u + l;
+                if (k >= pc.K) break;
+                float q = float((gbyte(q_off + l) >> 4u) & 0x0Fu);
+                acc += (d2 * q + m2) * x[k];
+            }
+        }
+    }
+
+    y_out[n] = acc;
+}

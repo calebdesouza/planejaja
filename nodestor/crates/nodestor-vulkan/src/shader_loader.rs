@@ -24,8 +24,10 @@ pub enum ShaderKind {
     CosineSim,
     Lossless,
     GDeflate,
-    /// Multiplicação de matrizes com desquantização Q4 on-the-fly
+    /// Multiplicação de matrizes com desquantização Q4 on-the-fly (Q4_0 legacy)
     MatmulQ4,
+    /// Fused Q4_K dequant + matrix-vector (principal caminho quant para inferência)
+    MatmulQ4K,
     /// Cooperative Matrix / Tensor Cores
     MatmulTensorCore,
     /// BitNet b1.58 Matmul (Ternary)
@@ -67,6 +69,7 @@ impl ShaderKind {
             Self::Lossless => "lossless_expansion",
             Self::GDeflate => "gdeflate_decompress",
             Self::MatmulQ4 => "matmul_q4",
+            Self::MatmulQ4K => "matmul_q4k",
             Self::MatmulTensorCore => "matmul_tensorcore",
             Self::MatmulTernary => "matmul_ternary",
             Self::MambaSelectiveScan => "mamba_selective_scan",
@@ -102,6 +105,7 @@ impl ShaderKind {
             ShaderKind::Lossless,
             ShaderKind::GDeflate,
             ShaderKind::MatmulQ4,
+            ShaderKind::MatmulQ4K,
             ShaderKind::MatmulTensorCore,
             ShaderKind::MatmulTernary,
             ShaderKind::MambaSelectiveScan,
@@ -176,6 +180,7 @@ pub fn load_shader(kind: ShaderKind) -> Result<ShaderSpirv, VulkanError> {
         ShaderKind::Lossless => include_bytes!(concat!(env!("OUT_DIR"), "/lossless_expansion.spv")).to_vec(),
         ShaderKind::GDeflate => include_bytes!(concat!(env!("OUT_DIR"), "/gdeflate_decompress.spv")).to_vec(),
         ShaderKind::MatmulQ4 => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_q4.spv")).to_vec(),
+        ShaderKind::MatmulQ4K => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_q4k.spv")).to_vec(),
         ShaderKind::MatmulTensorCore => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_tensorcore.spv")).to_vec(),
         ShaderKind::MatmulTernary => include_bytes!(concat!(env!("OUT_DIR"), "/matmul_ternary.spv")).to_vec(),
         ShaderKind::MambaSelectiveScan => include_bytes!(concat!(env!("OUT_DIR"), "/mamba_selective_scan.spv")).to_vec(),

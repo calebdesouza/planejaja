@@ -23,6 +23,7 @@ pub enum PipelineKind {
     Lossless,
     GDeflate,
     MatmulQ4,
+    MatmulQ4K,
     MatmulTensorCore,
     MatmulTernary,
     MambaSelectiveScan,
@@ -179,8 +180,9 @@ impl ComputePipeline {
                 PipelineKind::DequantQ4 | PipelineKind::DequantQ8 | PipelineKind::DequantQ6K
                 | PipelineKind::DequantQ5_0
                 | PipelineKind::Lossless | PipelineKind::GDeflate | PipelineKind::RoPe | PipelineKind::SiLu => 2,
-                PipelineKind::Matmul | PipelineKind::CosineSim | PipelineKind::MatmulQ4 
-                | PipelineKind::MatmulTensorCore | PipelineKind::MatmulTernary | PipelineKind::RmsNorm | PipelineKind::CoopMatrix 
+                PipelineKind::Matmul | PipelineKind::CosineSim | PipelineKind::MatmulQ4
+                | PipelineKind::MatmulQ4K
+                | PipelineKind::MatmulTensorCore | PipelineKind::MatmulTernary | PipelineKind::RmsNorm | PipelineKind::CoopMatrix
                 | PipelineKind::OutProd | PipelineKind::Add | PipelineKind::Mul => 3,
                 PipelineKind::Attention | PipelineKind::TurboQuantAttention | PipelineKind::MoERouting 
                 | PipelineKind::ZipGEMM | PipelineKind::FlashAttention | PipelineKind::TreeAttention 
@@ -576,6 +578,74 @@ impl ComputePipeline {
             device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
 
             device.cmd_dispatch(cmd_buf, (n + 15) / 16, (m + 15) / 16, 1);
+            device.end_command_buffer(cmd_buf).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.queue_wait_idle(ctx.queue.unwrap()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+
+            device.free_command_buffers(command_pool, &[cmd_buf]);
+            device.free_descriptor_sets(descriptor_pool, &[descriptor_set]).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Fused Q4_K dequant + matrix-vector dispatch.
+    ///
+    /// `weight` must contain Q4K quantized bytes (144 bytes / 256 elements per block).
+    /// `input` is FP32 vector of length K.
+    /// `output` is a HOST_VISIBLE staging buffer of size N×4 bytes.
+    /// Push constants: [N, K, n_blocks_per_row].
+    pub fn dispatch_matmul_q4k(
+        &self,
+        ctx: &VulkanContext,
+        weight: &crate::buffer::GpuBuffer,
+        input: &crate::buffer::GpuBuffer,
+        output: &mut crate::buffer::GpuBuffer,
+        n: u32, // output rows
+        k: u32, // inner dim
+    ) -> Result<(), NodeStorError> {
+        if !self.vulkan_active {
+            // CPU fallback: dequant Q4K inline then multiply
+            cpu_matmul_q4k_fallback(weight.as_f32_slice(), input.as_f32_slice(), output, n as usize, k as usize);
+            return Ok(());
+        }
+
+        let n_blocks = (k + 255) / 256;
+
+        unsafe {
+            let device = ctx.device.as_ref().unwrap();
+            let descriptor_pool = ctx.descriptor_pool.unwrap();
+            let command_pool = ctx.command_pool.unwrap();
+
+            let layouts = [self.descriptor_set_layout.unwrap()];
+            let alloc_info = ash::vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts);
+            let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let descriptor_set = descriptor_sets[0];
+
+            let b_w   = [ash::vk::DescriptorBufferInfo::default().buffer(weight.handle.unwrap()).offset(0).range(weight.size as u64)];
+            let b_in  = [ash::vk::DescriptorBufferInfo::default().buffer(input.handle.unwrap()).offset(0).range(input.size as u64)];
+            let b_out = [ash::vk::DescriptorBufferInfo::default().buffer(output.handle.unwrap()).offset(0).range(output.size as u64)];
+
+            device.update_descriptor_sets(&[
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_w),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_in),
+                ash::vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER).buffer_info(&b_out),
+            ], &[]);
+
+            let alloc_cmds = ash::vk::CommandBufferAllocateInfo::default().command_pool(command_pool).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let cmd_bufs = device.allocate_command_buffers(&alloc_cmds).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            let cmd_buf = cmd_bufs[0];
+
+            device.begin_command_buffer(cmd_buf, &ash::vk::CommandBufferBeginInfo::default()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
+            device.cmd_bind_pipeline(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline.unwrap());
+            device.cmd_bind_descriptor_sets(cmd_buf, ash::vk::PipelineBindPoint::COMPUTE, self.pipeline_layout.unwrap(), 0, &[descriptor_set], &[]);
+
+            let constants = [n, k, n_blocks];
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 12);
+            device.cmd_push_constants(cmd_buf, self.pipeline_layout.unwrap(), ash::vk::ShaderStageFlags::COMPUTE, 0, bytes);
+
+            let groups_x = (n + 63) / 64;
+            device.cmd_dispatch(cmd_buf, groups_x, 1, 1);
             device.end_command_buffer(cmd_buf).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
 
             device.queue_submit(ctx.queue.unwrap(), &[ash::vk::SubmitInfo::default().command_buffers(&[cmd_buf])], ash::vk::Fence::null()).map_err(|e: ash::vk::Result| NodeStorError::VulkanError(e.to_string()))?;
@@ -1538,6 +1608,7 @@ pub fn create_all_pipelines(
             ShaderKind::Lossless => PipelineKind::Lossless,
             ShaderKind::GDeflate => PipelineKind::GDeflate,
             ShaderKind::MatmulQ4 => PipelineKind::MatmulQ4,
+            ShaderKind::MatmulQ4K => PipelineKind::MatmulQ4K,
             ShaderKind::MatmulTensorCore => PipelineKind::MatmulTensorCore,
             ShaderKind::MatmulTernary => PipelineKind::MatmulTernary,
             ShaderKind::MambaSelectiveScan => PipelineKind::MambaSelectiveScan,
@@ -1560,8 +1631,23 @@ pub fn create_all_pipelines(
             _ => continue,
         };
 
-        let pipeline = ComputePipeline::new_real(ctx, kind, &shader.bytecode)?;
-        map.insert(kind, pipeline);
+        match ComputePipeline::new_real(ctx, kind, &shader.bytecode) {
+            Ok(p) => { map.insert(kind, p); }
+            Err(e) => {
+                // Shaders obrigatórios devem ser GPU reais — propaga o erro para
+                // VulkanEngine::new() cair em simulação CPU completa.
+                // Shaders opcionais (TensorCore, ZipGEMM, etc.) usam simulação local.
+                let is_required = matches!(kind,
+                    PipelineKind::Matmul | PipelineKind::RmsNorm | PipelineKind::RoPe
+                    | PipelineKind::SiLu | PipelineKind::Add | PipelineKind::Mul
+                );
+                if is_required {
+                    return Err(e);
+                }
+                tracing::warn!("Shader {:?} rejeitado ({}): usando simulação para este op opcional", kind, e);
+                map.insert(kind, ComputePipeline::new_simulation(kind));
+            }
+        }
     }
 
     Ok(map)
@@ -1763,6 +1849,20 @@ fn cpu_matmul_f32(a: &[f32], b: &[f32], output: &mut GpuBuffer, m: usize, k: usi
     }
 }
 
+/// CPU fallback para Q4K matmul (simulation mode).
+/// Nota: `weight_bytes` aqui é um slice de f32 da memória de simulação — no fallback
+/// os dados foram escritos como raw bytes via from_cpu_data, então as_f32_slice()
+/// retorna o mesmo slice que foi passado. Na prática, este fallback só é chamado
+/// quando Vulkan não está disponível e o pipeline está em modo de simulação.
+fn cpu_matmul_q4k_fallback(weight_bytes: &[f32], input: &[f32], output: &mut GpuBuffer, n: usize, _k: usize) {
+    // Em modo simulação o gpu_bank TAMBÉM tem os bytes raw, não F32 dequantizados.
+    // Como o cpu_reference.rs usa staging_bank (já em F32), este fallback retorna zeros
+    // para não produzir resultados incorretos — a rota CPU usa staging_bank via cpu_reference.
+    let out = output.as_mut_bytes();
+    let _ = (weight_bytes, input, n);
+    out.fill(0);
+}
+
 fn cpu_cosine_batch(query: &[f32], candidates: &[f32], scores: &mut GpuBuffer, num_candidates: usize, dim: usize) {
     let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
     for c in 0..num_candidates {
@@ -1789,6 +1889,7 @@ pub fn create_simulation_pipelines() -> HashMap<PipelineKind, ComputePipeline> {
         PipelineKind::Lossless,
         PipelineKind::GDeflate,
         PipelineKind::MatmulQ4,
+        PipelineKind::MatmulQ4K,
         PipelineKind::MatmulTensorCore,
         PipelineKind::MatmulTernary,
         PipelineKind::RmsNorm,

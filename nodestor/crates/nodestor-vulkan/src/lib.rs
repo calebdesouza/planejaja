@@ -10,7 +10,7 @@ pub mod external_memory;
 pub mod operator_registry;
 pub mod unified_pool;
 
-pub use buffer::{GpuBuffer, GpuBufferUsage};
+pub use buffer::{GpuBuffer, GpuBufferUsage, QuantKind};
 pub use error::VulkanError;
 pub use instance::VulkanContext;
 pub use pipeline::{ComputePipeline, PipelineKind};
@@ -52,7 +52,13 @@ impl VulkanEngine {
         if !ctx.vulkan_available {
             return Ok(Self::new_simulation());
         }
-        let pipelines = pipeline::create_all_pipelines(&ctx).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        let pipelines = match pipeline::create_all_pipelines(&ctx) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Pipelines Vulkan falharam ({}): usando simulação CPU completa", e);
+                return Ok(Self::new_simulation());
+            }
+        };
         // Se o conjunto de pipelines GPU estiver INCOMPLETO (ex.: o SPIR-V do
         // TurboQuantAttention não compila neste driver), caímos para o motor de
         // simulação COMPLETO (CPU) em vez de um estado GPU meio-carregado. Um
@@ -156,7 +162,11 @@ impl VulkanEngine {
 
     /// Matmul cujo output é HOST_VISIBLE: GPU escreve direto, CPU lê via as_f32_slice()
     /// sem staging copy. Ideal para Q/K/V (precisam ir para CPU para atenção).
+    /// Despacha automaticamente para Q4K shader quando `a.quant_kind == Q4K`.
     pub fn matmul_to_host(&self, a: &GpuBuffer, b: &GpuBuffer, m: u32, k: u32, n: u32) -> Result<GpuBuffer, NodeStorError> {
+        if a.quant_kind == crate::buffer::QuantKind::Q4K {
+            return self.matmul_q4k_to_host(a, b, m, k, n);
+        }
         let pipeline = self.pipelines.get(&PipelineKind::Matmul)
             .ok_or_else(|| NodeStorError::VulkanError("Pipeline Matmul not available".into()))?;
         let mut output = if self.ctx.vulkan_available {
@@ -167,6 +177,23 @@ impl VulkanEngine {
             GpuBuffer::new_storage((m * n * 4) as usize)
         };
         pipeline.dispatch_matmul(&self.ctx, a, b, &mut output, m, k, n)?;
+        Ok(output)
+    }
+
+    /// Fused Q4_K dequant + matrix-vector mul com output HOST_VISIBLE.
+    ///
+    /// `weight` deve conter bytes Q4_K (144 bytes / 256 elementos por bloco).
+    /// `m` = linhas de saída (N de peso), `k` = dimensão interna, `n` deve ser 1.
+    pub fn matmul_q4k_to_host(&self, weight: &GpuBuffer, input: &GpuBuffer, m: u32, k: u32, _n: u32) -> Result<GpuBuffer, NodeStorError> {
+        let pipeline = self.pipelines.get(&PipelineKind::MatmulQ4K)
+            .ok_or_else(|| NodeStorError::VulkanError("Pipeline MatmulQ4K não disponível — usando FP32 fallback".into()))?;
+        let mut output = if self.ctx.vulkan_available {
+            GpuBuffer::allocate(&self.ctx, (m * 4) as usize, GpuBufferUsage::Staging)
+                .map_err(|e| NodeStorError::VulkanError(e.to_string()))?
+        } else {
+            GpuBuffer::new_storage((m * 4) as usize)
+        };
+        pipeline.dispatch_matmul_q4k(&self.ctx, weight, input, &mut output, m, k)?;
         Ok(output)
     }
 

@@ -603,7 +603,7 @@ impl InferencePipeline {
             Some(w) => crate::cpu_reference::CpuKvCache::with_window(cpu_cfg.n_layers, w),
             None => crate::cpu_reference::CpuKvCache::new(cpu_cfg.n_layers),
         };
-        let _ = (&cheby, &cober, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
+        let _ = (&cheby, &drafter, &_mcts_engine, &probes_sae, &transformer, probes_enabled, layers_per_token, &sampler);
 
         // Prefill: preenche o cache com o prompt.
         let use_gpu = self.engine.is_gpu_active();
@@ -658,7 +658,10 @@ impl InferencePipeline {
             let logits = match cur_logits.take() { Some(l) => l, None => break };
 
             // 1+2+3. Rascunho n-gram → verificação batched → aceita prefixo.
-            let draft = prompt_lookup(&full_seq, draft_k);
+            // L1/L2: COBER Crystal Skeleton (GoldenNgrams → PromptLookup → EAGLE-2 → Medusa)
+            // fallback: inline n-gram closure para cobrir o caso de todos os caches vazios.
+            let cober_draft = cober.draft_with_crystal_skeleton(&full_seq, &[]);
+            let draft = if cober_draft.is_empty() { prompt_lookup(&full_seq, draft_k) } else { cober_draft };
             if !draft.is_empty() {
                 spec_rounds += 1;
                 spec_drafted += draft.len();
@@ -688,6 +691,20 @@ impl InferencePipeline {
                 }
                 main_kv.truncate(orig + m); // guilhotina os rascunhos rejeitados
                 spec_accepted += m;
+                // Alimenta COBER com tokens validados: o GoldenNgramCache aprende
+                // sequências confirmadas pelo modelo mestre → taxa de hit L1 cresce.
+                cober.stats.total_draft_tokens += draft.len() as u64;
+                cober.stats.total_rounds += 1;
+                if m > 0 {
+                    cober.stats.total_accepted_tokens += m as u64;
+                    let ctx_start = full_seq.len().saturating_sub(8);
+                    if let Some(golden) = &mut cober.golden_ngrams {
+                        golden.insert_verified(&full_seq[ctx_start..], &draft[..m]);
+                    }
+                    if let Some(lookup) = &mut cober.prompt_lookup {
+                        lookup.append_context(&draft[..m]);
+                    }
+                }
                 for &t in draft.iter().take(m) {
                     if Some(t) == eos_token { break 'outer; }
                     generated_tokens.push(t);
@@ -761,6 +778,7 @@ impl InferencePipeline {
                 draft_k, spec_accepted, spec_drafted,
                 100.0 * spec_accepted as f64 / spec_drafted.max(1) as f64,
                 (spec_accepted + spec_rounds) as f64 / spec_rounds as f64);
+            debug!("COBER: {}", cober.full_report().lines().collect::<Vec<_>>().join(" | "));
         }
 
         // Simula o fechamento verificando quantos blocos estão quentes na VRAM
@@ -1307,8 +1325,10 @@ fn build_weight_bank(
     model_path: &str,
 ) -> (nodestor_vulkan::WeightBank, nodestor_vulkan::WeightBank) {
     let mut staging_bank = nodestor_vulkan::WeightBank::new();
-    // Armazena os dados f32 brutos para depois construir o gpu_bank sem re-ler o GGUF.
-    let mut raw_data: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // F32 dequantized bytes → gpu_bank para pesos não-Q4K
+    let mut raw_f32_data: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // Raw Q4K bytes → gpu_bank com quant_kind=Q4K (não dequantizado)
+    let mut raw_q4k_data: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
 
     let mut real_loaded = 0usize;
 
@@ -1321,7 +1341,7 @@ fn build_weight_bank(
                 std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4).to_vec()
             };
             staging_bank.insert(name.clone(), nodestor_vulkan::GpuBuffer::from_cpu_data(bytes.clone()));
-            raw_data.insert(name, bytes);
+            raw_f32_data.insert(name, bytes);
             real_loaded += 1;
         }
     } else {
@@ -1333,7 +1353,10 @@ fn build_weight_bank(
                     let (dtype, n_elems) = store.tensor_info(name)
                         .map(|t| (t.dtype, t.shape.iter().map(|&d| d as usize).product::<usize>()))
                         .unwrap_or((nodestor_core::TensorDtype::F32, bytes.len() / 4));
-                    let upload_bytes: Vec<u8> = match tensor_to_f32(bytes, dtype, n_elems) {
+
+                    let is_q4k = dtype == nodestor_core::TensorDtype::Q4K;
+
+                    let f32_bytes: Vec<u8> = match tensor_to_f32(bytes, dtype, n_elems) {
                         Some(f32s) => {
                             let raw = unsafe {
                                 std::slice::from_raw_parts(f32s.as_ptr() as *const u8, f32s.len() * 4)
@@ -1342,13 +1365,18 @@ fn build_weight_bank(
                         }
                         None => bytes.to_vec(),
                     };
-                    // staging_bank uses CPU-backed buffers so as_f32_slice() is always readable.
-                    // GPU compute uses gpu_bank (device-local). Never mix them up.
-                    staging_bank.insert(name.to_string(), nodestor_vulkan::GpuBuffer::from_cpu_data(upload_bytes.clone()));
-                    raw_data.insert(name.to_string(), upload_bytes);
+                    // staging_bank: always FP32 so cpu_reference.rs can call as_f32_slice().
+                    staging_bank.insert(name.to_string(), nodestor_vulkan::GpuBuffer::from_cpu_data(f32_bytes.clone()));
+
+                    if is_q4k {
+                        // GPU gets raw Q4K bytes — 7× less VRAM bandwidth than FP32.
+                        raw_q4k_data.insert(name.to_string(), bytes.to_vec());
+                    } else {
+                        raw_f32_data.insert(name.to_string(), f32_bytes);
+                    }
                     real_loaded += 1;
                 }
-                debug!("WeightBank: {} tensores carregados do GGUF", real_loaded);
+                debug!("WeightBank: {} tensores carregados do GGUF ({} Q4K)", real_loaded, raw_q4k_data.len());
             }
             Err(e) => debug!("WeightStore indisponível ({}); usando buffers vazios", e),
         }
@@ -1371,7 +1399,7 @@ fn build_weight_bank(
                 std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4).to_vec()
             };
             staging_bank.insert("output.weight".to_string(), nodestor_vulkan::GpuBuffer::from_cpu_data(raw.clone()));
-            raw_data.insert("output.weight".to_string(), raw);
+            raw_f32_data.insert("output.weight".to_string(), raw);
             debug!("WeightBank: tied embeddings output.weight←token_embd ({} floats)", data.len());
         }
     }
@@ -1380,11 +1408,11 @@ fn build_weight_bank(
     //    Se não há Vulkan real, reutiliza staging (upload() já retorna CPU-backed buffer).
     let mut gpu_bank = nodestor_vulkan::WeightBank::new();
     if engine.is_gpu_active() {
-        for (name, data) in &raw_data {
+        // FP32 weights: standard device-local upload
+        for (name, data) in &raw_f32_data {
             match engine.upload_device_local(data) {
                 Ok(buf) => gpu_bank.insert(name.clone(), buf),
                 Err(e) => {
-                    // Fallback: usa staging se device_local falhar (VRAM cheia, etc.)
                     debug!("gpu_weight_bank: device_local upload '{}' falhou ({}); usando staging", name, e);
                     if let Ok(buf) = engine.upload(data) {
                         gpu_bank.insert(name.clone(), buf);
@@ -1392,7 +1420,27 @@ fn build_weight_bank(
                 }
             }
         }
-        debug!("gpu_weight_bank: {} tensores em DEVICE_LOCAL", gpu_bank.len());
+        // Q4K weights: upload raw quantized bytes, mark with QuantKind::Q4K for fused shader
+        for (name, data) in &raw_q4k_data {
+            match engine.upload_device_local(data) {
+                Ok(buf) => {
+                    gpu_bank.insert(name.clone(), buf.with_quant_kind(nodestor_vulkan::QuantKind::Q4K));
+                }
+                Err(e) => {
+                    debug!("gpu_weight_bank: Q4K upload '{}' falhou ({}); usando staging FP32", name, e);
+                    if let Some(f32_buf) = staging_bank.get(name) {
+                        let f32_bytes = unsafe {
+                            let s = f32_buf.as_f32_slice();
+                            std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
+                        };
+                        if let Ok(buf) = engine.upload(f32_bytes) {
+                            gpu_bank.insert(name.clone(), buf);
+                        }
+                    }
+                }
+            }
+        }
+        debug!("gpu_weight_bank: {} tensores em DEVICE_LOCAL ({} Q4K)", gpu_bank.len(), raw_q4k_data.len());
     } else {
         // CPU mode: gpu_bank vazio — gpu_forward nunca é chamado (use_gpu = false)
         debug!("gpu_weight_bank: Vulkan inativo, gpu_bank vazio (não usado)");

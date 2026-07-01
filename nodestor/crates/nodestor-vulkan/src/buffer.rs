@@ -47,12 +47,24 @@ pub enum MemoryPath {
     Simulation,
 }
 
+/// Formato de quantização dos dados no buffer (relevante para pesos de modelo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuantKind {
+    /// Dados em FP32 padrão.
+    #[default]
+    F32,
+    /// Q4_K_M: blocos de 144 bytes / 256 elementos (formato GGUF principal).
+    Q4K,
+}
+
 /// Fatia de memória alocada para a GPU.
 pub struct GpuBuffer {
     pub size: usize,
     pub usage: GpuBufferUsage,
     /// Qual estratégia de memória foi usada.
     pub memory_path: MemoryPath,
+    /// Formato dos dados armazenados (relevante para buffers de pesos).
+    pub quant_kind: QuantKind,
     pub(crate) handle: Option<ash::vk::Buffer>,
     pub(crate) allocation: Option<gpu_allocator::vulkan::Allocation>,
     /// Ponteiro mapeado persistentemente (evita vkMapMemory/vkUnmapMemory repetidos).
@@ -127,6 +139,7 @@ impl GpuBuffer {
                 size,
                 usage,
                 memory_path,
+                quant_kind: QuantKind::default(),
                 handle: Some(buffer),
                 allocation: Some(allocation),
                 mapped_ptr,
@@ -222,6 +235,7 @@ impl GpuBuffer {
                 size,
                 usage: GpuBufferUsage::PinnedTransfer,
                 memory_path: MemoryPath::RebarDirect,
+                quant_kind: QuantKind::default(),
                 handle: Some(buffer),
                 allocation: Some(allocation),
                 mapped_ptr,
@@ -279,6 +293,7 @@ impl GpuBuffer {
                 size,
                 usage: GpuBufferUsage::PinnedTransfer,
                 memory_path: MemoryPath::PinnedHostDma,
+                quant_kind: QuantKind::default(),
                 handle: Some(buffer),
                 allocation: Some(allocation),
                 mapped_ptr,
@@ -341,6 +356,7 @@ impl GpuBuffer {
             size,
             usage: GpuBufferUsage::Storage,
             memory_path: MemoryPath::Simulation,
+            quant_kind: QuantKind::default(),
             handle: None,
             allocation: None,
             mapped_ptr: None,
@@ -354,6 +370,7 @@ impl GpuBuffer {
             size,
             usage: GpuBufferUsage::Staging,
             memory_path: MemoryPath::Simulation,
+            quant_kind: QuantKind::default(),
             handle: None,
             allocation: None,
             mapped_ptr: None,
@@ -361,11 +378,19 @@ impl GpuBuffer {
         }
     }
 
+    /// Builder: marca este buffer como Q4K quantizado.
+    /// Usado ao fazer upload de pesos quantizados para GPU sem dequantização.
+    pub fn with_quant_kind(mut self, kind: QuantKind) -> Self {
+        self.quant_kind = kind;
+        self
+    }
+
     fn new_pinned_simulation(size: usize) -> Self {
         Self {
             size,
             usage: GpuBufferUsage::PinnedTransfer,
             memory_path: MemoryPath::Simulation,
+            quant_kind: QuantKind::default(),
             handle: None,
             allocation: None,
             mapped_ptr: None,
@@ -510,6 +535,7 @@ mod tests {
             size: 64,
             usage: GpuBufferUsage::PinnedTransfer,
             memory_path: MemoryPath::RebarDirect,
+            quant_kind: QuantKind::default(),
             handle: None,
             allocation: None,
             mapped_ptr: None,
@@ -521,6 +547,7 @@ mod tests {
             size: 64,
             usage: GpuBufferUsage::Staging,
             memory_path: MemoryPath::StagingCopy,
+            quant_kind: QuantKind::default(),
             handle: None,
             allocation: None,
             mapped_ptr: None,
