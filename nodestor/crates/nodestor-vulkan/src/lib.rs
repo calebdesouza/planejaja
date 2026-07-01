@@ -279,15 +279,19 @@ impl VulkanEngine {
     }
 
     /// Macro-batch helper: alloc cmd_buf, execute closure (record ops), submit+wait+free.
+    /// Uses batch_descriptor_pool (pointer-bump, reset per token) to skip individual DS frees.
     fn run_batch<F>(&self, f: F) -> Result<(), NodeStorError>
     where F: FnOnce(&ash::Device, ash::vk::DescriptorPool, ash::vk::CommandBuffer, &mut Vec<ash::vk::DescriptorSet>) -> Result<(), NodeStorError>
     {
         if !self.ctx.vulkan_available {
             return Err(NodeStorError::VulkanError("run_batch: Vulkan não disponível".into()));
         }
+        // Prefer batch_pool (pointer-bump, no per-call free). Falls back to main pool.
+        let use_batch_pool = self.ctx.batch_descriptor_pool.is_some();
+        let dp = self.ctx.batch_descriptor_pool
+            .unwrap_or_else(|| self.ctx.descriptor_pool.unwrap());
         unsafe {
             let device = self.ctx.device.as_ref().unwrap();
-            let dp = self.ctx.descriptor_pool.unwrap();
             let cp = self.ctx.command_pool.unwrap();
             let cmd_buf = device.allocate_command_buffers(
                 &ash::vk::CommandBufferAllocateInfo::default().command_pool(cp).level(ash::vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)
@@ -302,8 +306,20 @@ impl VulkanEngine {
             device.queue_wait_idle(self.ctx.queue.unwrap())
                 .map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
             device.free_command_buffers(cp, &[cmd_buf]);
-            let _ = device.free_descriptor_sets(dp, &ds);
+            // batch_pool DS are freed via reset_batch_pool() once per token, not here.
+            if !use_batch_pool {
+                let _ = device.free_descriptor_sets(dp, &ds);
+            }
             r
+        }
+    }
+
+    /// Reset the batch descriptor pool — call once per token after all layers complete.
+    /// This frees all DS allocated during the forward pass in O(1) instead of N free calls.
+    pub fn reset_batch_pool(&self) {
+        if !self.ctx.vulkan_available { return; }
+        if let (Some(device), Some(pool)) = (self.ctx.device.as_ref(), self.ctx.batch_descriptor_pool) {
+            unsafe { let _ = device.reset_descriptor_pool(pool, ash::vk::DescriptorPoolResetFlags::empty()); }
         }
     }
 
@@ -369,8 +385,8 @@ impl VulkanEngine {
         Ok(out_buf)
     }
 
-    /// Batch C: RmsNorm + gate + up + SiLU + mul + down — FFN completo em 1 sync.
-    /// Returns ffn_out as DEVICE_LOCAL.
+    /// Batch C: RmsNorm + gate + up + SiLU + mul + down + residual_add — FFN completo em 1 sync.
+    /// Returns x + ffn(x_norm) as DEVICE_LOCAL (residual already included).
     pub fn batch_ffn(
         &self,
         x: &GpuBuffer, ffn_norm: &GpuBuffer,
@@ -381,29 +397,33 @@ impl VulkanEngine {
         let mat_p  = self.pipelines.get(&PipelineKind::Matmul).ok_or_else(|| NodeStorError::VulkanError("Matmul missing".into()))?;
         let silu_p = self.pipelines.get(&PipelineKind::SiLu).ok_or_else(|| NodeStorError::VulkanError("SiLu missing".into()))?;
         let mul_p  = self.pipelines.get(&PipelineKind::Mul).ok_or_else(|| NodeStorError::VulkanError("Mul missing".into()))?;
+        let add_p  = self.pipelines.get(&PipelineKind::Add).ok_or_else(|| NodeStorError::VulkanError("Add missing".into()))?;
         if !rms_p.is_gpu_active() || !mat_p.is_gpu_active() || !self.ctx.vulkan_available {
             let x_norm = self.rmsnorm(x, ffn_norm, 1, h, eps)?;
             let gate  = self.matmul(wg, &x_norm, ffn_dim, h, 1)?;
             let up    = self.matmul(wu, &x_norm, ffn_dim, h, 1)?;
             let silu  = self.silu(&gate, ffn_dim)?;
             let swi   = self.mul(&silu, &up, ffn_dim)?;
-            return self.matmul(wd, &swi, h, ffn_dim, 1);
+            let ffn_out = self.matmul(wd, &swi, h, ffn_dim, 1)?;
+            return self.add(x, &ffn_out, h);
         }
         let norm_buf  = GpuBuffer::allocate(&self.ctx, (h * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let gate_buf  = GpuBuffer::allocate(&self.ctx, (ffn_dim * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let up_buf    = GpuBuffer::allocate(&self.ctx, (ffn_dim * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let silu_buf  = GpuBuffer::allocate(&self.ctx, (ffn_dim * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let swi_buf   = GpuBuffer::allocate(&self.ctx, (ffn_dim * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
+        let down_buf  = GpuBuffer::allocate(&self.ctx, (h * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let out_buf   = GpuBuffer::allocate(&self.ctx, (h * 4) as usize, GpuBufferUsage::Storage).map_err(|e| NodeStorError::VulkanError(e.to_string()))?;
         let nr = &norm_buf; let gr = &gate_buf; let ur = &up_buf;
-        let sr = &silu_buf; let wr = &swi_buf; let or_ = &out_buf;
+        let sr = &silu_buf; let wr = &swi_buf; let dr = &down_buf; let xor = &out_buf;
         self.run_batch(|dev, dp, cmd, ds| {
             rms_p.record_rmsnorm_into(dev, dp, cmd, x, ffn_norm, nr, 1, h, eps, ds)?;
             mat_p.record_matmul_into(dev, dp, cmd, wg, nr, gr, ffn_dim, h, 1, ds)?;
             mat_p.record_matmul_into(dev, dp, cmd, wu, nr, ur, ffn_dim, h, 1, ds)?;
             silu_p.record_silu_into(dev, dp, cmd, gr, sr, ffn_dim, ds)?;
             mul_p.record_mul_into(dev, dp, cmd, sr, ur, wr, ffn_dim, ds)?;
-            mat_p.record_matmul_into(dev, dp, cmd, wd, wr, or_, h, ffn_dim, 1, ds)?;
+            mat_p.record_matmul_into(dev, dp, cmd, wd, wr, dr, h, ffn_dim, 1, ds)?;
+            add_p.record_add_into(dev, dp, cmd, x, dr, xor, h, ds)?;
             Ok(())
         })?;
         Ok(out_buf)

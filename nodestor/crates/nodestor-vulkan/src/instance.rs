@@ -20,6 +20,9 @@ pub struct VulkanContext {
     pub(crate) allocator: Option<std::sync::Arc<std::sync::Mutex<gpu_allocator::vulkan::Allocator>>>,
     pub(crate) command_pool: Option<ash::vk::CommandPool>,
     pub(crate) descriptor_pool: Option<ash::vk::DescriptorPool>,
+    /// Pool sem FREE_DESCRIPTOR_SET: alocação é pointer-bump, liberação é vkResetDescriptorPool.
+    /// Usado em run_batch para eliminar free individual por token. Reset ao fim de cada token.
+    pub(crate) batch_descriptor_pool: Option<ash::vk::DescriptorPool>,
     pub(crate) capabilities: GpuCapabilities,
     pub(crate) device_name: String,
     pub(crate) vulkan_available: bool,
@@ -176,6 +179,7 @@ impl VulkanContext {
             allocator: None,
             command_pool: None,
             descriptor_pool: None,
+            batch_descriptor_pool: None,
             vulkan_available: false,
             has_rebar: false,
             has_dedicated_transfer_queue: false,
@@ -193,6 +197,9 @@ impl Drop for VulkanContext {
                     device.destroy_command_pool(pool, None);
                 }
                 if let Some(pool) = self.descriptor_pool {
+                    device.destroy_descriptor_pool(pool, None);
+                }
+                if let Some(pool) = self.batch_descriptor_pool {
                     device.destroy_descriptor_pool(pool, None);
                 }
                 // O gpu_allocator precisa do device vivo para liberar alocações.
@@ -444,6 +451,19 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                 let descriptor_pool = device.create_descriptor_pool(&descriptor_pool_info, None)
                     .map_err(|e| VulkanError::DeviceCreation(e.to_string()))?;
 
+                // Batch pool: pointer-bump alloc, reset once per token (no FREE_DESCRIPTOR_SET).
+                // 512 sets × 4096 storage descriptors covers 1 full forward pass with margin.
+                let batch_pool_sizes = [
+                    ash::vk::DescriptorPoolSize::default()
+                        .ty(ash::vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(4096)
+                ];
+                let batch_pool_info = ash::vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(512)
+                    .pool_sizes(&batch_pool_sizes);
+                let batch_pool = device.create_descriptor_pool(&batch_pool_info, None)
+                    .map_err(|e| VulkanError::DeviceCreation(e.to_string()))?;
+
 
                 let driver_ver = format!("{}.{}.{}",
                     (props.driver_version >> 22) & 0x3FF,
@@ -462,6 +482,7 @@ fn try_init_vulkan(gpu_hint: Option<&GpuCapabilities>) -> Result<VulkanContext, 
                     allocator: Some(std::sync::Arc::new(std::sync::Mutex::new(allocator))),
                     command_pool: Some(command_pool),
                     descriptor_pool: Some(descriptor_pool),
+                    batch_descriptor_pool: Some(batch_pool),
                     vulkan_available: true,
                     has_rebar,
                     has_dedicated_transfer_queue: has_dedicated_transfer,

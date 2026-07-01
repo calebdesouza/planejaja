@@ -356,7 +356,8 @@ pub fn gpu_forward_step(
             let x = hs_post_attn.to_gpu(engine)?;
             let ffn_norm = wb.get(&format!("blk.{layer}.ffn_norm.weight"))?;
 
-            let ffn_out = if let (Some(wg), Some(wu), Some(wd)) = (
+            // batch_ffn now includes the residual add (x + ffn(x_norm)) — saves 1 sync/layer.
+            let x = if let (Some(wg), Some(wu), Some(wd)) = (
                 wb.get(&format!("blk.{layer}.ffn_gate.weight")),
                 wb.get(&format!("blk.{layer}.ffn_up.weight")),
                 wb.get(&format!("blk.{layer}.ffn_down.weight")),
@@ -369,10 +370,9 @@ pub fn gpu_forward_step(
                 crate::observability::emit_expert_selection(
                     layer, &moe_out.routing.expert_indices, moe_out.routing.entropy,
                 );
-                engine.upload_f32(&moe_out.hidden).ok()?
+                let moe_gpu = engine.upload_f32(&moe_out.hidden).ok()?;
+                engine.add(&x, &moe_gpu, h as u32).ok()?
             } else { return None; };
-
-            let x = engine.add(&x, &ffn_out, h as u32).ok()?;
 
             // APEX post-FFN (GPU arm)
             let mut hs_post_ffn = HiddenState::Gpu(x);
@@ -462,6 +462,9 @@ pub fn gpu_forward_step(
             hs = HiddenState::Cpu(x);
         }
     }
+
+    // Release batch descriptor pool — O(1) reset instead of N individual frees.
+    engine.reset_batch_pool();
 
     // Final norm + LM head.
     // Prefer GPU when hidden state already resides there (zero transfer cost).
