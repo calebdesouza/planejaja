@@ -1,19 +1,19 @@
 # NodeStor — Cargo workspace configuration
 #
-# Força o uso do MSVC linker no Windows para evitar problemas com
-# o dlltool do MSYS2/mingw que não suporta paths com espaços.
-# O MSVC toolchain (stable-x86_64-pc-windows-msvc) está instalado
-# via rustup e é o linker recomendado para desenvolvimento no Windows.
+# NOTA: target e target-dir são definidos localmente (não commitados) para
+# evitar conflitos entre ambientes (Windows dev / Linux VPS / CI).
+# No Windows use: CARGO_BUILD_TARGET=x86_64-pc-windows-msvc
+# No Linux/VPS: sem target explícito (Rust detecta automaticamente)
 
+# Limita jobs paralelos para não estourar RAM em builds paralelos grandes.
+# Ajuste conforme os cores disponíveis (VPS tem mais; remova esta linha lá).
 [build]
-# Usa o target MSVC explicitamente para este workspace
-target = "x86_64-pc-windows-msvc"
-# D: pendrive com defeito (No Media). Build vai para C: com debuginfo=0 para caber.
-# Quando D: voltar: trocar de volta para D:\\nodestor-target
-target-dir = "C:\\nodestor-target"
-# Limita jobs paralelos — 28 threads simultâneas estouram o pagefile do Windows
 jobs = 6
 
 [target.x86_64-pc-windows-msvc]
 # AVX2 + FMA — Xeon E5-2680 v4 suporta ambos; elimina scalar fallbacks do compilador
 rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+# AVX2 + FMA para RTX 2080 Ti host (Xeon E5-2697 v4)
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3"]
