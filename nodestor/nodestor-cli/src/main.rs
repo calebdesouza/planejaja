@@ -1615,7 +1615,11 @@ async fn cmd_bench_infer(
         }
     }
 
-    struct RunResult { ttft_ms: f32, tps: f32, tokens: u32 }
+    struct RunResult {
+        ttft_ms: f32, tps: f32, tokens: u32,
+        spec_acceptance: f64, spec_speedup: f64,
+        spec_drafted: usize, spec_accepted: usize, spec_k: usize,
+    }
     let mut results: Vec<RunResult> = Vec::with_capacity(runs);
 
     for r in 0..runs {
@@ -1625,13 +1629,23 @@ async fn cmd_bench_infer(
         match pipeline.clone().generate(prompt, tokens, None, 0.7).await {
             Ok((_, stats)) => {
                 let ttft_ms = t0.elapsed().as_secs_f32() * 1000.0 / stats.generated_tokens.max(1) as f32;
-                println!("{} tok  TTFT~={:.1}ms  TPS={:.2}",
-                    stats.generated_tokens, stats.total_time_ms as f32 / stats.generated_tokens.max(1) as f32,
-                    stats.tokens_per_second);
+                println!("{} tok  TPS={:.2}  COBER: {}/{} acc={:.0}% speedup={:.2}x k={}",
+                    stats.generated_tokens,
+                    stats.tokens_per_second,
+                    stats.spec_accepted, stats.spec_drafted,
+                    stats.spec_acceptance_rate * 100.0,
+                    stats.spec_speedup,
+                    stats.spec_k,
+                );
                 results.push(RunResult {
                     ttft_ms,
                     tps: stats.tokens_per_second as f32,
                     tokens: stats.generated_tokens as u32,
+                    spec_acceptance: stats.spec_acceptance_rate,
+                    spec_speedup: stats.spec_speedup,
+                    spec_drafted: stats.spec_drafted,
+                    spec_accepted: stats.spec_accepted,
+                    spec_k: stats.spec_k,
                 });
             }
             Err(e) => { println!("ERROR: {}", e); }
@@ -1650,9 +1664,17 @@ async fn cmd_bench_infer(
     let tps_max  = *tps_vals.last().unwrap();
     let ttft_mean = results.iter().map(|r| r.ttft_ms).sum::<f32>() / results.len() as f32;
 
+    let spec_acc_mean = results.iter().map(|r| r.spec_acceptance).sum::<f64>() / results.len() as f64;
+    let spec_spd_mean = results.iter().map(|r| r.spec_speedup).sum::<f64>() / results.len() as f64;
+    let total_drafted: usize = results.iter().map(|r| r.spec_drafted).sum();
+    let total_accepted: usize = results.iter().map(|r| r.spec_accepted).sum();
+    let k_final = results.last().map(|r| r.spec_k).unwrap_or(0);
+
     println!("{}", "─".repeat(64));
     println!("  TPS   mean={:.2}  p50={:.2}  min={:.2}  max={:.2}", tps_mean, tps_p50, tps_min, tps_max);
     println!("  TTFT  approx mean={:.1}ms/tok", ttft_mean);
+    println!("  COBER acc={:.0}%  speedup={:.2}x  drafted={}  accepted={}  k_final={}",
+        spec_acc_mean * 100.0, spec_spd_mean, total_drafted, total_accepted, k_final);
     println!("{}", "═".repeat(64));
 
     let run_json: Vec<serde_json::Value> = results.iter().enumerate().map(|(i, r)| {
@@ -1660,7 +1682,11 @@ async fn cmd_bench_infer(
             "run": i + 1,
             "ttft_ms_approx": (r.ttft_ms * 10.0).round() / 10.0,
             "tps": (r.tps * 100.0).round() / 100.0,
-            "tokens": r.tokens
+            "tokens": r.tokens,
+            "cober_acceptance_pct": (r.spec_acceptance * 1000.0).round() / 10.0,
+            "cober_speedup": (r.spec_speedup * 100.0).round() / 100.0,
+            "spec_drafted": r.spec_drafted,
+            "spec_accepted": r.spec_accepted,
         })
     }).collect();
 
@@ -1680,7 +1706,11 @@ async fn cmd_bench_infer(
             "tps_p50":  (tps_p50  * 100.0).round() / 100.0,
             "tps_min":  (tps_min  * 100.0).round() / 100.0,
             "tps_max":  (tps_max  * 100.0).round() / 100.0,
-            "ttft_ms_per_tok_approx": (ttft_mean * 10.0).round() / 10.0
+            "ttft_ms_per_tok_approx": (ttft_mean * 10.0).round() / 10.0,
+            "cober_acceptance_pct": (spec_acc_mean * 1000.0).round() / 10.0,
+            "cober_speedup": (spec_spd_mean * 100.0).round() / 100.0,
+            "spec_drafted_total": total_drafted,
+            "spec_accepted_total": total_accepted,
         },
         "timestamp": chrono_now(),
         "nodestor_version": env!("CARGO_PKG_VERSION")
