@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Download benchmark models from HuggingFace (public, no auth required)
 # Usage: bash download_models.sh [small|medium|large|all]
-#   small  = Gemma-3-1B Q4_K_M  (~700 MB)
-#   medium = + Gemma-3-4B Q4_K_M (~2.5 GB)
-#   large  = + Llama-3.1-8B Q4_K_M (~4.7 GB)
-#   all    = + Gemma-3-12B Q4_K_M (~7.5 GB)
+#   small  = Llama-3.2-1B Q4_K_M  (~875 MB)
+#   medium = + Llama-3.2-3B Q4_K_M (~2.0 GB)
+#   large  = + Llama-3.1-8B Q4_K_M (~4.9 GB)
+#   all    = + Mistral-7B Q4_K_M    (~4.1 GB)
+#
+# Gemma requires accepting Google license at huggingface.co first.
+# To use Gemma: export HF_TOKEN=hf_xxx before running this script.
 set -euo pipefail
 
 TIER="${1:-small}"
@@ -18,9 +21,12 @@ hf_wget() {
         return 0
     fi
     local url="https://huggingface.co/${repo}/resolve/main/${file}"
+    local auth_header=""
+    [ -n "${HF_TOKEN:-}" ] && auth_header="--header=Authorization: Bearer ${HF_TOKEN}"
     echo "  Downloading $(basename "$dest") ..."
-    wget -q --show-progress -O "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" \
-        && echo "  [OK] $(du -h "$dest" | cut -f1)  $dest" \
+    wget -q --show-progress $auth_header -O "$dest.tmp" "$url" \
+        && mv "$dest.tmp" "$dest" \
+        && echo "  [OK] $(du -h "$dest" | cut -f1)" \
         || { rm -f "$dest.tmp"; echo "  [FAIL] $url"; return 1; }
 }
 
@@ -28,23 +34,23 @@ echo "═══ NodeStor model download (tier: $TIER) ═══"
 echo "  Models → $MODELS_DIR"
 echo ""
 
-# Gemma-3-1B Q4_K_M (~700 MB) — roda em qualquer GPU, boa qualidade
+# Llama-3.2-1B Q4_K_M (~875 MB) — Apache 2.0, fully public
 if [[ "$TIER" =~ ^(small|medium|large|all)$ ]]; then
     hf_wget \
-        "bartowski/gemma-3-1b-it-GGUF" \
-        "gemma-3-1b-it-Q4_K_M.gguf" \
-        "$MODELS_DIR/gemma-3-1b-it-Q4_K_M.gguf"
+        "bartowski/Llama-3.2-1B-Instruct-GGUF" \
+        "Llama-3.2-1B-Instruct-Q4_K_M.gguf" \
+        "$MODELS_DIR/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 fi
 
-# Gemma-3-4B Q4_K_M (~2.5 GB) — mostra vantagem SSD streaming
+# Llama-3.2-3B Q4_K_M (~2.0 GB) — shows memory bandwidth advantage
 if [[ "$TIER" =~ ^(medium|large|all)$ ]]; then
     hf_wget \
-        "bartowski/gemma-3-4b-it-GGUF" \
-        "gemma-3-4b-it-Q4_K_M.gguf" \
-        "$MODELS_DIR/gemma-3-4b-it-Q4_K_M.gguf"
+        "bartowski/Llama-3.2-3B-Instruct-GGUF" \
+        "Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
+        "$MODELS_DIR/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 fi
 
-# Llama-3.1-8B Q4_K_M (~4.7 GB) — referência padrão da industria
+# Llama-3.1-8B Q4_K_M (~4.9 GB) — industry standard benchmark
 if [[ "$TIER" =~ ^(large|all)$ ]]; then
     hf_wget \
         "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" \
@@ -52,12 +58,12 @@ if [[ "$TIER" =~ ^(large|all)$ ]]; then
         "$MODELS_DIR/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 fi
 
-# Gemma-3-12B Q4_K_M (~7.5 GB) — cabe em 11GB VRAM (RTX 2080 Ti / 3080)
+# Mistral-7B-v0.3 Q4_K_M (~4.1 GB) — Apache 2.0, cross-model comparison
 if [[ "$TIER" =~ ^(all)$ ]]; then
     hf_wget \
-        "bartowski/gemma-3-12b-it-GGUF" \
-        "gemma-3-12b-it-Q4_K_M.gguf" \
-        "$MODELS_DIR/gemma-3-12b-it-Q4_K_M.gguf"
+        "bartowski/Mistral-7B-Instruct-v0.3-GGUF" \
+        "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf" \
+        "$MODELS_DIR/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
 fi
 
 echo ""
