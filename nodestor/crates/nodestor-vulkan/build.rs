@@ -19,8 +19,6 @@ fn main() {
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 // matmul_coop.comp usa GL_KHR_cooperative_matrix — não suportado pelo Naga.
                 // O shader é carregado opcionalmente em runtime via `load_shader_by_kind(CoopMatrix)`.
-                // Quando glslc/glslangValidator estiver disponível, compilar manualmente e ativar
-                // a linha em `load_shader_by_kind` para incluir o .spv no binário.
                 if name == "matmul_coop" || name == "tree_attention" || name == "turbo_quant_attention" || name == "moe_routing" || name == "fused_layernorm_gelu" {
                     println!("cargo:info={} shader excluído da compilação Naga (requer glslc + driver moderno)", name);
                     continue;
@@ -47,6 +45,14 @@ fn compile_shader(path: &Path, dest_dir: &Path) {
     }
 }
 
+fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
 fn try_compile_shader(name: &str, source: &str, dest_dir: &Path) -> Result<(), String> {
     let mut frontend = glsl::Frontend::default();
     let options = glsl::Options {
@@ -69,8 +75,7 @@ fn try_compile_shader(name: &str, source: &str, dest_dir: &Path) -> Result<(), S
         .map_err(|e| format!("SPIR-V write error em '{}': {:?}", name, e))?;
 
     let dest_path = dest_dir.join(format!("{}.spv", name));
-    let bytes: Vec<u8> = binary.iter().flat_map(|w| w.to_le_bytes()).collect();
-    fs::write(dest_path, bytes).map_err(|e| format!("write error: {}", e))?;
+    fs::write(dest_path, words_to_bytes(&binary)).map_err(|e| format!("write error: {}", e))?;
     Ok(())
 }
 
@@ -89,17 +94,20 @@ fn write_stub_spirv(name: &str, dest_dir: &Path) {
         if let Ok(info) = info {
             let spv_options = spv::Options::default();
             if let Ok(binary) = spv::write_vec(&module, &info, &spv_options, None) {
-                let bytes: Vec<u8> = binary.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let dest_path = dest_dir.join(format!("{}.spv", name));
-                let _ = fs::write(dest_path, bytes);
+                let _ = fs::write(dest_path, words_to_bytes(&binary));
                 return;
             }
         }
     }
-    // Fallback de último recurso: SPIR-V magic + header mínimo (4 words)
+    // Fallback: SPIR-V magic word + minimal header (5 words, all zeros except magic)
     let dest_path = dest_dir.join(format!("{}.spv", name));
-    let magic: Vec<u8> = [0x03u32, 0x02, 0x23, 0x07, 0x00, 0x01, 0x00, 0x00,
-                           0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                           0x00, 0x00, 0x00, 0x00].iter().flat_map(|&b: &u8| [b]).collect();
-    let _ = fs::write(dest_path, magic);
+    let header: [u8; 20] = [
+        0x03, 0x02, 0x23, 0x07, // magic 0x07230203 LE
+        0x00, 0x00, 0x01, 0x00, // version 1.0
+        0x00, 0x00, 0x00, 0x00, // generator
+        0x01, 0x00, 0x00, 0x00, // bound
+        0x00, 0x00, 0x00, 0x00, // schema
+    ];
+    let _ = fs::write(dest_path, &header);
 }
